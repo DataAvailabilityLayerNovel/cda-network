@@ -1,0 +1,22 @@
+# Build artifacts
+bin/
+*.exe
+
+# Go workspace
+go.work.sum
+
+# Docker generated files
+docker-compose.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# Scratch files
+scratch/
+
+# Secrets / env
+.env
+*.env

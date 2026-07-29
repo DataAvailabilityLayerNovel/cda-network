@@ -1,0 +1,9 @@
+go 1.24.0
+
+use (
+	./rlnc-rsmt2d
+	./cda-publisher-node
+	./cda-bootstrap-node
+	./cda-store-node
+	./cda-light-node
+)

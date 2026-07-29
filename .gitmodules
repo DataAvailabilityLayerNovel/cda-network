@@ -1,0 +1,3 @@
+[submodule "rlnc-rsmt2d"]
+	path = rlnc-rsmt2d
+	url = https://github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d.git
