@@ -41,6 +41,10 @@ type Receiver struct {
 	peersMu   sync.RWMutex
 	rowPeers  []p2pcommon.PeerInfo
 	colPeers  []p2pcommon.PeerInfo
+
+	// Rate limiting
+	rateLimitersMu sync.Mutex
+	rateLimiters   map[peer.ID]*tokenBucket
 }
 
 func NewReceiver(
@@ -67,6 +71,7 @@ func NewReceiver(
 		cache:         cache,
 		broadcaster:   broadcaster,
 		crashOnFail:   crashOnFail,
+		rateLimiters:  make(map[peer.ID]*tokenBucket),
 	}
 }
 
@@ -330,6 +335,13 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 	defer stream.Close()
 
+	remotePeer := stream.Conn().RemotePeer()
+	if !rcv.allowRequest(remotePeer) {
+		log.Printf("[RateLimiter] Rejected fetch request from peer %s (rate limit exceeded)", remotePeer)
+		rcv.respondWithError(stream, "rate limit exceeded")
+		return
+	}
+
 	var req p2pcommon.StoreFetchRequest
 	if err := json.NewDecoder(stream).Decode(&req); err != nil {
 		return
@@ -528,4 +540,50 @@ func (rcv *Receiver) respondWithError(stream network.Stream, errMsg string) {
 		Success: false,
 		Error:   errMsg,
 	})
+}
+
+func (rcv *Receiver) allowRequest(pid peer.ID) bool {
+	rcv.rateLimitersMu.Lock()
+	defer rcv.rateLimitersMu.Unlock()
+
+	tb, exists := rcv.rateLimiters[pid]
+	if !exists {
+		tb = newTokenBucket(10.0, 10.0) // 10 burst, 10 tokens refill per second
+		rcv.rateLimiters[pid] = tb
+	}
+
+	return tb.allow()
+}
+
+type tokenBucket struct {
+	tokens     float64
+	maxTokens  float64
+	refillRate float64
+	lastRefill time.Time
+}
+
+func newTokenBucket(maxTokens, refillRate float64) *tokenBucket {
+	return &tokenBucket{
+		tokens:     maxTokens,
+		maxTokens:  maxTokens,
+		refillRate: refillRate,
+		lastRefill: time.Now(),
+	}
+}
+
+func (tb *tokenBucket) allow() bool {
+	now := time.Now()
+	elapsed := now.Sub(tb.lastRefill).Seconds()
+	tb.lastRefill = now
+
+	tb.tokens += elapsed * tb.refillRate
+	if tb.tokens > tb.maxTokens {
+		tb.tokens = tb.maxTokens
+	}
+
+	if tb.tokens >= 1.0 {
+		tb.tokens -= 1.0
+		return true
+	}
+	return false
 }

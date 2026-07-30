@@ -148,6 +148,7 @@ docker compose -f docker-compose.json logs light-1 > logs/docker_light1.log 2>&1
 docker compose -f docker-compose.json logs store-0-1 > logs/docker_store0_1.log 2>&1
 docker compose -f docker-compose.json logs store-0-2 > logs/docker_store0_2.log 2>&1
 docker compose -f docker-compose.json logs bootstrap-0 > logs/docker_bootstrap0.log 2>&1
+docker compose -f docker-compose.json down -v
 echo "[+] Representative logs exported to logs/ directory!"
 
 echo "[+] SUCCESS: Containerized Matrix E2E verification passed successfully!"

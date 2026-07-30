@@ -9,7 +9,7 @@ import (
 type Config struct {
 	Port          int
 	PublisherAddr string
-	BootstrapsMap map[int]string
+	BootstrapsMap map[int][]string
 	K             int
 	CrashOnFail   bool
 }
@@ -17,12 +17,12 @@ type Config struct {
 func LoadConfig() *Config {
 	port := flag.Int("port", 8085, "API port for light node")
 	publisher := flag.String("publisher", "http://localhost:8080", "Publisher URL")
-	bootstrapsStr := flag.String("bootstraps", "0:http://localhost:8090;1:http://localhost:8091;2:http://localhost:8092;3:http://localhost:8093", "Semicolon-separated mapping of networkColumnIdx:bootstrapURL")
+	bootstrapsStr := flag.String("bootstraps", "0:http://localhost:8090;1:http://localhost:8091;2:http://localhost:8092;3:http://localhost:8093", "Semicolon-separated mapping of networkColumnIdx:bootstrapURLs (comma-separated for HA fallbacks)")
 	k := flag.Int("k", 4, "Number of chunks K")
 	crashOnFail := flag.Bool("crash-on-fail", false, "Crash the node if verification fails")
 	flag.Parse()
 
-	bootstrapsMap := make(map[int]string)
+	bootstrapsMap := make(map[int][]string)
 	if *bootstrapsStr != "" {
 		for _, colGroup := range strings.Split(*bootstrapsStr, ";") {
 			parts := strings.SplitN(colGroup, ":", 2)
@@ -31,7 +31,12 @@ func LoadConfig() *Config {
 				if err != nil {
 					continue
 				}
-				bootstrapsMap[netColIdx] = strings.TrimSpace(parts[1])
+				addrList := strings.Split(parts[1], ",")
+				var cleanAddrs []string
+				for _, addr := range addrList {
+					cleanAddrs = append(cleanAddrs, strings.TrimSpace(addr))
+				}
+				bootstrapsMap[netColIdx] = cleanAddrs
 			}
 		}
 	}

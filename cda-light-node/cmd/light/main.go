@@ -68,58 +68,60 @@ func main() {
 	}
 
 	// 4.5. Connect to Bootstrap Nodes via P2P to join GossipSub mesh
-	for colIdx, httpAddr := range cfg.BootstrapsMap {
-		_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", colIdx))
-		if err != nil {
-			log.Printf("[P2P] Failed to derive bootstrap keypair for col %d: %v", colIdx, err)
-			continue
-		}
+	for colIdx, httpAddrs := range cfg.BootstrapsMap {
+		for _, httpAddr := range httpAddrs {
+			_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", colIdx))
+			if err != nil {
+				log.Printf("[P2P] Failed to derive bootstrap keypair for col %d: %v", colIdx, err)
+				continue
+			}
 
-		// Convert HTTP address to P2P multiaddr: http://host:port -> /dns4/host/tcp/(port+10000)
-		bootAddr := httpAddr
-		if strings.HasPrefix(bootAddr, "http://") || strings.HasPrefix(bootAddr, "https://") {
-			u, err := url.Parse(bootAddr)
-			if err == nil {
-				hostStr := u.Hostname()
-				portStr := u.Port()
-				if portVal, err := strconv.Atoi(portStr); err == nil {
-					p2pPort := portVal + 10000
-					if hostStr == "localhost" || hostStr == "127.0.0.1" {
-						bootAddr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p2pPort)
-					} else {
-						bootAddr = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, p2pPort)
+			// Convert HTTP address to P2P multiaddr: http://host:port -> /dns4/host/tcp/(port+10000)
+			bootAddr := httpAddr
+			if strings.HasPrefix(bootAddr, "http://") || strings.HasPrefix(bootAddr, "https://") {
+				u, err := url.Parse(bootAddr)
+				if err == nil {
+					hostStr := u.Hostname()
+					portStr := u.Port()
+					if portVal, err := strconv.Atoi(portStr); err == nil {
+						p2pPort := portVal + 10000
+						if hostStr == "localhost" || hostStr == "127.0.0.1" {
+							bootAddr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p2pPort)
+						} else {
+							bootAddr = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, p2pPort)
+						}
 					}
 				}
 			}
-		}
 
-		fullAddr := fmt.Sprintf("%s/p2p/%s", bootAddr, bootPID.String())
-		maddr, err := multiaddr.NewMultiaddr(fullAddr)
-		if err != nil {
-			log.Printf("[P2P] Failed to parse bootstrap multiaddr %s: %v", fullAddr, err)
-			continue
-		}
-
-		bootInfo, err := peer.AddrInfoFromP2pAddr(maddr)
-		if err != nil {
-			log.Printf("[P2P] Failed to parse AddrInfo for bootstrap col %d: %v", colIdx, err)
-			continue
-		}
-
-		go func(info peer.AddrInfo) {
-			for {
-				if err := p2pHost.Connect(ctx, info); err == nil {
-					log.Printf("[P2P] Light Node connected to Bootstrap Node %s", info.ID)
-					break
-				}
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					time.Sleep(2 * time.Second)
-				}
+			fullAddr := fmt.Sprintf("%s/p2p/%s", bootAddr, bootPID.String())
+			maddr, err := multiaddr.NewMultiaddr(fullAddr)
+			if err != nil {
+				log.Printf("[P2P] Failed to parse bootstrap multiaddr %s: %v", fullAddr, err)
+				continue
 			}
-		}(*bootInfo)
+
+			bootInfo, err := peer.AddrInfoFromP2pAddr(maddr)
+			if err != nil {
+				log.Printf("[P2P] Failed to parse AddrInfo for bootstrap col %d: %v", colIdx, err)
+				continue
+			}
+
+			go func(info peer.AddrInfo) {
+				for {
+					if err := p2pHost.Connect(ctx, info); err == nil {
+						log.Printf("[P2P] Light Node connected to Bootstrap Node %s", info.ID)
+						break
+					}
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						time.Sleep(2 * time.Second)
+					}
+				}
+			}(*bootInfo)
+		}
 	}
 
 	// 5. Initialize HTTP API Service

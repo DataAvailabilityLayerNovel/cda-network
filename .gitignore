@@ -20,3 +20,6 @@ scratch/
 # Secrets / env
 .env
 *.env
+
+# data
+data/

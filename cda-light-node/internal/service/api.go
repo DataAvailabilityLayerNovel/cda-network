@@ -27,7 +27,7 @@ import (
 
 type APIService struct {
 	publisherAddr string
-	bootstrapsMap map[int]string
+	bootstrapsMap map[int][]string
 	verifier      *verifier.DASVerifier
 	crashOnFail   bool
 	host          host.Host
@@ -60,7 +60,7 @@ type DASResponse struct {
 
 func NewAPIService(
 	publisherAddr string,
-	bootstrapsMap map[int]string,
+	bootstrapsMap map[int][]string,
 	v *verifier.DASVerifier,
 	crashOnFail bool,
 	h host.Host,
@@ -204,26 +204,16 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 		netColIdx = col / colsPerNetCol
 	}
 
-	bootAddr, ok := s.bootstrapsMap[netColIdx]
-	if !ok {
+	bootAddrs, ok := s.bootstrapsMap[netColIdx]
+	if !ok || len(bootAddrs) == 0 {
 		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("no bootstrap node configured for network column %d", netColIdx)}
 	}
 
-	if strings.HasPrefix(bootAddr, "http://") || strings.HasPrefix(bootAddr, "https://") {
-		u, err := url.Parse(bootAddr)
-		if err == nil {
-			hostStr := u.Hostname()
-			portStr := u.Port()
-			if portVal, err := strconv.Atoi(portStr); err == nil {
-				p2pPort := portVal + 10000
-				if hostStr == "localhost" || hostStr == "127.0.0.1" {
-					bootAddr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p2pPort)
-				} else {
-					bootAddr = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, p2pPort)
-				}
-			}
-		}
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var activeStores []p2pcommon.PeerInfo
+	var lastErr error
 
 	colIdx := netColIdx * (n / 4)
 	_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", colIdx))
@@ -231,70 +221,107 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to calculate bootstrap PeerID: %v", err)}
 	}
 
-	bootstrapAddrFull := fmt.Sprintf("%s/p2p/%s", bootAddr, bootPID.String())
-	maddr, err := multiaddr.NewMultiaddr(bootstrapAddrFull)
-	if err != nil {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("invalid bootstrap multiaddr: %v", err)}
-	}
-
-	bootInfo, err := peer.AddrInfoFromP2pAddr(maddr)
-	if err != nil {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to parse peer info: %v", err)}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := s.host.Connect(ctx, *bootInfo); err != nil {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to connect to bootstrap %s: %v", bootInfo.ID, err)}
-	}
-
-	// Query bootstrap node for active store node list via P2P routing RPC
-	stream, err := s.host.NewStream(ctx, bootInfo.ID, p2pcommon.ProtoBootstrapRouting)
-	if err != nil {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to open routing stream: %v", err)}
-	}
-	defer stream.Close()
-
-	req := p2pcommon.BootstrapRoutingRequest{
-		Peer: p2pcommon.PeerInfo{
-			PeerID:     s.host.ID().String(),
-			Multiaddrs: []string{}, // Light node does not need dynamic indexing
-			Row:        -1,
-			Col:        -1,
-		},
-		TargetRow: row,
-		TargetCol: col,
-	}
-
-	if err := json.NewEncoder(stream).Encode(req); err != nil {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to request routing info: %v", err)}
-	}
-
-	var routingResp p2pcommon.BootstrapRoutingResponse
-	if err := json.NewDecoder(stream).Decode(&routingResp); err != nil {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to read routing info: %v", err)}
-	}
-
-	// Filter store nodes matching target column subnet
-	var activeStores []p2pcommon.PeerInfo
-	for _, p := range routingResp.ColPeers {
-		storeNetCol := 0
-		if colsPerNetCol > 0 {
-			storeNetCol = p.Col / colsPerNetCol
+	// Try each bootstrap address in the list
+	for _, bootAddr := range bootAddrs {
+		resolvedAddr := bootAddr
+		if strings.HasPrefix(resolvedAddr, "http://") || strings.HasPrefix(resolvedAddr, "https://") {
+			u, err := url.Parse(resolvedAddr)
+			if err == nil {
+				hostStr := u.Hostname()
+				portStr := u.Port()
+				if portVal, err := strconv.Atoi(portStr); err == nil {
+					p2pPort := portVal + 10000
+					if hostStr == "localhost" || hostStr == "127.0.0.1" {
+						resolvedAddr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p2pPort)
+					} else {
+						resolvedAddr = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, p2pPort)
+					}
+				}
+			}
 		}
-		if storeNetCol == netColIdx {
-			activeStores = append(activeStores, p)
+
+		bootstrapAddrFull := fmt.Sprintf("%s/p2p/%s", resolvedAddr, bootPID.String())
+		maddr, err := multiaddr.NewMultiaddr(bootstrapAddrFull)
+		if err != nil {
+			lastErr = fmt.Errorf("invalid bootstrap multiaddr %s: %v", bootstrapAddrFull, err)
+			continue
 		}
+
+		bootInfo, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to parse peer info: %v", err)
+			continue
+		}
+
+		dialCtx, dialCancel := context.WithTimeout(ctx, 2*time.Second) // shorter timeout for faster failover
+
+		if err := s.host.Connect(dialCtx, *bootInfo); err != nil {
+			dialCancel()
+			lastErr = fmt.Errorf("failed to connect to bootstrap %s: %v", bootInfo.ID, err)
+			continue
+		}
+
+		// Query bootstrap node for active store node list via P2P routing RPC
+		stream, err := s.host.NewStream(dialCtx, bootInfo.ID, p2pcommon.ProtoBootstrapRouting)
+		if err != nil {
+			dialCancel()
+			lastErr = fmt.Errorf("failed to open routing stream: %v", err)
+			continue
+		}
+
+		req := p2pcommon.BootstrapRoutingRequest{
+			Peer: p2pcommon.PeerInfo{
+				PeerID:     s.host.ID().String(),
+				Multiaddrs: []string{}, // Light node does not need dynamic indexing
+				Row:        -1,
+				Col:        -1,
+			},
+			TargetRow: row,
+			TargetCol: col,
+		}
+
+		if err := json.NewEncoder(stream).Encode(req); err != nil {
+			stream.Close()
+			dialCancel()
+			lastErr = fmt.Errorf("failed to request routing info: %v", err)
+			continue
+		}
+
+		var routingResp p2pcommon.BootstrapRoutingResponse
+		if err := json.NewDecoder(stream).Decode(&routingResp); err != nil {
+			stream.Close()
+			dialCancel()
+			lastErr = fmt.Errorf("failed to read routing info: %v", err)
+			continue
+		}
+		stream.Close()
+		dialCancel()
+
+		// Filter store nodes matching target column subnet
+		for _, p := range routingResp.ColPeers {
+			storeNetCol := 0
+			if colsPerNetCol > 0 {
+				storeNetCol = p.Col / colsPerNetCol
+			}
+			if storeNetCol == netColIdx {
+				activeStores = append(activeStores, p)
+			}
+		}
+
+		// Fallback to all column peers if none registered specifically for target cell
+		if len(activeStores) == 0 {
+			activeStores = routingResp.ColPeers
+		}
+
+		if len(activeStores) > 0 {
+			lastErr = nil
+			break // Successfully retrieved routing info from this bootstrap node!
+		}
+		lastErr = fmt.Errorf("no active store nodes returned by bootstrap %s", bootInfo.ID)
 	}
 
-	// Fallback to all column peers if none registered specifically for target cell (Bootstrap may return column peers)
-	if len(activeStores) == 0 {
-		activeStores = routingResp.ColPeers
-	}
-
-	if len(activeStores) == 0 {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("no active store nodes registered on bootstrap %s for column %d", bootInfo.ID, col)}
+	if lastErr != nil {
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("routing query failed on all bootstraps: %v", lastErr)}
 	}
 
 	// Pick a random store node in the dynamic list to query

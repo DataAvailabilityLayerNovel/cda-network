@@ -153,11 +153,10 @@ Phase 2 (Async goroutine):
 - [x] Deterministic PeerID cho phép discovery không cần external service
 
 ### Hạn Chế / Cần Cải Thiện
-- **Registry in-memory:** Toàn bộ peer registry lưu trong RAM, không persistent; restart mất toàn bộ state
 - **Không có Byzantine fault tolerance:** Nếu bootstrap node bị compromise, nó có thể trả về danh sách store node giả → cần Merkle-based peer attestation
 - **Single bootstrap per column:** Không có backup bootstrap; nếu bootstrap crash, cột đó mất toàn bộ routing
 - **Seeding không có retry:** Nếu store node chưa kịp đăng ký khi seeding diễn ra, pieces bị bỏ qua hoàn toàn → cần retry queue hoặc lazy seeding
-- **RLNC coding chưa có recoding:** Store nodes không thể recode từ pieces nhận được để phân phối tiếp (chỉ lưu, không lan truyền chủ động)
+- **RLNC coding chưa có recoding:** Store nodes không thể recode từ pieces nhận được để phân phối tiếp (chỉ lưu, không lan truyền chủ động) 
 - **Chưa có slashing:** Không có cơ chế phạt store node khai báo sai hoặc offline
 - **Không có load balancing:** Tất cả store nodes trong cột nhận cùng số pieces từ bootstrap
 
@@ -224,7 +223,10 @@ Khi nhận SIGTERM/SIGINT:
 
 ### Đã Làm Được
 - [x] Layer 3 KZG verification của từng piece nhận từ bootstrap
-- [x] In-memory custody store với thread-safe access
+- [x] In-memory custody store với thread-safe access và phục hồi tự động khi khởi động
+- [x] **Lưu trữ persistent trên ổ đĩa:** Các pieces, anchors, và recoded pieces được lưu trữ cục bộ dưới dạng file JSON (`data/store_{port}/`)
+- [x] **Key Caching:** Cache keypair PeerID xuống file đĩa (`store_{port}.key`) giúp loại bỏ brute-force startup cost
+- [x] **Token-bucket rate limiting:** Giới hạn tốc độ yêu cầu P2P trên store node theo PeerID để chống spam active pull
 - [x] RLNC decoding: recover original cell data từ k coded pieces
 - [x] Active pull: query peers trong cùng column subnet khi thiếu pieces
 - [x] Graceful deregistration khi shutdown
@@ -232,13 +234,8 @@ Khi nhận SIGTERM/SIGINT:
 - [x] GossipSub subscription cho column anchor
 
 ### Hạn Chế / Cần Cải Thiện
-- **Lưu trữ in-memory:** Restart store node → mất toàn bộ pieces; cần persistent storage (LevelDB, RocksDB)
-- **Custody assignment chưa verifiable on-chain:** Không có smart contract để enforce store node phải lưu đúng custody
-- **Không có proof-of-custody:** Store node không cần chứng minh đang lưu dữ liệu; cần periodic challenge-response
-- **Không có replication factor đảm bảo:** Nếu chỉ có 1 store node mỗi cột, single point of failure
-- **Active pull không có rate limiting:** Light node có thể gây DoS bằng cách query liên tục
-- **PeerID brute-force startup cost:** `GenerateKeypairForCell` có thể mất vài giây nếu điều kiện khắt khe
-- **Chưa có DHT:** Peer discovery dựa vào bootstrap registry, không có global DHT fallback
+- **Không có replication factor đảm bảo:** Nếu chỉ có 1 store node mỗi cột, single point of failure (tuy nhiên RS 2D vẫn khôi phục được ma trận nếu mất nguyên một cột)
+- **Cần seed node / genesis bootstrap list:** Node mới gia nhập mạng cần biết ít nhất 1 địa chỉ IP thực của bootstrap; production nên dùng DNS seed (`bootstrap.cda-network.example.com`) hoặc hardcode genesis list
 
 ---
 
@@ -306,8 +303,6 @@ Client → GET /das/sample/{blockID}?row=0&col=3 → Light Node
 ### Hạn Chế / Cần Cải Thiện
 - **Sampling không stateless:** Light node cần biết địa chỉ bootstrap nodes trước (từ config); trong mạng thực cần DNS-based discovery hoặc genesis config
 - **Không có erasure coding verification đầy đủ:** Chỉ verify tính đúng đắn của piece (KZG), không verify rằng các cells tuân theo cấu trúc 2D RS (cần row proof + col proof)
-- **Header trust từ 1 nguồn:** Chỉ nhận header từ publisher (hoặc GossipSub relay của publisher), không verify header đến từ consensus majority
-- **Không có fraud proof:** Nếu store node trả về data giả, light node sẽ phát hiện sai KZG verify nhưng không thể tạo fraud proof để submit on-chain
 - **Random sampling chưa đủ mẫu:** Mặc định 4 samples, nhưng theo lý thuyết cần ~30 samples để đạt 99.9% confidence rằng block không bị withhold
 - **Không có caching lâu dài:** Headers và verification results không persist qua restart
 
@@ -360,26 +355,25 @@ Dùng **BLAKE3** hash của PeerID để tính vị trí `(row, col)` trong matr
 
 | Vấn đề | Mô Tả | Giải Pháp Đề Xuất |
 |--------|--------|-------------------|
-| Trusted setup | SRS (Structured Reference String) được tạo ngẫu nhiên (`big.NewInt(-1)`) | Cần ceremony (Powers of Tau) trong production |
-| Không có row proofs | Chỉ verify column commitment, không verify row structure | Thêm row commitment scheme |
-| Không có proof-of-custody | Store nodes không cần chứng minh đang giữ data | Implement periodic challenge (PoC protocol) |
-| No fraud proofs | Light node phát hiện lỗi nhưng không thể prove on-chain | Implement zkSNARK-based fraud proofs |
+| Trusted setup | SRS được tạo ngẫu nhiên (`big.NewInt(-1)`) | Cần ceremony (Powers of Tau) trong production |
+| DAS sample count thấp | Prototype test với 2 light nodes; statistical security cần nhiều node độc lập sampling cùng lúc | Tăng số lượng light node, mỗi node sample ≥30 cells ngẫu nhiên để đạt 99.9% confidence |
+
 
 ### Infrastructure / Scalability
 
 | Vấn đề | Mô Tả | Giải Pháp Đề Xuất |
 |--------|--------|-------------------|
-| All in-memory | Tất cả state (headers, peers, pieces) lưu RAM | Thêm persistent layer (LevelDB/RocksDB) |
-| Không có DHT | Peer discovery dựa hoàn toàn vào bootstrap registry | Integrate libp2p Kademlia DHT |
+| All in-memory | Tất cả state (headers trên Publisher, registry trên Bootstrap) lưu RAM | Chuyển đổi sang persistent storage cho Publisher/Bootstrap (Store Node đã persistent) |
 | Không có NAT traversal | `NewP2PHost` chỉ bind `/ip4/0.0.0.0`, không có hole punching | Enable libp2p AutoNAT + Circuit Relay |
-| Single point of failure | Mỗi thành phần chỉ có 1 instance | Implement HA với consensus (RAFT/Tendermint) |
-| Không có config management | Config qua CLI flags | Chuyển sang config file + environment variables + Kubernetes ConfigMap |
+| Single point of failure | Mỗi thành phần chỉ có 1 instance | Đã hỗ trợ HA Failover cho Bootstrap (Light/Store nodes hỗ trợ khai báo array bootstrap và failover). Cần tích hợp thêm leader election cho multi-bootstrap |
+| Bootstrap node discovery | Node mới cần địa chỉ bootstrap từ config; không có tự động khám phá | DNS seed record hoặc genesis bootstrap list (không cần DHT vì routing đã structured theo ma trận) |
+
 
 ### Network Protocol
 
 | Vấn đề | Mô Tả | Giải Pháp Đề Xuất |
-|--------|--------|-------------------|
-| Không có block ordering | BlockID là string tự do, không có height/slot | Thêm slot number và fork choice rule |
+|--------|--------|------------------|
+| Không có block ordering | BlockID là string tự do, không có height/slot | Thêm slot number và fork choice rule (phục vụ mô phỏng) |
 | GossipSub không có retention | Header message mất nếu node offline khi publish | Implement store-and-forward hoặc message retention |
 | HTTP fallback centralized | Light node phải biết địa chỉ publisher | Loại bỏ HTTP fallback sau khi GossipSub ổn định |
 | Không có rate limiting | Bất kỳ peer nào cũng có thể spam requests | Thêm request rate limiting per PeerID |
@@ -399,14 +393,17 @@ Dùng **BLAKE3** hash của PeerID để tính vị trí `(row, col)` trong matr
 ✅ E2E test hoàn chỉnh bao gồm node failure simulation
 ✅ Docker-based deployment với docker-compose
 ✅ GossipSub P2P propagation cho block headers (sau fix timing race)
+✅ Lưu trữ persistent cục bộ cho store node (file-based JSON)
+✅ Cache keypair PeerID để tránh brute-force khi restart
+✅ Rate limiting cho các stream active pull
+✅ Bootstrap HA failover và dự phòng kết nối
 ```
 
 ### Ưu Tiên Cải Thiện Để Deploy Thực Tế
 
-1. **Persistent storage** — Không thể có production system với all-in-memory
-2. **Trusted KZG setup** — Cần ceremony thực sự, không thể dùng random SRS
-3. **Proof-of-custody protocol** — Core mechanism của DA layer
-4. **Fraud proof generation** — Để light node có thể report on-chain
-5. **DHT-based peer discovery** — Không phụ thuộc vào bootstrap node
-6. **Consensus/ordering layer** — Ai được phép publish block và theo thứ tự nào
-7. **NAT traversal** — Để nodes hoạt động sau firewall/NAT trong môi trường thực
+1. **Persistent storage cho Publisher/Bootstrap** — Bổ sung cơ chế lưu trữ đĩa cho block headers trên Publisher và registry trên Bootstrap node
+2. **Trusted KZG setup** — Cần ceremony thực sự (Powers of Tau), không thể dùng random SRS
+3. **Scale light node fleet** — Statistical security của DAS phụ thuộc vào số lượng light node độc lập sampling; cần tối thiểu hàng chục node   
+4. **NAT traversal** — libp2p AutoNAT + Circuit Relay để nodes hoạt động sau firewall/NAT
+5. **DNS seed / genesis bootstrap list** — Cho phép tự động hóa quá trình cấu hình bootstrap khi node mới gia nhập mạng
+

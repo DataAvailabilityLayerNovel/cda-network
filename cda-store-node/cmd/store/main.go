@@ -23,6 +23,7 @@ import (
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	bls12381kzg "github.com/consensys/gnark-crypto/ecc/bls12-381/kzg"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 )
@@ -44,14 +45,41 @@ func main() {
 	kzg := cda.NewGnarkKZG(*srs)
 
 	// 2. Initialize Custody Cache Storage
-	cache := storage.NewCustodyStore()
+	cache := storage.NewCustodyStore(cfg.Port)
 
-	// 3. Generate deterministic keypair for targets (cfg.RowIdx, cfg.ColIdx)
-	gridRows := 2 * cfg.K
-	gridCols := 2 * cfg.K
-	privKey, pid, err := p2pcommon.GenerateKeypairForCell(cfg.RowIdx, cfg.ColIdx, gridRows, gridCols, "cda-salt-2026")
-	if err != nil {
-		log.Fatalf("Failed to generate deterministic keypair for cell coordinate: %v", err)
+	// 3. Generate or load deterministic keypair for targets (cfg.RowIdx, cfg.ColIdx)
+	keyFileName := fmt.Sprintf("store_%d.key", cfg.Port)
+	var privKey crypto.PrivKey
+	var pid peer.ID
+
+	if keyData, err := os.ReadFile(keyFileName); err == nil {
+		privKey, err = crypto.UnmarshalPrivateKey(keyData)
+		if err == nil {
+			pid, err = peer.IDFromPrivateKey(privKey)
+		}
+		if err == nil {
+			log.Printf("[P2P Identity] Loaded cached keypair from %s", keyFileName)
+		} else {
+			log.Printf("[P2P Identity] Cached key file invalid, regenerating...")
+			privKey = nil
+		}
+	}
+
+	if privKey == nil {
+		gridRows := 2 * cfg.K
+		gridCols := 2 * cfg.K
+		privKey, pid, err = p2pcommon.GenerateKeypairForCell(cfg.RowIdx, cfg.ColIdx, gridRows, gridCols, "cda-salt-2026")
+		if err != nil {
+			log.Fatalf("Failed to generate deterministic keypair for cell coordinate: %v", err)
+		}
+
+		keyData, err := crypto.MarshalPrivateKey(privKey)
+		if err == nil {
+			err = os.WriteFile(keyFileName, keyData, 0600)
+			if err == nil {
+				log.Printf("[P2P Identity] Saved generated keypair to %s", keyFileName)
+			}
+		}
 	}
 
 	p2pPort := cfg.Port + 10000 // Compute P2P port deterministically (e.g. 8080 -> 18080)
