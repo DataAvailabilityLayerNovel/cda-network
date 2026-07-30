@@ -1,50 +1,75 @@
 package p2p
 
 import (
-	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"sync"
+	"time"
 
+	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
 
 type Broadcaster struct {
-	peers []string
-	mu    sync.RWMutex
+	host   host.Host
+	ps     *pubsub.PubSub
+	peers  []peer.ID
+	mu     sync.RWMutex
+	topics map[string]*pubsub.Topic
 }
 
-func NewBroadcaster(peers []string) *Broadcaster {
+func NewBroadcaster(h host.Host, ps *pubsub.PubSub) *Broadcaster {
 	return &Broadcaster{
-		peers: peers,
+		host:   h,
+		ps:     ps,
+		topics: make(map[string]*pubsub.Topic),
 	}
 }
 
-func (b *Broadcaster) UpdatePeers(peers []string) {
+func (b *Broadcaster) JoinTopic(topicName string) (*pubsub.Topic, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.topics == nil {
+		b.topics = make(map[string]*pubsub.Topic)
+	}
+
+	topic, ok := b.topics[topicName]
+	if ok {
+		return topic, nil
+	}
+
+	topic, err := b.ps.Join(topicName)
+	if err != nil {
+		return nil, err
+	}
+	b.topics[topicName] = topic
+	return topic, nil
+}
+
+func (b *Broadcaster) UpdatePeers(peers []peer.ID) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.peers = peers
 }
 
-// BroadcastRecodedPiece simulates GossipSub broadcast of a recoded piece to neighboring Store Nodes in the column
+// BroadcastRecodedPiece broadcasts a recoded piece to GossipSub column topic
 func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece *cda.ReceivedPiece, pieceCommits [][]byte) error {
-	b.mu.RLock()
-	peersCopy := make([]string, len(b.peers))
-	copy(peersCopy, b.peers)
-	b.mu.RUnlock()
-
-	log.Printf("[GossipSub] Broadcasting recoded piece (coeffs: %x, data len: %d) for cell [%d, %d] to %d column neighbor peers",
-		piece.Data.Coeffs, len(piece.Data.Data), row, col, len(peersCopy))
+	log.Printf("[GossipSub] Broadcasting recoded piece (coeffs: %x, data len: %d) for cell [%d, %d] to GossipSub Column topic",
+		piece.Data.Coeffs, len(piece.Data.Data), row, col)
 
 	commitsStr := make([]string, len(pieceCommits))
 	for i, c := range pieceCommits {
 		commitsStr[i] = hex.EncodeToString(c)
 	}
 
-	payload := StorePayload{
+	payload := p2pcommon.SeedCellRequest{
 		BlockID:      blockID,
 		Row:          row,
 		Col:          col,
@@ -59,22 +84,19 @@ func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece 
 		return fmt.Errorf("failed to marshal store payload: %w", err)
 	}
 
-	for _, peer := range peersCopy {
-		go func(peerURL string) {
-			url := fmt.Sprintf("%s/store/cell/", peerURL)
-			resp, err := http.Post(url, "application/json", bytes.NewReader(payloadBytes))
-			if err != nil {
-				log.Printf("[GossipSub] Failed to gossip to peer %s: %v", peerURL, err)
-				return
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				log.Printf("[GossipSub] Peer %s returned status %d", peerURL, resp.StatusCode)
-			} else {
-				log.Printf("[GossipSub] Successfully gossiped piece to peer %s", peerURL)
-			}
-		}(peer)
+	topicName := p2pcommon.TopicCol(col)
+	topic, err := b.JoinTopic(topicName)
+	if err != nil {
+		return fmt.Errorf("failed to join GossipSub topic %s: %w", topicName, err)
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := topic.Publish(ctx, payloadBytes); err != nil {
+		return fmt.Errorf("failed to publish recoded piece to GossipSub: %w", err)
+	}
+
+	log.Printf("[GossipSub] Successfully gossiped recoded piece for cell [%d, %d] to topic %s", row, col, topicName)
 	return nil
 }

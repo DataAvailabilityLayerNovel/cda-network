@@ -21,7 +21,7 @@ def generate_compose(k, cols, stores_per_col, lights, crash_on_fail=False):
             'dockerfile': 'Dockerfile'
         },
         'command': ["/usr/local/bin/publisher", "-config", "/app/publisher_config.json"],
-        'ports': ["8080:8080"],
+        'ports': ["8080:8080", "18080:18080"],
         'volumes': ["./publisher_config_docker.json:/app/publisher_config.json"],
         'networks': ['cda-net']
     }
@@ -34,10 +34,8 @@ def generate_compose(k, cols, stores_per_col, lights, crash_on_fail=False):
     for c in range(cols):
         col_id = c * 2 # map to even columns for now (0, 2, 4, 6)
         bootstrap_port = 8090 + c
+        bootstrap_p2p_port = bootstrap_port + 10000
         bootstrap_name = f'bootstrap-{c}'
-        
-        # We point bootstrap to the first store node in its column as initial peer
-        initial_store = f'http://store-{c}-1:8080'
 
         compose['services'][bootstrap_name] = {
             'build': {
@@ -48,22 +46,21 @@ def generate_compose(k, cols, stores_per_col, lights, crash_on_fail=False):
                 "/usr/local/bin/bootstrap",
                 "-port", str(bootstrap_port),
                 "-col", str(col_id),
-                "-store", initial_store,
                 "-publisher", "http://publisher:8080",
                 "-k", str(k)
             ] + crash_arg,
-            'ports': [f"{bootstrap_port}:{bootstrap_port}"],
+            'ports': [f"{bootstrap_port}:{bootstrap_port}", f"{bootstrap_p2p_port}:{bootstrap_p2p_port}"],
             'networks': ['cda-net'],
             'depends_on': ['publisher']
         }
 
-        bootstrap_addresses.append(f"{c}:{http_addr(bootstrap_name, bootstrap_port)}")
+        bootstrap_addresses.append(f"{c}:/dns4/{bootstrap_name}/tcp/{bootstrap_p2p_port}")
 
         # Store Nodes for this column
         for s in range(1, stores_per_col + 1):
             store_name = f'store-{c}-{s}'
             store_ports.append(current_store_host_port)
-            
+
             compose['services'][store_name] = {
                 'build': {
                     'context': '.',
@@ -72,14 +69,14 @@ def generate_compose(k, cols, stores_per_col, lights, crash_on_fail=False):
                 'command': [
                     "/usr/local/bin/store",
                     "-port", "8080",
-                    "-row", "0",
+                    "-row", str(s - 1),
                     "-col", str(col_id),
                     "-publisher", "http://publisher:8080",
-                    "-bootstrap", f"http://{bootstrap_name}:{bootstrap_port}",
+                    "-bootstrap", f"/dns4/{bootstrap_name}/tcp/{bootstrap_p2p_port}",
                     "-k", str(k),
                     "-myaddr", f"http://{store_name}:8080"
                 ] + crash_arg,
-                'ports': [f"{current_store_host_port}:8080"],
+                'ports': [f"{current_store_host_port}:8080", f"{current_store_host_port + 10000}:18080"],
                 'networks': ['cda-net'],
                 'depends_on': [bootstrap_name]
             }
@@ -90,7 +87,7 @@ def generate_compose(k, cols, stores_per_col, lights, crash_on_fail=False):
     for l in range(1, lights + 1):
         light_port = 8094 + l
         light_name = f'light-{l}'
-        
+
         compose['services'][light_name] = {
             'build': {
                 'context': '.',
@@ -103,7 +100,7 @@ def generate_compose(k, cols, stores_per_col, lights, crash_on_fail=False):
                 "-bootstraps", bootstraps_arg,
                 "-k", str(k)
             ] + crash_arg,
-            'ports': [f"{light_port}:{light_port}"],
+            'ports': [f"{light_port}:{light_port}", f"{light_port + 10000}:{light_port + 10000}"],
             'networks': ['cda-net'],
             'depends_on': ['publisher']
         }

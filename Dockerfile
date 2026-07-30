@@ -1,5 +1,5 @@
 # Stage 1: Build stage
-FROM golang:1.24-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 RUN apk add --no-cache git build-base
 
@@ -12,6 +12,7 @@ COPY cda-publisher-node/ cda-publisher-node/
 COPY cda-bootstrap-node/ cda-bootstrap-node/
 COPY cda-store-node/ cda-store-node/
 COPY cda-light-node/ cda-light-node/
+COPY cda-p2p/ cda-p2p/
 
 # Compile all binaries
 RUN go build -o bin/publisher ./cda-publisher-node/cmd/publisher/main.go

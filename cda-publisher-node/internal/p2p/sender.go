@@ -1,43 +1,95 @@
 package p2p
 
 import (
-	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	p2pcommon "cda-p2p"
 
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 )
 
 type Sender struct {
+	host host.Host
 	disc *Discovery
 }
 
-type BootstrapPayload struct {
-	BlockID      string            `json:"block_id"`
-	ColIdx       int               `json:"col_idx"`
-	ColumnData   []string          `json:"column_data"`   // Hex-encoded cells
-	PieceCommits []string          `json:"piece_commits"` // Hex-encoded piece commitments
-	MerkleProofs []cda.MerkleProof `json:"merkle_proofs"`
-}
-
-func NewSender(disc *Discovery) *Sender {
+func NewSender(h host.Host, disc *Discovery) *Sender {
 	return &Sender{
+		host: h,
 		disc: disc,
 	}
 }
 
-// SendColumnChunk transmits column cells, commitments, and Merkle proofs to the bootstrap node over simulated P2P channel
+// SendColumnChunk transmits column cells, commitments, and Merkle proofs to the bootstrap node over a libp2p stream
 func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, pieceCommits [][]byte, merkleProofs []cda.MerkleProof) error {
 	addr, err := s.disc.FindBootstrapNode(colIdx)
 	if err != nil {
 		return fmt.Errorf("resolve bootstrap address for column %d: %w", colIdx, err)
 	}
 
+	// Support HTTP address conversion to multiaddr
+	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+		u, err := url.Parse(addr)
+		if err == nil {
+			hostStr := u.Hostname()
+			portStr := u.Port()
+			if portVal, err := strconv.Atoi(portStr); err == nil {
+				p2pPort := portVal + 10000
+				if hostStr == "localhost" || hostStr == "127.0.0.1" {
+					addr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p2pPort)
+				} else {
+					addr = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, p2pPort)
+				}
+			}
+		}
+	}
+
+	// Append PeerID if not already present
+	if !strings.Contains(addr, "/p2p/") && !strings.Contains(addr, "/ipfs/") {
+		bootColID := (colIdx / 2) * 2
+		_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", bootColID))
+		if err != nil {
+			return fmt.Errorf("failed to generate bootstrap PeerID: %w", err)
+		}
+		addr = fmt.Sprintf("%s/p2p/%s", addr, bootPID.String())
+	}
+
 	log.Printf("[P2P] Connecting to peer at %s to send Column %d", addr, colIdx)
+
+	maddr, err := multiaddr.NewMultiaddr(addr)
+	if err != nil {
+		return fmt.Errorf("invalid bootstrap multiaddr %s: %w", addr, err)
+	}
+
+	info, err := peer.AddrInfoFromP2pAddr(maddr)
+	if err != nil {
+		return fmt.Errorf("failed to parse peer info from multiaddr %s: %w", addr, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := s.host.Connect(ctx, *info); err != nil {
+		return fmt.Errorf("failed to connect to bootstrap node %s: %w", info.ID, err)
+	}
+
+	log.Printf("[P2P] Dialing stream %s to %s", p2pcommon.ProtoPublisherPush, info.ID)
+	stream, err := s.host.NewStream(ctx, info.ID, p2pcommon.ProtoPublisherPush)
+	if err != nil {
+		return fmt.Errorf("failed to open stream: %w", err)
+	}
+	defer stream.Close()
 
 	hexColData := make([]string, len(colData))
 	for i, d := range colData {
@@ -49,33 +101,40 @@ func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, p
 		hexPieceCommits[i] = hex.EncodeToString(c)
 	}
 
-	payload := BootstrapPayload{
+	serializedProofs := make([]p2pcommon.SerializedMerkleProof, len(merkleProofs))
+	for i, p := range merkleProofs {
+		serializedProofs[i] = p2pcommon.SerializedMerkleProof{
+			Index:    p.Index,
+			Siblings: p.Siblings,
+		}
+	}
+
+	payload := p2pcommon.PublisherPushRequest{
 		BlockID:      blockID,
 		ColIdx:       colIdx,
 		ColumnData:   hexColData,
 		PieceCommits: hexPieceCommits,
-		MerkleProofs: merkleProofs,
+		MerkleProofs: serializedProofs,
 	}
 
-	bodyBytes, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal bootstrap payload: %w", err)
+	if err := json.NewEncoder(stream).Encode(payload); err != nil {
+		return fmt.Errorf("failed to encode payload to stream: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/bootstrap/column/%d", addr, colIdx)
-	log.Printf("[P2P] Dialing stream /bootstrap/column/%d to %s", colIdx, addr)
-	
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("P2P stream failed: %w", err)
+	// Read acknowledgement response
+	var response struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error,omitempty"`
 	}
-	defer resp.Body.Close()
+	if err := json.NewDecoder(stream).Decode(&response); err != nil {
+		return fmt.Errorf("failed to read response from remote peer: %w", err)
+	}
 
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("remote peer returned error %d: %s", resp.StatusCode, string(respBody))
+	if !response.Success {
+		return fmt.Errorf("remote peer returned error: %s", response.Error)
 	}
 
 	log.Printf("[P2P] Stream finished successfully for Column %d", colIdx)
 	return nil
 }
+

@@ -1,93 +1,108 @@
 package p2p
 
 import (
-	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
+	"time"
 
+	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/multiformats/go-multiaddr"
 )
 
+type Registry interface {
+	GetPeersForCell(row, col int) []p2pcommon.PeerInfo
+}
+
 type Broadcaster struct {
-	storeNodeAddr string
+	host host.Host
+	ps   *pubsub.PubSub
+	reg  Registry
 }
 
-type StorePayload struct {
-	BlockID      string   `json:"block_id"`
-	Row          int      `json:"row"`
-	Col          int      `json:"col"`
-	Data         string   `json:"data"`          // Hex coded data d_i
-	Coeffs       string   `json:"coeffs"`        // Hex coefficients g_i
-	Proof        string   `json:"proof"`         // Hex combined proof P_i
-	PieceCommits []string `json:"piece_commits"` // Hex piece commitments C_0..C_k-1
-}
-
-type AnchorPayload struct {
-	BlockID      string            `json:"block_id"`
-	ColIdx       int               `json:"col_idx"`
-	PieceCommits []string          `json:"piece_commits"`
-	MerkleProofs []cda.MerkleProof `json:"merkle_proofs"`
-}
-
-func NewBroadcaster(storeNodeAddr string) *Broadcaster {
+func NewBroadcaster(h host.Host, ps *pubsub.PubSub) *Broadcaster {
 	return &Broadcaster{
-		storeNodeAddr: storeNodeAddr,
+		host: h,
+		ps:   ps,
 	}
 }
 
-// BroadcastAnchor gossips the piece commitments and Merkle proofs to the column's Store Nodes to anchor the state
+func (b *Broadcaster) SetRegistry(reg Registry) {
+	b.reg = reg
+}
+
+// BroadcastAnchor publishes the commitments and proofs to the column's GossipSub topic
 func (b *Broadcaster) BroadcastAnchor(blockID string, colIdx int, pieceCommits [][]byte, merkleProofs []cda.MerkleProof) error {
-	log.Printf("[P2P] Broadcasting anchor for Column %d to Store Node", colIdx)
+	log.Printf("[GossipSub] Broadcasting anchor for Column %d to GossipSub", colIdx)
 
 	hexPieceCommits := make([]string, len(pieceCommits))
 	for i, c := range pieceCommits {
 		hexPieceCommits[i] = hex.EncodeToString(c)
 	}
 
-	payload := AnchorPayload{
+	serializedProofs := make([]p2pcommon.SerializedMerkleProof, len(merkleProofs))
+	for i, p := range merkleProofs {
+		serializedProofs[i] = p2pcommon.SerializedMerkleProof{
+			Index:    p.Index,
+			Siblings: p.Siblings,
+		}
+	}
+
+	payload := p2pcommon.GossipAnchorPayload{
 		BlockID:      blockID,
 		ColIdx:       colIdx,
 		PieceCommits: hexPieceCommits,
-		MerkleProofs: merkleProofs,
+		MerkleProofs: serializedProofs,
 	}
 
-	bodyBytes, err := json.Marshal(payload)
+	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal anchor payload: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/store/anchor/%d", b.storeNodeAddr, colIdx)
-	log.Printf("[P2P] Dialing stream /store/anchor/%d to %s", colIdx, b.storeNodeAddr)
-
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(bodyBytes))
+	topicName := p2pcommon.TopicCol(colIdx)
+	topic, err := b.ps.Join(topicName)
 	if err != nil {
-		return fmt.Errorf("anchor broadcast failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("remote store node returned error %d on anchor: %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("failed to join GossipSub topic %s: %w", topicName, err)
 	}
 
-	log.Printf("[P2P] Anchor broadcast finished successfully for Column %d", colIdx)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := topic.Publish(ctx, payloadBytes); err != nil {
+		return fmt.Errorf("failed to publish anchor on GossipSub: %w", err)
+	}
+
+	log.Printf("[GossipSub] Successfully gossiped anchor for Column %d on topic %s", colIdx, topicName)
 	return nil
 }
 
-// BroadcastPiece sends the encoded RLNC piece and piece commitments to the Store Node
+// BroadcastPiece unicasts the RLNC piece to the Store Nodes for cell [row, col]
 func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, piece *cda.ReceivedPiece, pieceCommits [][]byte) error {
-	log.Printf("[P2P] Connecting to Store Node peer to send cell [%d, %d]", row, col)
+	if b.reg == nil {
+		return fmt.Errorf("peer registry not set on broadcaster")
+	}
+
+	// Lookup active store nodes registered for cell [row, col]
+	peers := b.reg.GetPeersForCell(row, col)
+	if len(peers) == 0 {
+		// Log warning but don't return error. It might be that no store node registered for this row coordinate yet.
+		log.Printf("[P2P Seeder] Warning: No Store Node registered for cell [%d, %d] yet. Seeding skipped.", row, col)
+		return nil
+	}
 
 	hexPieceCommits := make([]string, len(pieceCommits))
 	for i, c := range pieceCommits {
 		hexPieceCommits[i] = hex.EncodeToString(c)
 	}
 
-	payload := StorePayload{
+	payload := p2pcommon.SeedCellRequest{
 		BlockID:      blockID,
 		Row:          row,
 		Col:          col,
@@ -97,25 +112,61 @@ func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, piece *cda.Re
 		PieceCommits: hexPieceCommits,
 	}
 
-	bodyBytes, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal store payload: %w", err)
+	for _, pInfo := range peers {
+		pid, err := peer.Decode(pInfo.PeerID)
+		if err != nil {
+			log.Printf("[P2P Seeder] Invalid Peer ID %s: %v", pInfo.PeerID, err)
+			continue
+		}
+
+		// Add addresses to Peerstore
+		for _, addrStr := range pInfo.Multiaddrs {
+			maddr, err := multiaddr.NewMultiaddr(addrStr)
+			if err != nil {
+				continue
+			}
+			b.host.Peerstore().AddAddr(pid, maddr, peerstoreAddressTTL())
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err = b.host.Connect(ctx, peer.AddrInfo{ID: pid})
+		if err != nil {
+			log.Printf("[P2P Seeder] Failed to connect to store node %s: %v", pid, err)
+			cancel()
+			continue
+		}
+
+		stream, err := b.host.NewStream(ctx, pid, p2pcommon.ProtoBootstrapSeed)
+		cancel() // cancel context for connection after stream is established or failed
+		if err != nil {
+			log.Printf("[P2P Seeder] Failed to open stream to store node %s: %v", pid, err)
+			continue
+		}
+
+		if err := json.NewEncoder(stream).Encode(payload); err != nil {
+			log.Printf("[P2P Seeder] Failed to send piece to %s: %v", pid, err)
+			stream.Close()
+			continue
+		}
+
+		// Read response
+		var ack struct {
+			Success bool   `json:"success"`
+			Error   string `json:"error,omitempty"`
+		}
+		if err := json.NewDecoder(stream).Decode(&ack); err != nil {
+			log.Printf("[P2P Seeder] Failed to read ACK from %s: %v", pid, err)
+		} else if !ack.Success {
+			log.Printf("[P2P Seeder] Store node %s failed to verify piece: %s", pid, ack.Error)
+		} else {
+			log.Printf("[P2P Seeder] Successfully seeded piece for cell [%d, %d] to Store Node %s", row, col, pid)
+		}
+		stream.Close()
 	}
 
-	url := fmt.Sprintf("%s/store/cell/%d/%d", b.storeNodeAddr, row, col)
-	log.Printf("[P2P] Dialing stream /store/cell/%d/%d to %s", row, col, b.storeNodeAddr)
-
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("P2P stream failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("remote peer returned error %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	log.Printf("[P2P] Stream finished successfully for cell [%d, %d]", row, col)
 	return nil
+}
+
+func peerstoreAddressTTL() time.Duration {
+	return 10 * time.Minute
 }

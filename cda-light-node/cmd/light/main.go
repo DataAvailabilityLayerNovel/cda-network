@@ -1,17 +1,30 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/big"
 	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
 	"cda-light-node/config"
 	"cda-light-node/internal/service"
 	"cda-light-node/internal/verifier"
 
+	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	bls12381kzg "github.com/consensys/gnark-crypto/ecc/bls12-381/kzg"
+	"github.com/libp2p/go-libp2p/core/peer"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/multiformats/go-multiaddr"
 )
 
 func main() {
@@ -31,8 +44,110 @@ func main() {
 	// 2. Initialize Verifier
 	dasVerifier := verifier.NewDASVerifier(cfg.K, kzg)
 
-	// 3. Initialize HTTP API Service
-	apiService := service.NewAPIService(cfg.PublisherAddr, cfg.BootstrapsMap, dasVerifier, cfg.CrashOnFail)
+	// 3. Initialize P2P Host (using seed based on API port)
+	privKey, pid, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-light-%d", cfg.Port))
+	if err != nil {
+		log.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	p2pPort := cfg.Port + 10000 // e.g. 8095 -> 18095
+	p2pHost, err := p2pcommon.NewP2PHost(p2pPort, privKey)
+	if err != nil {
+		log.Fatalf("Failed to start P2P Host: %v", err)
+	}
+
+	log.Printf("[P2P] Light Node Host started with ID %s listening on %v", pid.String(), p2pHost.Addrs())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 4. Initialize GossipSub
+	ps, err := pubsub.NewGossipSub(ctx, p2pHost)
+	if err != nil {
+		log.Fatalf("Failed to start GossipSub: %v", err)
+	}
+
+	// 4.5. Connect to Bootstrap Nodes via P2P to join GossipSub mesh
+	for colIdx, httpAddr := range cfg.BootstrapsMap {
+		_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", colIdx))
+		if err != nil {
+			log.Printf("[P2P] Failed to derive bootstrap keypair for col %d: %v", colIdx, err)
+			continue
+		}
+
+		// Convert HTTP address to P2P multiaddr: http://host:port -> /dns4/host/tcp/(port+10000)
+		bootAddr := httpAddr
+		if strings.HasPrefix(bootAddr, "http://") || strings.HasPrefix(bootAddr, "https://") {
+			u, err := url.Parse(bootAddr)
+			if err == nil {
+				hostStr := u.Hostname()
+				portStr := u.Port()
+				if portVal, err := strconv.Atoi(portStr); err == nil {
+					p2pPort := portVal + 10000
+					if hostStr == "localhost" || hostStr == "127.0.0.1" {
+						bootAddr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p2pPort)
+					} else {
+						bootAddr = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, p2pPort)
+					}
+				}
+			}
+		}
+
+		fullAddr := fmt.Sprintf("%s/p2p/%s", bootAddr, bootPID.String())
+		maddr, err := multiaddr.NewMultiaddr(fullAddr)
+		if err != nil {
+			log.Printf("[P2P] Failed to parse bootstrap multiaddr %s: %v", fullAddr, err)
+			continue
+		}
+
+		bootInfo, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			log.Printf("[P2P] Failed to parse AddrInfo for bootstrap col %d: %v", colIdx, err)
+			continue
+		}
+
+		go func(info peer.AddrInfo) {
+			for {
+				if err := p2pHost.Connect(ctx, info); err == nil {
+					log.Printf("[P2P] Light Node connected to Bootstrap Node %s", info.ID)
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					time.Sleep(2 * time.Second)
+				}
+			}
+		}(*bootInfo)
+	}
+
+	// 5. Initialize HTTP API Service
+	apiService := service.NewAPIService(cfg.PublisherAddr, cfg.BootstrapsMap, dasVerifier, cfg.CrashOnFail, p2pHost, ps)
+
+	// 6. Subscribe to Header GossipSub topic
+	topic, err := ps.Join(p2pcommon.TopicHeader)
+	if err != nil {
+		log.Fatalf("Failed to join header GossipSub topic: %v", err)
+	}
+
+	sub, err := topic.Subscribe()
+	if err != nil {
+		log.Fatalf("Failed to subscribe to header GossipSub topic: %v", err)
+	}
+
+	go func() {
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return
+			}
+			var header service.BlockHeader
+			if err := json.Unmarshal(msg.Data, &header); err == nil {
+				apiService.CacheHeader(&header)
+			}
+		}
+	}()
 
 	mux := http.NewServeMux()
 	apiService.RegisterHandlers(mux)
@@ -43,10 +158,27 @@ func main() {
 		w.Write([]byte("healthy"))
 	})
 
-	// 4. Start HTTP Server
+	// 7. Start HTTP Server
 	addr := fmt.Sprintf(":%d", cfg.Port)
-	log.Printf("Light Node listening on %s...", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("Light Node HTTP server failed: %v", err)
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
 	}
+
+	go func() {
+		log.Printf("Light Node HTTP listening on %s...", addr)
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatalf("Light Node HTTP server failed: %v", err)
+		}
+	}()
+
+	// Signal handling for clean exit
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	<-sigChan
+	log.Printf("Shutting down Light Node...")
+	server.Shutdown(ctx)
+	p2pHost.Close()
+	cancel()
 }

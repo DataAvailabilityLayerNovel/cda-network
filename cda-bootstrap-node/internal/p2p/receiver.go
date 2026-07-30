@@ -1,30 +1,27 @@
 package p2p
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
-	"strconv"
-	"strings"
 	"sync"
+	"time"
 
 	"cda-bootstrap-node/internal/engine"
 	"cda-bootstrap-node/internal/storage"
 	"cda-bootstrap-node/internal/verifier"
+
+	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-type BootstrapPayload struct {
-	BlockID      string            `json:"block_id"`
-	ColIdx       int               `json:"col_idx"`
-	ColumnData   []string          `json:"column_data"`   // Hex-encoded cells
-	PieceCommits []string          `json:"piece_commits"` // Hex-encoded piece commitments
-	MerkleProofs []cda.MerkleProof `json:"merkle_proofs"`
-}
-
 type Receiver struct {
+	host          host.Host
 	kzg           cda.KZGProvider
 	publisherAddr string
 	k             int
@@ -33,11 +30,15 @@ type Receiver struct {
 	encoder       *engine.RLNCEncoder
 	broadcaster   *Broadcaster
 	crashOnFail   bool
-	activeStores  map[string]bool
-	activeMu      sync.RWMutex
+
+	// Dynamic Peer Registry
+	peersMu      sync.RWMutex
+	activePeers  map[peer.ID]p2pcommon.PeerInfo
+	lastSeenPeer map[peer.ID]time.Time
 }
 
 func NewReceiver(
+	h host.Host,
 	kzg cda.KZGProvider,
 	publisherAddr string,
 	k int,
@@ -47,7 +48,8 @@ func NewReceiver(
 	broadcaster *Broadcaster,
 	crashOnFail bool,
 ) *Receiver {
-	return &Receiver{
+	rcv := &Receiver{
+		host:          h,
 		kzg:           kzg,
 		publisherAddr: publisherAddr,
 		k:             k,
@@ -56,49 +58,60 @@ func NewReceiver(
 		encoder:       encoder,
 		broadcaster:   broadcaster,
 		crashOnFail:   crashOnFail,
-		activeStores:  make(map[string]bool),
+		activePeers:   make(map[peer.ID]p2pcommon.PeerInfo),
+		lastSeenPeer:  make(map[peer.ID]time.Time),
 	}
+	// Connect broadcaster back to registry
+	broadcaster.SetRegistry(rcv)
+	return rcv
 }
 
-func (rcv *Receiver) RegisterHandlers(mux *http.ServeMux) {
-	mux.HandleFunc("/bootstrap/column/", rcv.handleReceiveColumn)
-	mux.HandleFunc("/bootstrap/register", rcv.handleRegisterStore)
-	mux.HandleFunc("/bootstrap/deregister", rcv.handleDeregisterStore)
-	mux.HandleFunc("/bootstrap/peers", rcv.handleGetPeers)
+// Start listens to libp2p streams
+func (rcv *Receiver) Start(ctx context.Context) {
+	rcv.host.SetStreamHandler(p2pcommon.ProtoPublisherPush, rcv.handleReceiveColumn)
+	rcv.host.SetStreamHandler(p2pcommon.ProtoBootstrapRouting, rcv.handleRouting)
+
+	// Periodically clean up stale peers (older than 15s)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		for {
+			select {
+			case <-ticker.C:
+				rcv.peersMu.Lock()
+				now := time.Now()
+				for pid, lastSeen := range rcv.lastSeenPeer {
+					if now.Sub(lastSeen) > 15*time.Second {
+						log.Printf("[P2P Registry] Removing stale peer: %s", pid)
+						delete(rcv.activePeers, pid)
+						delete(rcv.lastSeenPeer, pid)
+					}
+				}
+				rcv.peersMu.Unlock()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
-func (rcv *Receiver) handleReceiveColumn(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
+	defer stream.Close()
+
+	var payload p2pcommon.PublisherPushRequest
+	if err := json.NewDecoder(stream).Decode(&payload); err != nil {
+		rcv.respondWithError(stream, fmt.Sprintf("failed to decode payload: %v", err))
 		return
 	}
 
-	// URL format: /bootstrap/column/:colIdx
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 4 {
-		http.Error(w, "Missing column index in URL", http.StatusBadRequest)
-		return
-	}
-	colIdx, err := strconv.Atoi(parts[3])
-	if err != nil {
-		http.Error(w, "Invalid column index: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	var payload BootstrapPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(w, "Failed to decode payload: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("[P2P] Received Stream /bootstrap/column/%d for Block %s", colIdx, payload.BlockID)
+	colIdx := payload.ColIdx
+	log.Printf("[P2P] Received Push stream for Column %d, Block %s", colIdx, payload.BlockID)
 
 	// 1. Decode hex data cells and commitments
 	columnData := make([][]byte, len(payload.ColumnData))
 	for i, h := range payload.ColumnData {
 		b, err := hex.DecodeString(h)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Invalid hex string in column data at index %d: %v", i, err), http.StatusBadRequest)
+			rcv.respondWithError(stream, fmt.Sprintf("invalid hex in column data: %v", err))
 			return
 		}
 		columnData[i] = b
@@ -108,20 +121,28 @@ func (rcv *Receiver) handleReceiveColumn(w http.ResponseWriter, r *http.Request)
 	for i, h := range payload.PieceCommits {
 		b, err := hex.DecodeString(h)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Invalid hex string in piece commitments at index %d: %v", i, err), http.StatusBadRequest)
+			rcv.respondWithError(stream, fmt.Sprintf("invalid hex in piece commitments: %v", err))
 			return
 		}
 		pieceCommits[i] = b
 	}
 
+	merkleProofs := make([]cda.MerkleProof, len(payload.MerkleProofs))
+	for i, p := range payload.MerkleProofs {
+		merkleProofs[i] = cda.MerkleProof{
+			Index:    p.Index,
+			Siblings: p.Siblings,
+		}
+	}
+
 	// 2. Verifier: Verify Fiat-Shamir and consistency
-	ok, err := verifier.VerifyPublisherData(rcv.kzg, rcv.publisherAddr, payload.BlockID, colIdx, columnData, pieceCommits, payload.MerkleProofs, rcv.k)
+	ok, err := verifier.VerifyPublisherData(rcv.kzg, rcv.publisherAddr, payload.BlockID, colIdx, columnData, pieceCommits, merkleProofs, rcv.k)
 	if err != nil {
 		if rcv.crashOnFail {
 			log.Fatalf("Verifier error for Column %d (CRASH): %v", colIdx, err)
 		}
 		log.Printf("Verifier error for Column %d: %v", colIdx, err)
-		http.Error(w, "Verification error: "+err.Error(), http.StatusBadRequest)
+		rcv.respondWithError(stream, "Verification error: "+err.Error())
 		return
 	}
 	if !ok {
@@ -129,22 +150,26 @@ func (rcv *Receiver) handleReceiveColumn(w http.ResponseWriter, r *http.Request)
 			log.Fatalf("Verifier failed (CRASH): data from publisher for Column %d is not consistent", colIdx)
 		}
 		log.Printf("Verifier failed: data from publisher for Column %d is not consistent", colIdx)
-		http.Error(w, "Data consistency check failed", http.StatusBadRequest)
+		rcv.respondWithError(stream, "Data consistency check failed")
 		return
 	}
 
 	log.Printf("[P2P] Verification succeeded for Column %d", colIdx)
+
 	// 3. Gossip commitments and Merkle proofs immediately (Fast Path Phase 1)
-	if err := rcv.broadcaster.BroadcastAnchor(payload.BlockID, colIdx, pieceCommits, payload.MerkleProofs); err != nil {
+	if err := rcv.broadcaster.BroadcastAnchor(payload.BlockID, colIdx, pieceCommits, merkleProofs); err != nil {
 		log.Printf("Failed to broadcast anchor for Column %d: %v", colIdx, err)
-		http.Error(w, "Anchor broadcast failed: "+err.Error(), http.StatusInternalServerError)
+		rcv.respondWithError(stream, "Anchor broadcast failed: "+err.Error())
 		return
 	}
 
 	// 4. Store in Local Cache
 	rcv.cache.Store(payload.BlockID, colIdx, columnData, pieceCommits)
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+
+	// Respond with success
+	json.NewEncoder(stream).Encode(struct {
+		Success bool `json:"success"`
+	}{Success: true})
 
 	// 5. Phase 2 (Async Heavy Task)
 	go func() {
@@ -180,72 +205,117 @@ func (rcv *Receiver) handleReceiveColumn(w http.ResponseWriter, r *http.Request)
 	}()
 }
 
-type RegisterPayload struct {
-	Addr string `json:"addr"`
+func (rcv *Receiver) handleRouting(stream network.Stream) {
+	defer stream.Close()
+
+	var req p2pcommon.BootstrapRoutingRequest
+	if err := json.NewDecoder(stream).Decode(&req); err != nil {
+		log.Printf("[P2P Registry] Failed to decode routing request: %v", err)
+		return
+	}
+
+	pid, err := peer.Decode(req.Peer.PeerID)
+	if err != nil {
+		log.Printf("[P2P Registry] Invalid PeerID: %s: %v", req.Peer.PeerID, err)
+		return
+	}
+
+	isLightNode := req.Peer.Row == -1 && req.Peer.Col == -1
+
+	// Update registry
+	rcv.peersMu.Lock()
+	if !isLightNode {
+		if req.IsLeave {
+			delete(rcv.activePeers, pid)
+			delete(rcv.lastSeenPeer, pid)
+			rcv.peersMu.Unlock()
+			log.Printf("[P2P Registry] Peer gracefully left: %s", pid)
+			return
+		}
+		rcv.activePeers[pid] = req.Peer
+		rcv.lastSeenPeer[pid] = time.Now()
+	}
+
+	// Find peers in the requester's row or column
+	var rowPeers []p2pcommon.PeerInfo
+	var colPeers []p2pcommon.PeerInfo
+
+	for p, info := range rcv.activePeers {
+		if p == pid {
+			continue // skip self
+		}
+		if isLightNode {
+			colPeers = append(colPeers, info)
+			rowPeers = append(rowPeers, info)
+		} else {
+			if info.Row == req.Peer.Row {
+				rowPeers = append(rowPeers, info)
+			}
+			if info.Col == req.Peer.Col {
+				colPeers = append(colPeers, info)
+			}
+		}
+	}
+	rcv.peersMu.Unlock()
+
+	resp := p2pcommon.BootstrapRoutingResponse{
+		RowPeers: rowPeers,
+		ColPeers: colPeers,
+	}
+
+	if err := json.NewEncoder(stream).Encode(resp); err != nil {
+		log.Printf("[P2P Registry] Failed to write routing response to %s: %v", pid, err)
+	}
 }
 
-func (rcv *Receiver) handleRegisterStore(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
+func (rcv *Receiver) GetPeersForCell(row, col int) []p2pcommon.PeerInfo {
+	rcv.peersMu.RLock()
+	defer rcv.peersMu.RUnlock()
+
+	var colPeers []p2pcommon.PeerInfo
+	for _, info := range rcv.activePeers {
+		colPeers = append(colPeers, info)
 	}
 
-	var p RegisterPayload
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+	if len(colPeers) == 0 {
+		return nil
 	}
 
-	if p.Addr == "" {
-		http.Error(w, "empty address", http.StatusBadRequest)
-		return
+	// Distribute rows across available store nodes in the column.
+	// We match store nodes whose Row coordinate equals row % len(colPeers).
+	var matched []p2pcommon.PeerInfo
+	targetRowMod := row % len(colPeers)
+	for _, info := range colPeers {
+		if info.Row == targetRowMod {
+			matched = append(matched, info)
+		}
 	}
 
-	rcv.activeMu.Lock()
-	rcv.activeStores[p.Addr] = true
-	rcv.activeMu.Unlock()
+	// Fallback to deterministic modulo indexing if no exact Row match
+	if len(matched) == 0 {
+		idx := row % len(colPeers)
+		matched = append(matched, colPeers[idx])
+	}
 
-	log.Printf("[P2P Registry] Registered Store Node: %s", p.Addr)
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("registered"))
+	return matched
 }
 
-func (rcv *Receiver) handleDeregisterStore(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var p RegisterPayload
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	rcv.activeMu.Lock()
-	delete(rcv.activeStores, p.Addr)
-	rcv.activeMu.Unlock()
-
-	log.Printf("[P2P Registry] Deregistered Store Node: %s", p.Addr)
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("deregistered"))
-}
-
-func (rcv *Receiver) handleGetPeers(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	rcv.activeMu.RLock()
+func (rcv *Receiver) GetActivePeers() []string {
+	rcv.peersMu.RLock()
+	defer rcv.peersMu.RUnlock()
 	var list []string
-	for k := range rcv.activeStores {
-		list = append(list, k)
+	for _, info := range rcv.activePeers {
+		list = append(list, info.Multiaddrs...)
 	}
-	rcv.activeMu.RUnlock()
+	return list
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"peers": list,
+func (rcv *Receiver) respondWithError(stream network.Stream, errMsg string) {
+	json.NewEncoder(stream).Encode(struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}{
+		Success: false,
+		Error:   errMsg,
 	})
 }

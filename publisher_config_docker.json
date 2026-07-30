@@ -2,13 +2,13 @@
   "api_port": 8080,
   "k": 4,
   "bootstrap_peers": {
-    "0": "http://bootstrap-0:8090",
-    "1": "http://bootstrap-0:8090",
-    "2": "http://bootstrap-1:8091",
-    "3": "http://bootstrap-1:8091",
-    "4": "http://bootstrap-2:8092",
-    "5": "http://bootstrap-2:8092",
-    "6": "http://bootstrap-3:8093",
-    "7": "http://bootstrap-3:8093"
+    "0": "/dns4/bootstrap-0/tcp/18090",
+    "1": "/dns4/bootstrap-0/tcp/18090",
+    "2": "/dns4/bootstrap-1/tcp/18091",
+    "3": "/dns4/bootstrap-1/tcp/18091",
+    "4": "/dns4/bootstrap-2/tcp/18092",
+    "5": "/dns4/bootstrap-2/tcp/18092",
+    "6": "/dns4/bootstrap-3/tcp/18093",
+    "7": "/dns4/bootstrap-3/tcp/18093"
   }
 }

@@ -1,18 +1,28 @@
 package service
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"cda-light-node/internal/verifier"
 
+	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/rlnc"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/multiformats/go-multiaddr"
 )
 
 type APIService struct {
@@ -20,6 +30,11 @@ type APIService struct {
 	bootstrapsMap map[int]string
 	verifier      *verifier.DASVerifier
 	crashOnFail   bool
+	host          host.Host
+	ps            *pubsub.PubSub
+
+	headersMu sync.RWMutex
+	headers   map[string]*BlockHeader
 }
 
 type BlockHeader struct {
@@ -27,25 +42,6 @@ type BlockHeader struct {
 	CommitsRoot string   `json:"commits_root"`
 	ColumnComm  [][]byte `json:"column_comm"`
 	Coeffs      []byte   `json:"coeffs"`
-}
-
-type StorePayload struct {
-	BlockID string `json:"block_id"`
-	Row     int    `json:"row"`
-	Col     int    `json:"col"`
-	Data    string `json:"data"`
-	Coeffs  string `json:"coeffs"`
-	Proof   string `json:"proof"`
-}
-
-type CellRetrieveResponse struct {
-	BlockID     string         `json:"block_id"`
-	Row         int            `json:"row"`
-	Col         int            `json:"col"`
-	Recovered   bool           `json:"recovered"`
-	Data        string         `json:"data,omitempty"`
-	PiecesCount int            `json:"pieces_count"`
-	Pieces      []StorePayload `json:"pieces"`
 }
 
 type SampleResult struct {
@@ -62,13 +58,30 @@ type DASResponse struct {
 	Results []SampleResult `json:"results"`
 }
 
-func NewAPIService(publisherAddr string, bootstrapsMap map[int]string, v *verifier.DASVerifier, crashOnFail bool) *APIService {
+func NewAPIService(
+	publisherAddr string,
+	bootstrapsMap map[int]string,
+	v *verifier.DASVerifier,
+	crashOnFail bool,
+	h host.Host,
+	ps *pubsub.PubSub,
+) *APIService {
 	return &APIService{
 		publisherAddr: publisherAddr,
 		bootstrapsMap: bootstrapsMap,
 		verifier:      v,
 		crashOnFail:   crashOnFail,
+		host:          h,
+		ps:            ps,
+		headers:       make(map[string]*BlockHeader),
 	}
+}
+
+func (s *APIService) CacheHeader(header *BlockHeader) {
+	s.headersMu.Lock()
+	defer s.headersMu.Unlock()
+	s.headers[header.BlockID] = header
+	log.Printf("[P2P Sync] Cached block header for block %s received via GossipSub", header.BlockID)
 }
 
 func (s *APIService) RegisterHandlers(mux *http.ServeMux) {
@@ -87,24 +100,32 @@ func (s *APIService) handleDASSample(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Fetch Block Header from Publisher
-	headerUrl := fmt.Sprintf("%s/header/%s", s.publisherAddr, blockID)
-	resp, err := http.Get(headerUrl)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to fetch block header: %v", err), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
+	// 1. Get header from local P2P cache or fallback to HTTP from Publisher
+	s.headersMu.RLock()
+	header, exists := s.headers[blockID]
+	s.headersMu.RUnlock()
 
-	if resp.StatusCode == http.StatusNotFound {
-		http.Error(w, "Block Header not found on Publisher", http.StatusNotFound)
-		return
-	}
+	if !exists {
+		log.Printf("[LightNode] Header not found in local P2P cache for block %s. Fetching via HTTP fallback...", blockID)
+		headerUrl := fmt.Sprintf("%s/header/%s", s.publisherAddr, blockID)
+		resp, err := http.Get(headerUrl)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to fetch block header: %v", err), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
 
-	var header BlockHeader
-	if err := json.NewDecoder(resp.Body).Decode(&header); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to parse block header: %v", err), http.StatusInternalServerError)
-		return
+		if resp.StatusCode == http.StatusNotFound {
+			http.Error(w, "Block Header not found on Publisher", http.StatusNotFound)
+			return
+		}
+
+		header = &BlockHeader{}
+		if err := json.NewDecoder(resp.Body).Decode(header); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to parse block header: %v", err), http.StatusInternalServerError)
+			return
+		}
+		s.CacheHeader(header)
 	}
 
 	// Determine matrix size N
@@ -127,7 +148,7 @@ func (s *APIService) handleDASSample(w http.ResponseWriter, r *http.Request) {
 		// Sample EVERY single cell in the EDS (N x N)
 		for rIdx := 0; rIdx < n; rIdx++ {
 			for cIdx := 0; cIdx < n; cIdx++ {
-				res := s.sampleCell(blockID, rIdx, cIdx, &header)
+				res := s.sampleCell(blockID, rIdx, cIdx, header)
 				results = append(results, res)
 			}
 		}
@@ -139,7 +160,7 @@ func (s *APIService) handleDASSample(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid row/col parameter", http.StatusBadRequest)
 			return
 		}
-		res := s.sampleCell(blockID, row, col, &header)
+		res := s.sampleCell(blockID, row, col, header)
 		results = append(results, res)
 	} else {
 		// Random DAS sampling
@@ -153,7 +174,7 @@ func (s *APIService) handleDASSample(w http.ResponseWriter, r *http.Request) {
 		for i := 0; i < numSamples; i++ {
 			row := rand.Intn(n)
 			col := rand.Intn(n)
-			res := s.sampleCell(blockID, row, col, &header)
+			res := s.sampleCell(blockID, row, col, header)
 			results = append(results, res)
 		}
 	}
@@ -188,47 +209,139 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("no bootstrap node configured for network column %d", netColIdx)}
 	}
 
-	// Dynamic Resolution: query bootstrap node for active stores
-	peersUrl := fmt.Sprintf("%s/bootstrap/peers", bootAddr)
-	peersResp, err := http.Get(peersUrl)
+	if strings.HasPrefix(bootAddr, "http://") || strings.HasPrefix(bootAddr, "https://") {
+		u, err := url.Parse(bootAddr)
+		if err == nil {
+			hostStr := u.Hostname()
+			portStr := u.Port()
+			if portVal, err := strconv.Atoi(portStr); err == nil {
+				p2pPort := portVal + 10000
+				if hostStr == "localhost" || hostStr == "127.0.0.1" {
+					bootAddr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p2pPort)
+				} else {
+					bootAddr = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, p2pPort)
+				}
+			}
+		}
+	}
+
+	colIdx := netColIdx * (n / 4)
+	_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", colIdx))
 	if err != nil {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to discover peers from bootstrap %s: %v", bootAddr, err)}
-	}
-	defer peersResp.Body.Close()
-
-	if peersResp.StatusCode != http.StatusOK {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("bootstrap returned status %d on peers query", peersResp.StatusCode)}
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to calculate bootstrap PeerID: %v", err)}
 	}
 
-	var peersData struct {
-		Peers []string `json:"peers"`
-	}
-	if err := json.NewDecoder(peersResp.Body).Decode(&peersData); err != nil || len(peersData.Peers) == 0 {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("no active store nodes registered on bootstrap %s", bootAddr)}
-	}
-
-	// Pick a random store node in the dynamic list to retrieve the cell pieces
-	storeUrl := peersData.Peers[rand.Intn(len(peersData.Peers))]
-	url := fmt.Sprintf("%s/store/cell/retrieve/%s/%d/%d", storeUrl, blockID, row, col)
-
-	resp, err := http.Get(url)
+	bootstrapAddrFull := fmt.Sprintf("%s/p2p/%s", bootAddr, bootPID.String())
+	maddr, err := multiaddr.NewMultiaddr(bootstrapAddrFull)
 	if err != nil {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to query store %s: %v", storeUrl, err)}
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("store returned status %d", resp.StatusCode)}
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("invalid bootstrap multiaddr: %v", err)}
 	}
 
-	var retrieveResp CellRetrieveResponse
-	if err := json.NewDecoder(resp.Body).Decode(&retrieveResp); err != nil {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to parse store response: %v", err)}
+	bootInfo, err := peer.AddrInfoFromP2pAddr(maddr)
+	if err != nil {
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to parse peer info: %v", err)}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := s.host.Connect(ctx, *bootInfo); err != nil {
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to connect to bootstrap %s: %v", bootInfo.ID, err)}
+	}
+
+	// Query bootstrap node for active store node list via P2P routing RPC
+	stream, err := s.host.NewStream(ctx, bootInfo.ID, p2pcommon.ProtoBootstrapRouting)
+	if err != nil {
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to open routing stream: %v", err)}
+	}
+	defer stream.Close()
+
+	req := p2pcommon.BootstrapRoutingRequest{
+		Peer: p2pcommon.PeerInfo{
+			PeerID:     s.host.ID().String(),
+			Multiaddrs: []string{}, // Light node does not need dynamic indexing
+			Row:        -1,
+			Col:        -1,
+		},
+		TargetRow: row,
+		TargetCol: col,
+	}
+
+	if err := json.NewEncoder(stream).Encode(req); err != nil {
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to request routing info: %v", err)}
+	}
+
+	var routingResp p2pcommon.BootstrapRoutingResponse
+	if err := json.NewDecoder(stream).Decode(&routingResp); err != nil {
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to read routing info: %v", err)}
+	}
+
+	// Filter store nodes matching target column subnet
+	var activeStores []p2pcommon.PeerInfo
+	for _, p := range routingResp.ColPeers {
+		storeNetCol := 0
+		if colsPerNetCol > 0 {
+			storeNetCol = p.Col / colsPerNetCol
+		}
+		if storeNetCol == netColIdx {
+			activeStores = append(activeStores, p)
+		}
+	}
+
+	// Fallback to all column peers if none registered specifically for target cell (Bootstrap may return column peers)
+	if len(activeStores) == 0 {
+		activeStores = routingResp.ColPeers
+	}
+
+	if len(activeStores) == 0 {
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("no active store nodes registered on bootstrap %s for column %d", bootInfo.ID, col)}
+	}
+
+	// Pick a random store node in the dynamic list to query
+	selectedStore := activeStores[rand.Intn(len(activeStores))]
+	storePID, err := peer.Decode(selectedStore.PeerID)
+	if err != nil {
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("invalid store Peer ID: %v", err)}
+	}
+
+	// Add store multiaddrs to peerstore
+	for _, mStr := range selectedStore.Multiaddrs {
+		m, err := multiaddr.NewMultiaddr(mStr)
+		if err == nil {
+			s.host.Peerstore().AddAddr(storePID, m, 10*time.Minute)
+		}
+	}
+
+	if err := s.host.Connect(ctx, peer.AddrInfo{ID: storePID}); err != nil {
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to connect to store node %s: %v", storePID, err)}
+	}
+
+	// Dial store pieces query P2P stream
+	storeStream, err := s.host.NewStream(ctx, storePID, p2pcommon.ProtoStoreGetPieces)
+	if err != nil {
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to open P2P stream on store node: %v", err)}
+	}
+	defer storeStream.Close()
+
+	fetchReq := p2pcommon.StoreFetchRequest{
+		BlockID:     blockID,
+		Row:         row,
+		Col:         col,
+		IsRemoteHop: false,
+	}
+
+	if err := json.NewEncoder(storeStream).Encode(fetchReq); err != nil {
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to send P2P request: %v", err)}
+	}
+
+	var fetchResp p2pcommon.StoreFetchResponse
+	if err := json.NewDecoder(storeStream).Decode(&fetchResp); err != nil {
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to read P2P response: %v", err)}
 	}
 
 	// Convert retrieved pieces into cda.ReceivedPiece
 	var recvPieces []cda.ReceivedPiece
-	for _, p := range retrieveResp.Pieces {
+	for _, p := range fetchResp.Pieces {
 		decData, err1 := hex.DecodeString(p.Data)
 		decCoeffs, err2 := hex.DecodeString(p.Coeffs)
 		decProof, err3 := hex.DecodeString(p.Proof)

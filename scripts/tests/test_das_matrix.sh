@@ -27,48 +27,53 @@ EOF
 
 echo "=== 3. Starting Services in Background ==="
 
-# --- Network Column 0 (Handles data cols 0, 1) ---
+## --- Start Bootstraps first ---
 # Bootstrap Node 0 (Port 8090)
 ./bin/bootstrap -port 8090 -col 0 -store http://localhost:8082 -publisher http://localhost:8080 -k 4 > bootstrap0.log 2>&1 &
 BOOTSTRAP0_PID=$!
+
+# Bootstrap Node 1 (Port 8091)
+./bin/bootstrap -port 8091 -col 2 -store http://localhost:8084 -publisher http://localhost:8080 -k 4 > bootstrap1.log 2>&1 &
+BOOTSTRAP1_PID=$!
+
+# Bootstrap Node 2 (Port 8092)
+./bin/bootstrap -port 8092 -col 4 -store http://localhost:8086 -publisher http://localhost:8080 -k 4 > bootstrap2.log 2>&1 &
+BOOTSTRAP2_PID=$!
+
+# Bootstrap Node 3 (Port 8093)
+./bin/bootstrap -port 8093 -col 6 -store http://localhost:8088 -publisher http://localhost:8080 -k 4 > bootstrap3.log 2>&1 &
+BOOTSTRAP3_PID=$!
+
+# Wait for bootstraps to spin up and bind their ports
+sleep 2
+
+# --- Start Store Nodes, Publisher, and Light Nodes ---
 # Store Node 0-1 (Port 8082) - registers to Bootstrap 8090
 ./bin/store -port 8082 -row 0 -col 0 -publisher http://localhost:8080 -bootstrap http://localhost:8090 -k 4 -myaddr http://localhost:8082 > store0_1.log 2>&1 &
 STORE0_1_PID=$!
 # Store Node 0-2 (Port 8083) - registers to Bootstrap 8090
-./bin/store -port 8083 -row 0 -col 0 -publisher http://localhost:8080 -bootstrap http://localhost:8090 -k 4 -myaddr http://localhost:8083 > store0_2.log 2>&1 &
+./bin/store -port 8083 -row 1 -col 0 -publisher http://localhost:8080 -bootstrap http://localhost:8090 -k 4 -myaddr http://localhost:8083 > store0_2.log 2>&1 &
 STORE0_2_PID=$!
 
-# --- Network Column 1 (Handles data cols 2, 3) ---
-# Bootstrap Node 1 (Port 8091)
-./bin/bootstrap -port 8091 -col 2 -store http://localhost:8084 -publisher http://localhost:8080 -k 4 > bootstrap1.log 2>&1 &
-BOOTSTRAP1_PID=$!
 # Store Node 1-1 (Port 8084) - registers to Bootstrap 8091
 ./bin/store -port 8084 -row 0 -col 2 -publisher http://localhost:8080 -bootstrap http://localhost:8091 -k 4 -myaddr http://localhost:8084 > store1_1.log 2>&1 &
 STORE1_1_PID=$!
 # Store Node 1-2 (Port 8085) - registers to Bootstrap 8091
-./bin/store -port 8085 -row 0 -col 2 -publisher http://localhost:8080 -bootstrap http://localhost:8091 -k 4 -myaddr http://localhost:8085 > store1_2.log 2>&1 &
+./bin/store -port 8085 -row 1 -col 2 -publisher http://localhost:8080 -bootstrap http://localhost:8091 -k 4 -myaddr http://localhost:8085 > store1_2.log 2>&1 &
 STORE1_2_PID=$!
 
-# --- Network Column 2 (Handles data cols 4, 5) ---
-# Bootstrap Node 2 (Port 8092)
-./bin/bootstrap -port 8092 -col 4 -store http://localhost:8086 -publisher http://localhost:8080 -k 4 > bootstrap2.log 2>&1 &
-BOOTSTRAP2_PID=$!
 # Store Node 2-1 (Port 8086) - registers to Bootstrap 8092
 ./bin/store -port 8086 -row 0 -col 4 -publisher http://localhost:8080 -bootstrap http://localhost:8092 -k 4 -myaddr http://localhost:8086 > store2_1.log 2>&1 &
 STORE2_1_PID=$!
 # Store Node 2-2 (Port 8087) - registers to Bootstrap 8092
-./bin/store -port 8087 -row 0 -col 4 -publisher http://localhost:8080 -bootstrap http://localhost:8092 -k 4 -myaddr http://localhost:8087 > store2_2.log 2>&1 &
+./bin/store -port 8087 -row 1 -col 4 -publisher http://localhost:8080 -bootstrap http://localhost:8092 -k 4 -myaddr http://localhost:8087 > store2_2.log 2>&1 &
 STORE2_2_PID=$!
 
-# --- Network Column 3 (Handles data cols 6, 7) ---
-# Bootstrap Node 3 (Port 8093)
-./bin/bootstrap -port 8093 -col 6 -store http://localhost:8088 -publisher http://localhost:8080 -k 4 > bootstrap3.log 2>&1 &
-BOOTSTRAP3_PID=$!
 # Store Node 3-1 (Port 8088) - registers to Bootstrap 8093
 ./bin/store -port 8088 -row 0 -col 6 -publisher http://localhost:8080 -bootstrap http://localhost:8093 -k 4 -myaddr http://localhost:8088 > store3_1.log 2>&1 &
 STORE3_1_PID=$!
 # Store Node 3-2 (Port 8089) - registers to Bootstrap 8093
-./bin/store -port 8089 -row 0 -col 6 -publisher http://localhost:8080 -bootstrap http://localhost:8093 -k 4 -myaddr http://localhost:8089 > store3_2.log 2>&1 &
+./bin/store -port 8089 -row 1 -col 6 -publisher http://localhost:8080 -bootstrap http://localhost:8093 -k 4 -myaddr http://localhost:8089 > store3_2.log 2>&1 &
 STORE3_2_PID=$!
 
 # --- Publisher Node (Port 8080) ---
@@ -106,7 +111,7 @@ echo "=== 4. Verifying Dynamic Registration (Phase 1) ==="
 PEERS0=$(curl -s http://localhost:8090/bootstrap/peers | jq -c '.peers')
 echo "Bootstrap Node 0 active peers list: $PEERS0"
 # Verify Store Node 0-1 and 0-2 are both registered
-if [[ "$PEERS0" != *"http://localhost:8082"* ]] || [[ "$PEERS0" != *"http://localhost:8083"* ]]; then
+if [[ "$PEERS0" != *"18082"* ]] || [[ "$PEERS0" != *"18083"* ]]; then
     echo "[-] ERROR: Dynamic registration failed!"
     exit 1
 fi
@@ -169,6 +174,8 @@ echo "$QUERY1_RESP" | jq '{block_id: .block_id, success: .success, total_cells_s
 
 if [ "$SUCCESS1" != "true" ]; then
     echo "[-] ERROR: DAS Verification on Light Node 1 failed!"
+    echo "Detailed Results (First 5 cells):"
+    echo "$QUERY1_RESP" | jq '.results[:5]'
     exit 1
 fi
 
@@ -183,11 +190,11 @@ PEERS0_AFTER=$(curl -s http://localhost:8090/bootstrap/peers | jq -c '.peers')
 echo "Bootstrap Node 0 active peers list after deregister: $PEERS0_AFTER"
 
 # Verify Store Node 0-2 is removed and 0-1 remains
-if [[ "$PEERS0_AFTER" == *"http://localhost:8083"* ]]; then
+if [[ "$PEERS0_AFTER" == *"18083"* ]]; then
     echo "[-] ERROR: Graceful deregistration failed (peer still present)!"
     exit 1
 fi
-if [[ "$PEERS0_AFTER" != *"http://localhost:8082"* ]]; then
+if [[ "$PEERS0_AFTER" != *"18082"* ]]; then
     echo "[-] ERROR: Remaining peer was incorrectly removed!"
     exit 1
 fi

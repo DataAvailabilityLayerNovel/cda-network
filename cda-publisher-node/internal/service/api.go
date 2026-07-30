@@ -1,15 +1,20 @@
 package service
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"cda-publisher-node/internal/engine"
 	"cda-publisher-node/internal/p2p"
+
+	p2pcommon "cda-p2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
 
 type APIService struct {
@@ -17,6 +22,7 @@ type APIService struct {
 	headers  map[string]*engine.BlockHeader
 	pipeline *engine.Pipeline
 	sender   *p2p.Sender
+	ps       *pubsub.PubSub
 }
 
 type PublishRequest struct {
@@ -24,11 +30,12 @@ type PublishRequest struct {
 	Data    []string `json:"data"` // List of cells as hex strings
 }
 
-func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender) *APIService {
+func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.PubSub) *APIService {
 	return &APIService{
 		headers:  make(map[string]*engine.BlockHeader),
 		pipeline: pipeline,
 		sender:   sender,
+		ps:       ps,
 	}
 }
 
@@ -72,12 +79,43 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Save Header
+	// 3. Save Header and Broadcast via GossipSub
 	s.mu.Lock()
 	s.headers[header.BlockID] = header
 	s.mu.Unlock()
 
 	log.Printf("Successfully generated Block Header for BlockID: %s", header.BlockID)
+
+	topic, err := s.ps.Join(p2pcommon.TopicHeader)
+	if err != nil {
+		log.Printf("[GossipSub] Failed to join header topic: %v", err)
+	} else {
+		headerBytes, err := json.Marshal(header)
+		if err != nil {
+			log.Printf("[GossipSub] Failed to marshal header: %v", err)
+		} else {
+			// Wait until at least 1 mesh peer is present (max 5s), then publish.
+			// This prevents silent message drop when GossipSub mesh is not yet formed.
+			published := false
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				peers := topic.ListPeers()
+				if len(peers) > 0 {
+					if err := topic.Publish(context.Background(), headerBytes); err != nil {
+						log.Printf("[GossipSub] Failed to publish header: %v", err)
+					} else {
+						log.Printf("[GossipSub] Successfully published Block Header for %s on GossipSub topic %s (mesh peers: %d)", header.BlockID, p2pcommon.TopicHeader, len(peers))
+						published = true
+					}
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			if !published {
+				log.Printf("[GossipSub] Warning: No mesh peers found for topic %s after 5s, header will only be served via HTTP fallback", p2pcommon.TopicHeader)
+			}
+		}
+	}
 
 	// 4. Distribute each column via P2P sender
 	n := int(eds.Width())

@@ -77,6 +77,13 @@ func (s *CustodyStore) GetRecodedPieces(blockID string, row, col int) []cda.Rece
 	return res
 }
 
+func (s *CustodyStore) GetPieceCount(blockID string, row, col int) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+	return len(s.received[key])
+}
+
 func (s *CustodyStore) IsComplete(blockID string, colIdx, k int) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

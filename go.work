@@ -1,4 +1,4 @@
-go 1.24.0
+go 1.25.12
 
 use (
 	./rlnc-rsmt2d
@@ -6,4 +6,5 @@ use (
 	./cda-bootstrap-node
 	./cda-store-node
 	./cda-light-node
+	./cda-p2p
 )

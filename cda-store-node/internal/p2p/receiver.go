@@ -2,49 +2,31 @@ package p2p
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
-	"strconv"
-	"strings"
+	"sync"
+	"time"
 
 	"cda-store-node/internal/engine"
 	"cda-store-node/internal/storage"
 	"cda-store-node/internal/verifier"
+
+	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	rlnc "github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/rlnc"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/multiformats/go-multiaddr"
 )
 
-type CellRetrieveResponse struct {
-	BlockID     string         `json:"block_id"`
-	Row         int            `json:"row"`
-	Col         int            `json:"col"`
-	Recovered   bool           `json:"recovered"`
-	Data        string         `json:"data,omitempty"`
-	PiecesCount int            `json:"pieces_count"`
-	Pieces      []StorePayload `json:"pieces"`
-}
-
-type AnchorPayload struct {
-	BlockID      string            `json:"block_id"`
-	ColIdx       int               `json:"col_idx"`
-	PieceCommits []string          `json:"piece_commits"`
-	MerkleProofs []cda.MerkleProof `json:"merkle_proofs"`
-}
-
-type StorePayload struct {
-	BlockID      string   `json:"block_id"`
-	Row          int      `json:"row"`
-	Col          int      `json:"col"`
-	Data         string   `json:"data"`          // Hex coded data d_i
-	Coeffs       string   `json:"coeffs"`        // Hex coefficients g_i
-	Proof        string   `json:"proof"`         // Hex combined proof P_i
-	PieceCommits []string `json:"piece_commits"` // Hex piece commitments C_0..C_k-1
-}
-
 type Receiver struct {
+	host          host.Host
+	ps            *pubsub.PubSub
 	kzg           cda.KZGProvider
 	rm            *cda.RecipientManager
 	publisherAddr string
@@ -54,9 +36,16 @@ type Receiver struct {
 	cache         *storage.CustodyStore
 	broadcaster   *Broadcaster
 	crashOnFail   bool
+
+	// Peer lists for Row and Column subnets
+	peersMu   sync.RWMutex
+	rowPeers  []p2pcommon.PeerInfo
+	colPeers  []p2pcommon.PeerInfo
 }
 
 func NewReceiver(
+	h host.Host,
+	ps *pubsub.PubSub,
 	kzg cda.KZGProvider,
 	pubAddr string,
 	k int,
@@ -67,6 +56,8 @@ func NewReceiver(
 	crashOnFail bool,
 ) *Receiver {
 	return &Receiver{
+		host:          h,
+		ps:            ps,
 		kzg:           kzg,
 		rm:            cda.NewRecipientManager(k, kzg),
 		publisherAddr: pubAddr,
@@ -79,113 +70,169 @@ func NewReceiver(
 	}
 }
 
-func (rcv *Receiver) RegisterHandlers(mux *http.ServeMux) {
-	mux.HandleFunc("/store/anchor/", rcv.handleReceiveAnchor)
-	mux.HandleFunc("/store/cell/retrieve/", rcv.handleRetrieveCell)
-	mux.HandleFunc("/store/cell/", rcv.handleReceiveCell)
-	mux.HandleFunc("/store/status/", rcv.handleStoreStatus)
+func (rcv *Receiver) SetPeers(rowPeers, colPeers []p2pcommon.PeerInfo) {
+	rcv.peersMu.Lock()
+	rcv.rowPeers = rowPeers
+	rcv.colPeers = colPeers
+	rcv.peersMu.Unlock()
+
+	// Update broadcaster with column peers for direct gossip fallback
+	var pIDs []peer.ID
+	for _, p := range colPeers {
+		if pid, err := peer.Decode(p.PeerID); err == nil {
+			pIDs = append(pIDs, pid)
+		}
+	}
+	rcv.broadcaster.UpdatePeers(pIDs)
 }
 
-func (rcv *Receiver) handleReceiveAnchor(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func (rcv *Receiver) Start(ctx context.Context) {
+	// 1. Set stream handlers
+	rcv.host.SetStreamHandler(p2pcommon.ProtoBootstrapSeed, rcv.handleSeedStream)
+	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreFetch, rcv.handleFetchStream)
+	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreGetPieces, rcv.handleFetchStream)
 
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 4 {
-		http.Error(w, "Missing column index", http.StatusBadRequest)
-		return
-	}
-	colIdx, err := strconv.Atoi(parts[3])
+	// 2. Subscribe to Column GossipSub topic
+	colTopicName := p2pcommon.TopicCol(rcv.colIdx)
+	topic, err := rcv.broadcaster.JoinTopic(colTopicName)
 	if err != nil {
-		http.Error(w, "Invalid column index", http.StatusBadRequest)
+		log.Fatalf("Failed to join column GossipSub topic %s: %v", colTopicName, err)
+	}
+
+	sub, err := topic.Subscribe()
+	if err != nil {
+		log.Fatalf("Failed to subscribe to column GossipSub topic %s: %v", colTopicName, err)
+	}
+
+	go func() {
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return
+			}
+			if msg.ReceivedFrom == rcv.host.ID() {
+				continue // skip self
+			}
+			rcv.processGossipMessage(msg.Data)
+		}
+	}()
+}
+
+func (rcv *Receiver) processGossipMessage(data []byte) {
+	// The message can be either GossipAnchorPayload or SeedCellRequest (pieces gossip)
+	// Inspect dynamic json fields to determine type
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return
 	}
 
-	var payload AnchorPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(w, "Failed to decode payload: "+err.Error(), http.StatusBadRequest)
-		return
+	if _, isAnchor := raw["merkle_proofs"]; isAnchor {
+		// Process Anchor Commitments
+		var payload p2pcommon.GossipAnchorPayload
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return
+		}
+		rcv.processAnchor(payload.BlockID, payload.ColIdx, payload.PieceCommits, payload.MerkleProofs)
+	} else {
+		// Process Recoded Piece Gossip
+		var payload p2pcommon.SeedCellRequest
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return
+		}
+		rcv.processPiece(payload.BlockID, payload.Row, payload.Col, payload.Data, payload.Coeffs, payload.Proof, payload.PieceCommits, true)
 	}
+}
 
-	log.Printf("[StoreNode] Received Anchor request for Column %d", colIdx)
+func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []string, proofsStr []p2pcommon.SerializedMerkleProof) {
+	log.Printf("[StoreNode] Received Anchor Gossip for Column %d, Block %s", colIdx, blockID)
 
 	// 1. Fetch Block Header from Publisher
-	header, err := verifier.FetchBlockHeader(rcv.publisherAddr, payload.BlockID)
+	header, err := verifier.FetchBlockHeader(rcv.publisherAddr, blockID)
 	if err != nil {
-		http.Error(w, "Failed to fetch header: "+err.Error(), http.StatusInternalServerError)
+		log.Printf("[StoreNode] Failed to fetch block header from publisher: %v", err)
 		return
 	}
 
 	// 2. Decode piece commitments
-	pieceCommits := make([][]byte, len(payload.PieceCommits))
-	for i, h := range payload.PieceCommits {
+	pieceCommits := make([][]byte, len(commitsStr))
+	for i, h := range commitsStr {
 		b, err := hex.DecodeString(h)
 		if err != nil {
-			http.Error(w, "Invalid hex in commitments: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 		pieceCommits[i] = b
 	}
 
-	// 3. Verify Anchor (Layer 1 and Layer 2 checks)
-	ok, err := verifier.VerifyAnchor(rcv.kzg, header, colIdx, pieceCommits, payload.MerkleProofs, rcv.k)
+	merkleProofs := make([]cda.MerkleProof, len(proofsStr))
+	for i, p := range proofsStr {
+		merkleProofs[i] = cda.MerkleProof{
+			Index:    p.Index,
+			Siblings: p.Siblings,
+		}
+	}
+
+	// 3. Verify Anchor
+	ok, err := verifier.VerifyAnchor(rcv.kzg, header, colIdx, pieceCommits, merkleProofs, rcv.k)
 	if err != nil {
 		if rcv.crashOnFail {
 			log.Fatalf("Anchor verification failed (CRASH): %v", err)
 		}
-		http.Error(w, "Anchor verification failed: "+err.Error(), http.StatusBadRequest)
+		log.Printf("Anchor verification failed: %v", err)
 		return
 	}
 	if !ok {
 		if rcv.crashOnFail {
 			log.Fatalf("Anchor verification failed (CRASH): invalid Merkle path or Fiat-Shamir combination")
 		}
-		http.Error(w, "Anchor verification failed: invalid Merkle path or Fiat-Shamir combination", http.StatusBadRequest)
+		log.Printf("Anchor verification failed: invalid Merkle path or Fiat-Shamir combination")
 		return
 	}
 
 	// 4. Save anchored commitments
-	rcv.cache.AnchorCommitments(payload.BlockID, colIdx, pieceCommits)
-	log.Printf("[StoreNode] Successfully anchored commitments for Block %s, Column %d", payload.BlockID, colIdx)
-	w.WriteHeader(http.StatusOK)
+	rcv.cache.AnchorCommitments(blockID, colIdx, pieceCommits)
+	log.Printf("[StoreNode] Successfully anchored commitments for Block %s, Column %d", blockID, colIdx)
 }
 
-func (rcv *Receiver) handleReceiveCell(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+func (rcv *Receiver) handleSeedStream(stream network.Stream) {
+	defer stream.Close()
+
+	var payload p2pcommon.SeedCellRequest
+	if err := json.NewDecoder(stream).Decode(&payload); err != nil {
+		rcv.respondWithError(stream, fmt.Sprintf("failed to decode seed: %v", err))
 		return
 	}
 
-	var payload StorePayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(w, "Failed to decode payload: "+err.Error(), http.StatusBadRequest)
+	err := rcv.processPiece(payload.BlockID, payload.Row, payload.Col, payload.Data, payload.Coeffs, payload.Proof, payload.PieceCommits, false)
+	if err != nil {
+		rcv.respondWithError(stream, err.Error())
 		return
 	}
 
+	json.NewEncoder(stream).Encode(struct {
+		Success bool `json:"success"`
+	}{Success: true})
+}
+
+func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsStr, proofStr string, pieceCommitsStr []string, isGossip bool) error {
 	// 1. Decode payload fields from hex
-	decodedData, err := hex.DecodeString(payload.Data)
+	decodedData, err := hex.DecodeString(dataStr)
 	if err != nil {
-		http.Error(w, "Invalid hex in data", http.StatusBadRequest)
-		return
+		return fmt.Errorf("invalid hex in data")
 	}
 
-	decodedCoeffs, err := hex.DecodeString(payload.Coeffs)
+	decodedCoeffs, err := hex.DecodeString(coeffsStr)
 	if err != nil {
-		http.Error(w, "Invalid hex in coeffs", http.StatusBadRequest)
-		return
+		return fmt.Errorf("invalid hex in coeffs")
 	}
 
-	decodedProof, err := hex.DecodeString(payload.Proof)
+	decodedProof, err := hex.DecodeString(proofStr)
 	if err != nil {
-		http.Error(w, "Invalid hex in proof", http.StatusBadRequest)
-		return
+		return fmt.Errorf("invalid hex in proof")
 	}
 
 	piece := cda.ReceivedPiece{
-		Row: payload.Row,
-		Col: payload.Col,
+		Row: row,
+		Col: col,
 		Data: rlnc.PieceData{
 			Data:   decodedData,
 			Coeffs: decodedCoeffs,
@@ -194,34 +241,30 @@ func (rcv *Receiver) handleReceiveCell(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Retrieve anchored commitments
-	pieceCommits, exists := rcv.cache.GetAnchoredCommitments(payload.BlockID, payload.Col)
+	pieceCommits, exists := rcv.cache.GetAnchoredCommitments(blockID, col)
 	if !exists {
 		// Fallback: fetch header and anchor commitments
-		log.Printf("[StoreNode] Anchored commitments not found in cache for block %s. Fetching from publisher...", payload.BlockID)
-		_, err := verifier.FetchBlockHeader(rcv.publisherAddr, payload.BlockID)
+		log.Printf("[StoreNode] Anchored commitments not found in cache for block %s. Fetching from publisher...", blockID)
+		_, err := verifier.FetchBlockHeader(rcv.publisherAddr, blockID)
 		if err != nil {
-			http.Error(w, "Failed to fetch header: "+err.Error(), http.StatusInternalServerError)
-			return
+			return fmt.Errorf("failed to fetch header: %w", err)
 		}
 
-		if len(payload.PieceCommits) == 0 {
-			http.Error(w, "Commitments not found in request payload for verification", http.StatusBadRequest)
-			return
+		if len(pieceCommitsStr) == 0 {
+			return fmt.Errorf("commitments not found in request payload for verification")
 		}
 
-		pieceCommits = make([][]byte, len(payload.PieceCommits))
-		for i, h := range payload.PieceCommits {
+		pieceCommits = make([][]byte, len(pieceCommitsStr))
+		for i, h := range pieceCommitsStr {
 			b, _ := hex.DecodeString(h)
 			pieceCommits[i] = b
 		}
 
-		// We assume Merkle checks were already performed by Bootstrap node.
-		// For simplicity, store in local cache directly.
-		rcv.cache.AnchorCommitments(payload.BlockID, payload.Col, pieceCommits)
+		rcv.cache.AnchorCommitments(blockID, col, pieceCommits)
 	}
 
 	// 3. Layer 3 (KZG Pairing Check): Verify the piece matches the combined column commitment
-	rowIdx := payload.Row
+	rowIdx := row
 	combinedProof := cda.OpeningProof(decodedProof)
 
 	pieceCommitsTyped := make([]cda.PieceCommitment, rcv.k)
@@ -230,95 +273,73 @@ func (rcv *Receiver) handleReceiveCell(w http.ResponseWriter, r *http.Request) {
 	}
 	combinedCommit, err := rcv.kzg.Combine(pieceCommitsTyped, decodedCoeffs)
 	if err != nil {
-		http.Error(w, "Failed to compute combined commitment: "+err.Error(), http.StatusBadRequest)
-		return
+		return fmt.Errorf("failed to compute combined commitment: %w", err)
 	}
 
 	if !rcv.kzg.Verify(combinedCommit, rowIdx, piece.Data.Data, combinedProof) {
 		if rcv.crashOnFail {
-			log.Fatalf("Layer 3 verification failed (CRASH): Piece [%d, %d] does not match combined column commitment", rowIdx, payload.Col)
+			log.Fatalf("Layer 3 verification failed (CRASH): Piece [%d, %d] does not match combined column commitment", rowIdx, col)
 		}
-		http.Error(w, "Layer 3 verification failed", http.StatusBadRequest)
-		return
+		return fmt.Errorf("layer 3 verification failed")
 	}
 
 	if !rcv.rm.VerifyPiece(piece, combinedCommit) {
-		log.Printf("[StoreNode] Piece verification failed (KZG pairing mismatch) for cell [%d, %d]", payload.Row, payload.Col)
-		http.Error(w, "Piece verification failed", http.StatusBadRequest)
-		return
+		log.Printf("[StoreNode] Piece verification failed (KZG pairing mismatch) for cell [%d, %d]", row, col)
+		return fmt.Errorf("piece verification failed")
 	}
 
 	// 4. Rank Filtering (Gaussian Elimination)
-	existingPieces := rcv.cache.GetPieces(payload.BlockID, payload.Row, payload.Col)
+	existingPieces := rcv.cache.GetPieces(blockID, row, col)
 	existingCoeffs := make([][]byte, len(existingPieces))
 	for i, p := range existingPieces {
 		existingCoeffs[i] = p.Data.Coeffs
 	}
 
 	if !engine.IsLinearlyIndependent(existingCoeffs, decodedCoeffs, rcv.k) {
-		log.Printf("[GossipSub] Received piece for cell [%d, %d] from peer. Linear independence check: dependent (redundant). Dropping piece.", payload.Row, payload.Col)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Redundant"))
-		return
+		log.Printf("[P2P] Received piece for cell [%d, %d]. Linear independence check: dependent (redundant). Dropping piece.", row, col)
+		return nil
 	}
 
 	// 5. Store valid piece in custody store
-	rcv.cache.StorePiece(payload.BlockID, payload.Row, payload.Col, piece)
-	log.Printf("[GossipSub] Received piece for cell [%d, %d] from peer. Linear independence check: independent. Stored piece (local rank increased to %d/%d).", payload.Row, payload.Col, len(existingPieces)+1, rcv.k)
+	rcv.cache.StorePiece(blockID, row, col, piece)
+	log.Printf("[P2P] Received piece for cell [%d, %d]. Linear independence check: independent. Stored piece (local rank increased to %d/%d).", row, col, len(existingPieces)+1, rcv.k)
 
 	// 6. P2P Recoding & GossipSub forwarding
-	updatedPieces := rcv.cache.GetPieces(payload.BlockID, payload.Row, payload.Col)
-	if len(updatedPieces) >= 2 {
-		log.Printf("[GossipSub] Local rank for cell [%d, %d] is %d/%d (>=2). Triggering local recoding of all available pieces...", payload.Row, payload.Col, len(updatedPieces), rcv.k)
-		recodedPiece, err := rcv.rm.RecodePieces(updatedPieces)
-		if err != nil {
-			log.Printf("[GossipSub] Failed to recode pieces for cell [%d, %d]: %v", payload.Row, payload.Col, err)
-		} else {
-			rcv.cache.StoreRecodedPiece(payload.BlockID, payload.Row, payload.Col, *recodedPiece)
-			log.Printf("[GossipSub] Recoding success for cell [%d, %d]. Gossiping recoded piece with coeffs %x to column neighbor peers...", payload.Row, payload.Col, recodedPiece.Data.Coeffs)
-			if err := rcv.broadcaster.BroadcastRecodedPiece(payload.BlockID, payload.Row, payload.Col, recodedPiece, pieceCommits); err != nil {
-				log.Printf("[GossipSub] Failed to gossip recoded piece for cell [%d, %d]: %v", payload.Row, payload.Col, err)
+	if !isGossip {
+		updatedPieces := rcv.cache.GetPieces(blockID, row, col)
+		if len(updatedPieces) >= 2 {
+			log.Printf("[GossipSub] Local rank for cell [%d, %d] is %d/%d (>=2). Triggering local recoding of all available pieces...", row, col, len(updatedPieces), rcv.k)
+			recodedPiece, err := rcv.rm.RecodePieces(updatedPieces)
+			if err != nil {
+				log.Printf("[GossipSub] Failed to recode pieces for cell [%d, %d]: %v", row, col, err)
 			} else {
-				log.Printf("[GossipSub] Successfully gossiped recoded piece for cell [%d, %d] to peers.", payload.Row, payload.Col)
+				rcv.cache.StoreRecodedPiece(blockID, row, col, *recodedPiece)
+				log.Printf("[GossipSub] Recoding success for cell [%d, %d]. Gossiping recoded piece with coeffs %x to column neighbor peers...", row, col, recodedPiece.Data.Coeffs)
+				if err := rcv.broadcaster.BroadcastRecodedPiece(blockID, row, col, recodedPiece, pieceCommits); err != nil {
+					log.Printf("[GossipSub] Failed to gossip recoded piece for cell [%d, %d]: %v", row, col, err)
+				} else {
+					log.Printf("[GossipSub] Successfully gossiped recoded piece for cell [%d, %d] to peers.", row, col)
+				}
 			}
 		}
 	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Stored"))
+	return nil
 }
 
-func (rcv *Receiver) handleRetrieveCell(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func (rcv *Receiver) handleFetchStream(stream network.Stream) {
+	defer stream.Close()
 
-	// Route format: /store/cell/retrieve/{blockID}/{row}/{col}
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 7 {
-		http.Error(w, "Invalid path parameters", http.StatusBadRequest)
+	var req p2pcommon.StoreFetchRequest
+	if err := json.NewDecoder(stream).Decode(&req); err != nil {
 		return
 	}
-	blockID := parts[4]
-	row, err := strconv.Atoi(parts[5])
-	if err != nil {
-		http.Error(w, "Invalid row index", http.StatusBadRequest)
-		return
-	}
-	col, err := strconv.Atoi(parts[6])
-	if err != nil {
-		http.Error(w, "Invalid column index", http.StatusBadRequest)
-		return
-	}
-
-	remoteOnly := r.URL.Query().Get("remote") == "true"
 
 	// 1. Gather all local pieces (raw and recoded filtered by rank)
-	localPieces := rcv.cache.GetPieces(blockID, row, col)
+	localPieces := rcv.cache.GetPieces(req.BlockID, req.Row, req.Col)
 	allPieces := append([]cda.ReceivedPiece(nil), localPieces...)
 
-	localRecoded := rcv.cache.GetRecodedPieces(blockID, row, col)
+	localRecoded := rcv.cache.GetRecodedPieces(req.BlockID, req.Row, req.Col)
 	for _, p := range localRecoded {
 		existingCoeffs := make([][]byte, len(allPieces))
 		for idx, val := range allPieces {
@@ -329,42 +350,69 @@ func (rcv *Receiver) handleRetrieveCell(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	log.Printf("[StoreNode] Retrieving cell [%d, %d] for block %s. Local pieces: %d", row, col, blockID, len(allPieces))
+	log.Printf("[StoreNode] Retrieving cell [%d, %d] for block %s. Local pieces: %d", req.Row, req.Col, req.BlockID, len(allPieces))
 
-	// Helper function to convert a cda.ReceivedPiece to StorePayload
-	toPayload := func(p cda.ReceivedPiece) StorePayload {
-		return StorePayload{
-			BlockID: blockID,
-			Row:     p.Row,
-			Col:     p.Col,
-			Data:    hex.EncodeToString(p.Data.Data),
-			Coeffs:  hex.EncodeToString(p.Data.Coeffs),
-			Proof:   hex.EncodeToString(p.Proof),
-		}
+	// Get commitments
+	pieceCommits, _ := rcv.cache.GetAnchoredCommitments(req.BlockID, req.Col)
+	pieceCommitsStr := make([]string, len(pieceCommits))
+	for i, c := range pieceCommits {
+		pieceCommitsStr[i] = hex.EncodeToString(c)
 	}
 
-	// If we don't have enough local pieces and we are allowed to query peers, ask them!
-	if len(allPieces) < rcv.k && !remoteOnly {
+	// 2. Query peers in column network if needed and allowed
+	if len(allPieces) < rcv.k && !req.IsRemoteHop {
 		log.Printf("[StoreNode] Not enough local pieces (%d/%d). Querying peers in column network...", len(allPieces), rcv.k)
-		for _, peer := range rcv.broadcaster.peers {
-			// Query peer for pieces
-			url := fmt.Sprintf("%s/store/cell/retrieve/%s/%d/%d?remote=true", peer, blockID, row, col)
-			resp, err := http.Get(url)
-			if err != nil {
-				log.Printf("[StoreNode] Failed to query peer %s: %v", peer, err)
-				continue
-			}
-			var peerResp struct {
-				Pieces []StorePayload `json:"pieces"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&peerResp); err != nil {
-				resp.Body.Close()
-				log.Printf("[StoreNode] Failed to decode peer response: %v", err)
-				continue
-			}
-			resp.Body.Close()
+		rcv.peersMu.RLock()
+		peersCopy := make([]p2pcommon.PeerInfo, len(rcv.colPeers))
+		copy(peersCopy, rcv.colPeers)
+		rcv.peersMu.RUnlock()
 
-			log.Printf("[StoreNode] Received %d pieces from peer %s", len(peerResp.Pieces), peer)
+		for _, pInfo := range peersCopy {
+			pid, err := peer.Decode(pInfo.PeerID)
+			if err != nil {
+				continue
+			}
+
+			// Add addresses
+			for _, addrStr := range pInfo.Multiaddrs {
+				maddr, err := multiaddr.NewMultiaddr(addrStr)
+				if err != nil {
+					continue
+				}
+				rcv.host.Peerstore().AddAddr(pid, maddr, 10*time.Minute)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			err = rcv.host.Connect(ctx, peer.AddrInfo{ID: pid})
+			if err != nil {
+				cancel()
+				continue
+			}
+
+			pStream, err := rcv.host.NewStream(ctx, pid, p2pcommon.ProtoStoreFetch)
+			cancel()
+			if err != nil {
+				continue
+			}
+
+			fetchReq := p2pcommon.StoreFetchRequest{
+				BlockID:     req.BlockID,
+				Row:         req.Row,
+				Col:         req.Col,
+				IsRemoteHop: true, // Prevent cycle
+			}
+
+			if err := json.NewEncoder(pStream).Encode(fetchReq); err != nil {
+				pStream.Close()
+				continue
+			}
+
+			var peerResp p2pcommon.StoreFetchResponse
+			if err := json.NewDecoder(pStream).Decode(&peerResp); err != nil {
+				pStream.Close()
+				continue
+			}
+			pStream.Close()
 
 			for _, pPayload := range peerResp.Pieces {
 				decData, err1 := hex.DecodeString(pPayload.Data)
@@ -374,7 +422,6 @@ func (rcv *Receiver) handleRetrieveCell(w http.ResponseWriter, r *http.Request) 
 					continue
 				}
 
-				// Build piece
 				p := cda.ReceivedPiece{
 					Row: pPayload.Row,
 					Col: pPayload.Col,
@@ -385,7 +432,6 @@ func (rcv *Receiver) handleRetrieveCell(w http.ResponseWriter, r *http.Request) 
 					Proof: cda.OpeningProof(decProof),
 				}
 
-				// Use rank filter to check if independent
 				existingCoeffs := make([][]byte, len(allPieces))
 				for idx, val := range allPieces {
 					existingCoeffs[idx] = val.Data.Coeffs
@@ -393,7 +439,7 @@ func (rcv *Receiver) handleRetrieveCell(w http.ResponseWriter, r *http.Request) 
 
 				if engine.IsLinearlyIndependent(existingCoeffs, decCoeffs, rcv.k) {
 					allPieces = append(allPieces, p)
-					log.Printf("[StoreNode] Added independent piece from peer %s. Current count: %d", peer, len(allPieces))
+					log.Printf("[StoreNode] Added independent piece from peer %s. Current count: %d", pid, len(allPieces))
 					if len(allPieces) >= rcv.k {
 						break
 					}
@@ -406,11 +452,10 @@ func (rcv *Receiver) handleRetrieveCell(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// 2. Try to recover the original cell data if we have k independent pieces
+	// 3. Try to recover the original cell data if we have k independent pieces
 	recovered := false
 	var cellDataStr string
 	if len(allPieces) >= rcv.k {
-		// Use RecipientManager to recover the cell
 		recoveredFrags, err := rcv.rm.RecoverCell(allPieces[:rcv.k])
 		if err == nil {
 			pieceSize := 64 / rcv.k
@@ -424,49 +469,63 @@ func (rcv *Receiver) handleRetrieveCell(w http.ResponseWriter, r *http.Request) 
 			}
 			cellDataStr = hex.EncodeToString(buf.Bytes())
 			recovered = true
-			log.Printf("[StoreNode] Successfully recovered cell [%d, %d] data: %s...", row, col, cellDataStr[:16])
+			log.Printf("[StoreNode] Successfully recovered cell [%d, %d] data: %s...", req.Row, req.Col, cellDataStr[:16])
 		} else {
 			log.Printf("[StoreNode] Failed to recover cell: %v", err)
 		}
 	}
 
-	// 3. Prepare response
-	piecesPayloads := make([]StorePayload, len(allPieces))
+	// Respond back
+	respPieces := make([]p2pcommon.CodedPiece, len(allPieces))
 	for i, p := range allPieces {
-		piecesPayloads[i] = toPayload(p)
+		respPieces[i] = p2pcommon.CodedPiece{
+			Row:          p.Row,
+			Col:          p.Col,
+			Data:         hex.EncodeToString(p.Data.Data),
+			Coeffs:       hex.EncodeToString(p.Data.Coeffs),
+			Proof:        hex.EncodeToString(p.Proof),
+			PieceCommits: pieceCommitsStr,
+		}
 	}
 
-	resp := CellRetrieveResponse{
-		BlockID:     blockID,
-		Row:         row,
-		Col:         col,
+	resp := p2pcommon.StoreFetchResponse{
+		BlockID:     req.BlockID,
+		Row:         req.Row,
+		Col:         req.Col,
 		Recovered:   recovered,
 		Data:        cellDataStr,
 		PiecesCount: len(allPieces),
-		Pieces:      piecesPayloads,
+		Pieces:      respPieces,
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(stream).Encode(resp)
 }
 
-func (rcv *Receiver) handleStoreStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
+func (rcv *Receiver) IsComplete(blockID string) bool {
+	n := 2 * rcv.k
+	colsPerNetCol := n / 4
+	if colsPerNetCol == 0 {
+		colsPerNetCol = 1
 	}
 
-	blockID := r.URL.Path[len("/store/status/"):]
-	if blockID == "" {
-		http.Error(w, "Missing block ID", http.StatusBadRequest)
-		return
+	for c := rcv.colIdx; c < rcv.colIdx+colsPerNetCol; c++ {
+		for r := 0; r < n; r++ {
+			if r % 2 == rcv.rowIdx % 2 {
+				if rcv.cache.GetPieceCount(blockID, r, c) < rcv.k {
+					return false
+				}
+			}
+		}
 	}
+	return true
+}
 
-	completed := rcv.cache.IsComplete(blockID, rcv.colIdx, rcv.k)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"block_id":  blockID,
-		"completed": completed,
+func (rcv *Receiver) respondWithError(stream network.Stream, errMsg string) {
+	json.NewEncoder(stream).Encode(struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}{
+		Success: false,
+		Error:   errMsg,
 	})
 }

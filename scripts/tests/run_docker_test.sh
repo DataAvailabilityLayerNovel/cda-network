@@ -8,7 +8,7 @@ LIGHTS=${3:-2}
 K=4
 
 echo "=== 0. Generating dynamic Docker Compose file ==="
-GENERATED_OUT=$(python3 generate_compose.py --cols $COLS --stores-per-col $STORES_PER_COL --lights $LIGHTS --k $K --crash-on-fail)
+GENERATED_OUT=$(python3 scripts/generate_compose.py --cols $COLS --stores-per-col $STORES_PER_COL --lights $LIGHTS --k $K --crash-on-fail)
 echo "$GENERATED_OUT"
 
 # Extract the store ports array from the script output
@@ -29,7 +29,7 @@ cleanup() {
     echo "=== Cleaning up Docker resources ==="
     docker compose -f docker-compose.json down -v 2>/dev/null || true
 }
-trap cleanup EXIT
+# trap cleanup EXIT
 
 echo "Waiting for services to start and register..."
 # Poll Publisher health check
@@ -47,7 +47,7 @@ sleep 5
 echo "=== 4. Verifying Dynamic Registration inside Docker ==="
 PEERS0=$(curl -s http://localhost:8090/bootstrap/peers | jq -c '.peers')
 echo "Bootstrap Node 0 active peers list: $PEERS0"
-if [[ "$PEERS0" != *"http://store-0-1:8080"* ]] || [[ "$PEERS0" != *"http://store-0-2:8080"* ]]; then
+if [[ "$PEERS0" != *"store-0-1"* ]] || [[ "$PEERS0" != *"store-0-2"* ]]; then
     echo "[-] ERROR: Dynamic registration inside Docker failed!"
     exit 1
 fi
@@ -119,11 +119,11 @@ sleep 2
 PEERS0_AFTER=$(curl -s http://localhost:8090/bootstrap/peers | jq -c '.peers')
 echo "Bootstrap Node 0 active peers list after container stop: $PEERS0_AFTER"
 
-if [[ "$PEERS0_AFTER" == *"http://store-0-2:8080"* ]]; then
+if [[ "$PEERS0_AFTER" == *"store-0-2"* ]]; then
     echo "[-] ERROR: Graceful deregistration failed inside Docker!"
     exit 1
 fi
-if [[ "$PEERS0_AFTER" != *"http://store-0-1:8080"* ]]; then
+if [[ "$PEERS0_AFTER" != *"store-0-1"* ]]; then
     echo "[-] ERROR: Remaining peer was incorrectly removed inside Docker!"
     exit 1
 fi
@@ -140,5 +140,14 @@ if [ "$SUCCESS2" != "true" ]; then
     echo "[-] ERROR: DAS Verification failed in Docker after peer leave!"
     exit 1
 fi
+
+echo "=== 9. Exporting Representative Node Logs ==="
+mkdir -p logs
+docker compose -f docker-compose.json logs publisher > logs/docker_publisher.log 2>&1
+docker compose -f docker-compose.json logs light-1 > logs/docker_light1.log 2>&1
+docker compose -f docker-compose.json logs store-0-1 > logs/docker_store0_1.log 2>&1
+docker compose -f docker-compose.json logs store-0-2 > logs/docker_store0_2.log 2>&1
+docker compose -f docker-compose.json logs bootstrap-0 > logs/docker_bootstrap0.log 2>&1
+echo "[+] Representative logs exported to logs/ directory!"
 
 echo "[+] SUCCESS: Containerized Matrix E2E verification passed successfully!"

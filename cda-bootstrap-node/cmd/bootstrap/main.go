@@ -1,19 +1,26 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"math/big"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"cda-bootstrap-node/config"
 	"cda-bootstrap-node/internal/engine"
 	"cda-bootstrap-node/internal/p2p"
 	"cda-bootstrap-node/internal/storage"
 
+	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	bls12381kzg "github.com/consensys/gnark-crypto/ecc/bls12-381/kzg"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
 
 func main() {
@@ -58,7 +65,6 @@ func main() {
 	log.Printf("Starting Bootstrap Node for ColumnID=%d, APIPort=%d", cfg.ColumnID, cfg.APIPort)
 
 	// 1. Initialize KZG Provider for verification and proof generation
-	// Assume max EDS width is 256, so srsSize is 256 * 4 = 1024.
 	srsSize := uint64(1024)
 	srs, err := bls12381kzg.NewSRS(srsSize, big.NewInt(-1))
 	if err != nil {
@@ -73,19 +79,82 @@ func main() {
 	proofGen := engine.NewProofGenerator(cfg.K, kzg)
 	encoder := engine.NewRLNCEncoder(cfg.K, kzg)
 
-	// 4. Initialize P2P subcomponents
-	broadcaster := p2p.NewBroadcaster(cfg.StoreNodeAddr)
-	receiver := p2p.NewReceiver(kzg, cfg.PublisherAddr, cfg.K, cache, proofGen, encoder, broadcaster, *crashOnFail)
-	syncService := p2p.NewSyncService(cache)
-
-	// 5. Register HTTP routing handlers
-	mux := http.NewServeMux()
-	receiver.RegisterHandlers(mux)
-	syncService.RegisterHandlers(mux)
-
-	// 6. Start HTTP listener
-	log.Printf("Bootstrap Node services listening on :%d...", cfg.APIPort)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", cfg.APIPort), mux); err != nil {
-		log.Fatalf("HTTP server failed: %v", err)
+	// 4. Initialize P2P Host with deterministic bootstrap keypair
+	privKey, pid, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", cfg.ColumnID))
+	if err != nil {
+		log.Fatalf("Failed to generate deterministic keypair for bootstrap node col %d: %v", cfg.ColumnID, err)
 	}
+
+	p2pPort := cfg.APIPort + 10000 // Compute P2P port deterministically
+	p2pHost, err := p2pcommon.NewP2PHost(p2pPort, privKey)
+	if err != nil {
+		log.Fatalf("Failed to initialize libp2p host: %v", err)
+	}
+
+	log.Printf("[P2P] Bootstrap Host started with ID %s, listening on %v", pid.String(), p2pHost.Addrs())
+
+	// 5. Initialize GossipSub
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ps, err := pubsub.NewGossipSub(ctx, p2pHost)
+	if err != nil {
+		log.Fatalf("Failed to initialize GossipSub: %v", err)
+	}
+
+	// 6. Initialize P2P subcomponents
+	broadcaster := p2p.NewBroadcaster(p2pHost, ps)
+	receiver := p2p.NewReceiver(p2pHost, kzg, cfg.PublisherAddr, cfg.K, cache, proofGen, encoder, broadcaster, *crashOnFail)
+
+	// Subscribe to TopicHeader so this bootstrap node acts as a GossipSub relay
+	// for block headers between the publisher and light/store nodes.
+	headerTopic, err := ps.Join(p2pcommon.TopicHeader)
+	if err != nil {
+		log.Fatalf("Failed to join header topic: %v", err)
+	}
+	headerSub, err := headerTopic.Subscribe()
+	if err != nil {
+		log.Fatalf("Failed to subscribe to header topic: %v", err)
+	}
+	go func() {
+		for {
+			msg, err := headerSub.Next(ctx)
+			if err != nil {
+				return // context cancelled
+			}
+			log.Printf("[GossipSub] Bootstrap relayed block header from %s", msg.ReceivedFrom)
+		}
+	}()
+
+	// Start P2P Receiver Stream Listeners
+	receiver.Start(ctx)
+
+	// Expose HTTP server for external queries (like /bootstrap/peers) on APIPort
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bootstrap/peers", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		peers := receiver.GetActivePeers()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"peers": peers,
+		})
+	})
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("healthy"))
+	})
+
+	go func() {
+		log.Printf("HTTP Registry Service listening on :%d...", cfg.APIPort)
+		if err := http.ListenAndServe(fmt.Sprintf(":%d", cfg.APIPort), mux); err != nil {
+			log.Printf("HTTP Server error: %v", err)
+		}
+	}()
+
+	// Keep running until signal received
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	log.Printf("Bootstrap Node services running. Waiting for signal...")
+	<-sigChan
+	log.Printf("Shutting down Bootstrap Node...")
 }
