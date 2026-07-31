@@ -7,8 +7,11 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"cda-publisher-node/config"
@@ -20,6 +23,7 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -27,6 +31,7 @@ func main() {
 	port := flag.Int("port", 0, "override API port")
 	bootstrap := flag.String("bootstrap", "", "override bootstrap address")
 	kVal := flag.Int("k", 0, "override K chunks parameter")
+	kPieceVal := flag.Int("k-piece", 0, "override K-piece parameter")
 	flag.Parse()
 
 	var cfg *config.Config
@@ -51,8 +56,14 @@ func main() {
 	if *kVal != 0 {
 		cfg.K = *kVal
 	}
+	if *kPieceVal != 0 {
+		cfg.KPiece = *kPieceVal
+	}
+	if cfg.KPiece == 0 {
+		cfg.KPiece = cfg.K
+	}
 
-	log.Printf("Starting Publisher Node with configuration: APIPort=%d, K=%d", cfg.APIPort, cfg.K)
+	log.Printf("Starting Publisher Node with configuration: APIPort=%d, K=%d, KPiece=%d", cfg.APIPort, cfg.K, cfg.KPiece)
 
 	// 1. Initialize P2P Host with deterministic PeerID
 	privKey, pid, err := p2pcommon.GenerateDeterministicKeypair("cda-publisher")
@@ -79,14 +90,20 @@ func main() {
 	sender := p2p.NewSender(p2pHost, disc)
 
 	// 4. Initialize Pipeline Engine
-	pipeline, err := engine.NewPipeline(cfg.K)
+	pipeline, err := engine.NewPipeline(cfg.KPiece)
 	if err != nil {
 		log.Fatalf("Failed to initialize pipeline engine: %v", err)
 	}
 
 	// 4.5 Connect to Bootstraps to maintain GossipSub mesh connectivity
 	for colIdx, addrStr := range cfg.BootstrapPeers {
-		_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", colIdx))
+		n := 2 * cfg.K
+		colsPerNetCol := n / 8
+		if colsPerNetCol == 0 {
+			colsPerNetCol = 1
+		}
+		bootColID := (colIdx / colsPerNetCol) * colsPerNetCol
+		_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", bootColID))
 		if err != nil {
 			continue
 		}
@@ -133,13 +150,34 @@ func main() {
 	}
 
 	// 5. Initialize API Service
-	apiService := service.NewAPIService(pipeline, sender, ps)
+	dbPath := "data/publisher/badger"
+	apiService := service.NewAPIService(pipeline, sender, ps, dbPath, cfg.SequencerPublicKey)
 	mux := http.NewServeMux()
 	apiService.RegisterHandlers(mux)
+	mux.Handle("/metrics", promhttp.Handler())
 
 	// 6. Start HTTP server for external triggers
-	log.Printf("API Service listening on :%d...", cfg.APIPort)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", cfg.APIPort), mux); err != nil {
-		log.Fatalf("HTTP server failed: %v", err)
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", cfg.APIPort),
+		Handler: mux,
 	}
+
+	go func() {
+		log.Printf("API Service listening on %s...", server.Addr)
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+			log.Printf("HTTP server failed: %v", err)
+		}
+	}()
+
+	// Signal handling for clean exit
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	<-sigChan
+	log.Printf("Shutting down Publisher Node...")
+	ctxShut, shutCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shutCancel()
+	server.Shutdown(ctxShut)
+	_ = apiService.Close()
+	p2pHost.Close()
 }

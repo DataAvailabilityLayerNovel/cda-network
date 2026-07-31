@@ -30,3 +30,18 @@ func (d *Discovery) FindBootstrapNode(colIdx int) (string, error) {
 	log.Printf("[P2P] Discovery: found bootstrap node for column %d -> %s", colIdx, addr)
 	return addr, nil
 }
+
+// GetBootstrapColID returns the lowest column index that maps to the same bootstrap address
+func (d *Discovery) GetBootstrapColID(colIdx int) int {
+	addr, exists := d.peers[colIdx]
+	if !exists {
+		return 0
+	}
+	smallestCol := colIdx
+	for c, a := range d.peers {
+		if a == addr && c < smallestCol {
+			smallestCol = c
+		}
+	}
+	return smallestCol
+}

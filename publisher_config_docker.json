@@ -1,14 +1,23 @@
 {
   "api_port": 8080,
-  "k": 4,
+  "k": 8,
+  "k_piece": 4,
   "bootstrap_peers": {
-    "0": "/dns4/bootstrap-0/tcp/18090",
-    "1": "/dns4/bootstrap-0/tcp/18090",
-    "2": "/dns4/bootstrap-1/tcp/18091",
-    "3": "/dns4/bootstrap-1/tcp/18091",
-    "4": "/dns4/bootstrap-2/tcp/18092",
-    "5": "/dns4/bootstrap-2/tcp/18092",
-    "6": "/dns4/bootstrap-3/tcp/18093",
-    "7": "/dns4/bootstrap-3/tcp/18093"
+    "0": "/dns4/bootstrap-0/tcp/19200",
+    "1": "/dns4/bootstrap-0/tcp/19200",
+    "2": "/dns4/bootstrap-0/tcp/19200",
+    "3": "/dns4/bootstrap-0/tcp/19200",
+    "4": "/dns4/bootstrap-0/tcp/19200",
+    "5": "/dns4/bootstrap-0/tcp/19200",
+    "6": "/dns4/bootstrap-0/tcp/19200",
+    "7": "/dns4/bootstrap-0/tcp/19200",
+    "8": "/dns4/bootstrap-1/tcp/19201",
+    "9": "/dns4/bootstrap-1/tcp/19201",
+    "10": "/dns4/bootstrap-1/tcp/19201",
+    "11": "/dns4/bootstrap-1/tcp/19201",
+    "12": "/dns4/bootstrap-1/tcp/19201",
+    "13": "/dns4/bootstrap-1/tcp/19201",
+    "14": "/dns4/bootstrap-1/tcp/19201",
+    "15": "/dns4/bootstrap-1/tcp/19201"
   }
 }

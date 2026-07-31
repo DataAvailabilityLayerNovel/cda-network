@@ -11,6 +11,7 @@ type Config struct {
 	StoreNodeAddr string `json:"store_node_addr"`
 	PublisherAddr string `json:"publisher_addr"`
 	K             int    `json:"k"`
+	KPiece        int    `json:"k_piece"`
 }
 
 func DefaultConfig() *Config {
@@ -20,6 +21,7 @@ func DefaultConfig() *Config {
 		StoreNodeAddr: "http://localhost:8082",
 		PublisherAddr: "http://localhost:8080",
 		K:             4,
+		KPiece:        4,
 	}
 }
 

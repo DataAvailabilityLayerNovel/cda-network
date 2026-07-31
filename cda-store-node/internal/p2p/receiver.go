@@ -30,7 +30,8 @@ type Receiver struct {
 	kzg           cda.KZGProvider
 	rm            *cda.RecipientManager
 	publisherAddr string
-	k             int
+	kBlock        int
+	kPiece        int
 	rowIdx        int
 	colIdx        int
 	cache         *storage.CustodyStore
@@ -52,7 +53,8 @@ func NewReceiver(
 	ps *pubsub.PubSub,
 	kzg cda.KZGProvider,
 	pubAddr string,
-	k int,
+	kBlock int,
+	kPiece int,
 	rowIdx int,
 	colIdx int,
 	cache *storage.CustodyStore,
@@ -63,9 +65,10 @@ func NewReceiver(
 		host:          h,
 		ps:            ps,
 		kzg:           kzg,
-		rm:            cda.NewRecipientManager(k, kzg),
+		rm:            cda.NewRecipientManager(kPiece, kzg),
 		publisherAddr: pubAddr,
-		k:             k,
+		kBlock:        kBlock,
+		kPiece:        kPiece,
 		rowIdx:        rowIdx,
 		colIdx:        colIdx,
 		cache:         cache,
@@ -177,7 +180,7 @@ func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []stri
 	}
 
 	// 3. Verify Anchor
-	ok, err := verifier.VerifyAnchor(rcv.kzg, header, colIdx, pieceCommits, merkleProofs, rcv.k)
+	ok, err := verifier.VerifyAnchor(rcv.kzg, header, colIdx, pieceCommits, merkleProofs, rcv.kPiece)
 	if err != nil {
 		if rcv.crashOnFail {
 			log.Fatalf("Anchor verification failed (CRASH): %v", err)
@@ -272,8 +275,8 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 	rowIdx := row
 	combinedProof := cda.OpeningProof(decodedProof)
 
-	pieceCommitsTyped := make([]cda.PieceCommitment, rcv.k)
-	for i := 0; i < rcv.k; i++ {
+	pieceCommitsTyped := make([]cda.PieceCommitment, rcv.kPiece)
+	for i := 0; i < rcv.kPiece; i++ {
 		pieceCommitsTyped[i] = cda.PieceCommitment(pieceCommits[i])
 	}
 	combinedCommit, err := rcv.kzg.Combine(pieceCommitsTyped, decodedCoeffs)
@@ -300,20 +303,20 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 		existingCoeffs[i] = p.Data.Coeffs
 	}
 
-	if !engine.IsLinearlyIndependent(existingCoeffs, decodedCoeffs, rcv.k) {
+	if !engine.IsLinearlyIndependent(existingCoeffs, decodedCoeffs, rcv.kPiece) {
 		log.Printf("[P2P] Received piece for cell [%d, %d]. Linear independence check: dependent (redundant). Dropping piece.", row, col)
 		return nil
 	}
 
 	// 5. Store valid piece in custody store
 	rcv.cache.StorePiece(blockID, row, col, piece)
-	log.Printf("[P2P] Received piece for cell [%d, %d]. Linear independence check: independent. Stored piece (local rank increased to %d/%d).", row, col, len(existingPieces)+1, rcv.k)
+	log.Printf("[P2P] Received piece for cell [%d, %d]. Linear independence check: independent. Stored piece (local rank increased to %d/%d).", row, col, len(existingPieces)+1, rcv.kPiece)
 
 	// 6. P2P Recoding & GossipSub forwarding
 	if !isGossip {
 		updatedPieces := rcv.cache.GetPieces(blockID, row, col)
 		if len(updatedPieces) >= 2 {
-			log.Printf("[GossipSub] Local rank for cell [%d, %d] is %d/%d (>=2). Triggering local recoding of all available pieces...", row, col, len(updatedPieces), rcv.k)
+			log.Printf("[GossipSub] Local rank for cell [%d, %d] is %d/%d (>=2). Triggering local recoding of all available pieces...", row, col, len(updatedPieces), rcv.kPiece)
 			recodedPiece, err := rcv.rm.RecodePieces(updatedPieces)
 			if err != nil {
 				log.Printf("[GossipSub] Failed to recode pieces for cell [%d, %d]: %v", row, col, err)
@@ -357,7 +360,7 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 		for idx, val := range allPieces {
 			existingCoeffs[idx] = val.Data.Coeffs
 		}
-		if engine.IsLinearlyIndependent(existingCoeffs, p.Data.Coeffs, rcv.k) {
+		if engine.IsLinearlyIndependent(existingCoeffs, p.Data.Coeffs, rcv.kPiece) {
 			allPieces = append(allPieces, p)
 		}
 	}
@@ -372,8 +375,8 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 	}
 
 	// 2. Query peers in column network if needed and allowed
-	if len(allPieces) < rcv.k && !req.IsRemoteHop {
-		log.Printf("[StoreNode] Not enough local pieces (%d/%d). Querying peers in column network...", len(allPieces), rcv.k)
+	if len(allPieces) < rcv.kPiece && !req.IsRemoteHop {
+		log.Printf("[StoreNode] Not enough local pieces (%d/%d). Querying peers in column network...", len(allPieces), rcv.kPiece)
 		rcv.peersMu.RLock()
 		peersCopy := make([]p2pcommon.PeerInfo, len(rcv.colPeers))
 		copy(peersCopy, rcv.colPeers)
@@ -449,16 +452,16 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 					existingCoeffs[idx] = val.Data.Coeffs
 				}
 
-				if engine.IsLinearlyIndependent(existingCoeffs, decCoeffs, rcv.k) {
+				if engine.IsLinearlyIndependent(existingCoeffs, decCoeffs, rcv.kPiece) {
 					allPieces = append(allPieces, p)
 					log.Printf("[StoreNode] Added independent piece from peer %s. Current count: %d", pid, len(allPieces))
-					if len(allPieces) >= rcv.k {
+					if len(allPieces) >= rcv.kPiece {
 						break
 					}
 				}
 			}
 
-			if len(allPieces) >= rcv.k {
+			if len(allPieces) >= rcv.kPiece {
 				break
 			}
 		}
@@ -467,10 +470,10 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 	// 3. Try to recover the original cell data if we have k independent pieces
 	recovered := false
 	var cellDataStr string
-	if len(allPieces) >= rcv.k {
-		recoveredFrags, err := rcv.rm.RecoverCell(allPieces[:rcv.k])
+	if len(allPieces) >= rcv.kPiece {
+		recoveredFrags, err := rcv.rm.RecoverCell(allPieces[:rcv.kPiece])
 		if err == nil {
-			pieceSize := 64 / rcv.k
+			pieceSize := 64 / rcv.kPiece
 			var buf bytes.Buffer
 			for _, frag := range recoveredFrags {
 				if len(frag) >= pieceSize {
@@ -514,22 +517,27 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 }
 
 func (rcv *Receiver) IsComplete(blockID string) bool {
-	n := 2 * rcv.k
-	colsPerNetCol := n / 4
-	if colsPerNetCol == 0 {
-		colsPerNetCol = 1
-	}
+	n := 2 * rcv.kBlock
 
-	for c := rcv.colIdx; c < rcv.colIdx+colsPerNetCol; c++ {
-		for r := 0; r < n; r++ {
-			if r % 2 == rcv.rowIdx % 2 {
-				if rcv.cache.GetPieceCount(blockID, r, c) < rcv.k {
-					return false
+	rcv.peersMu.RLock()
+	numStores := len(rcv.colPeers) + 1
+	rcv.peersMu.RUnlock()
+
+	hasAny := false
+	for c := 0; c < n; c++ {
+		_, exists := rcv.cache.GetAnchoredCommitments(blockID, c)
+		if exists {
+			hasAny = true
+			for r := 0; r < n; r++ {
+				if r % numStores == rcv.rowIdx {
+					if rcv.cache.GetPieceCount(blockID, r, c) < rcv.kPiece {
+						return false
+					}
 				}
 			}
 		}
 	}
-	return true
+	return hasAny
 }
 
 func (rcv *Receiver) respondWithError(stream network.Stream, errMsg string) {

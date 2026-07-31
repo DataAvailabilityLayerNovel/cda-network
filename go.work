@@ -1,10 +1,10 @@
 go 1.25.12
 
 use (
-	./rlnc-rsmt2d
-	./cda-publisher-node
 	./cda-bootstrap-node
-	./cda-store-node
 	./cda-light-node
 	./cda-p2p
+	./cda-publisher-node
+	./cda-store-node
+	./rlnc-rsmt2d
 )

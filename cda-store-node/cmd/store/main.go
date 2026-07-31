@@ -26,6 +26,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -101,7 +102,7 @@ func main() {
 
 	// 5. Initialize P2P subcomponents
 	broadcaster := p2p.NewBroadcaster(p2pHost, ps)
-	receiver := p2p.NewReceiver(p2pHost, ps, kzg, cfg.PublisherAddr, cfg.K, cfg.RowIdx, cfg.ColIdx, cache, broadcaster, cfg.CrashOnFail)
+	receiver := p2p.NewReceiver(p2pHost, ps, kzg, cfg.PublisherAddr, cfg.K, cfg.KPiece, cfg.RowIdx, cfg.ColIdx, cache, broadcaster, cfg.CrashOnFail)
 
 	// Expose HTTP server for local status check and health endpoint
 	mux := http.NewServeMux()
@@ -117,6 +118,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("healthy"))
 	})
+	mux.Handle("/metrics", promhttp.Handler())
 
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.Port),
@@ -283,6 +285,7 @@ func main() {
 		ctxShut, shutCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer shutCancel()
 		server.Shutdown(ctxShut)
+		_ = cache.Close()
 		p2pHost.Close()
 		cancel()
 	}()

@@ -1,47 +1,97 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"sync"
+	"os"
 	"time"
 
 	"cda-publisher-node/internal/engine"
 	"cda-publisher-node/internal/p2p"
 
 	p2pcommon "cda-p2p"
+	"github.com/dgraph-io/badger/v4"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
 
 type APIService struct {
-	mu       sync.RWMutex
-	headers  map[string]*engine.BlockHeader
-	pipeline *engine.Pipeline
-	sender   *p2p.Sender
-	ps       *pubsub.PubSub
+	pipeline        *engine.Pipeline
+	sender          *p2p.Sender
+	ps              *pubsub.PubSub
+	db              *badger.DB
+	sequencerPubKey string
 }
 
 type PublishRequest struct {
-	BlockID string   `json:"block_id"`
-	Data    []string `json:"data"` // List of cells as hex strings
+	BlockID   string   `json:"block_id"`
+	Data      []string `json:"data"` // List of cells as hex strings
+	Signature string   `json:"signature,omitempty"`
 }
 
-func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.PubSub) *APIService {
-	return &APIService{
-		headers:  make(map[string]*engine.BlockHeader),
-		pipeline: pipeline,
-		sender:   sender,
-		ps:       ps,
+func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.PubSub, dbPath string, sequencerPubKey string) *APIService {
+	var db *badger.DB
+	if dbPath != "" {
+		_ = os.MkdirAll(dbPath, 0755)
+		opts := badger.DefaultOptions(dbPath).WithLogger(nil)
+		var err error
+		db, err = badger.Open(opts)
+		if err != nil {
+			panic(fmt.Sprintf("failed to open badger db on publisher: %v", err))
+		}
 	}
+
+	return &APIService{
+		pipeline:        pipeline,
+		sender:          sender,
+		ps:              ps,
+		db:              db,
+		sequencerPubKey: sequencerPubKey,
+	}
+}
+
+func (s *APIService) Close() error {
+	if s.db != nil {
+		return s.db.Close()
+	}
+	return nil
 }
 
 func (s *APIService) RegisterHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/publish", s.handlePublish)
 	mux.HandleFunc("/header/", s.handleGetHeader)
+}
+
+func VerifySignature(blockID string, data []string, sigHex, pubKeyHex string) error {
+	pubKeyBytes, err := hex.DecodeString(pubKeyHex)
+	if err != nil {
+		return fmt.Errorf("invalid config public key hex: %w", err)
+	}
+	if len(pubKeyBytes) != ed25519.PublicKeySize {
+		return fmt.Errorf("invalid public key size")
+	}
+	pubKey := ed25519.PublicKey(pubKeyBytes)
+
+	sigBytes, err := hex.DecodeString(sigHex)
+	if err != nil {
+		return fmt.Errorf("invalid signature hex: %w", err)
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString(blockID)
+	for _, d := range data {
+		buf.WriteString(d)
+	}
+
+	if !ed25519.Verify(pubKey, buf.Bytes(), sigBytes) {
+		return fmt.Errorf("signature verification failed")
+	}
+	return nil
 }
 
 func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
@@ -59,6 +109,18 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	if len(req.Data) == 0 {
 		http.Error(w, "Data cannot be empty", http.StatusBadRequest)
 		return
+	}
+
+	// 0. Signature Verification
+	if s.sequencerPubKey != "" {
+		if req.Signature == "" {
+			http.Error(w, "Missing signature in request", http.StatusUnauthorized)
+			return
+		}
+		if err := VerifySignature(req.BlockID, req.Data, req.Signature, s.sequencerPubKey); err != nil {
+			http.Error(w, "Signature verification failed: "+err.Error(), http.StatusUnauthorized)
+			return
+		}
 	}
 
 	// 1. Decode hex data cells (ODS)
@@ -80,9 +142,12 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Save Header and Broadcast via GossipSub
-	s.mu.Lock()
-	s.headers[header.BlockID] = header
-	s.mu.Unlock()
+	if s.db != nil {
+		headerBytes, _ := json.Marshal(header)
+		_ = s.db.Update(func(txn *badger.Txn) error {
+			return txn.Set([]byte("header_"+header.BlockID), headerBytes)
+		})
+	}
 
 	log.Printf("Successfully generated Block Header for BlockID: %s", header.BlockID)
 
@@ -155,9 +220,25 @@ func (s *APIService) handleGetHeader(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.RLock()
-	header, exists := s.headers[blockID]
-	s.mu.RUnlock()
+	var header *engine.BlockHeader
+	var exists bool
+
+	if s.db != nil {
+		_ = s.db.View(func(txn *badger.Txn) error {
+			item, err := txn.Get([]byte("header_" + blockID))
+			if err != nil {
+				return err
+			}
+			return item.Value(func(val []byte) error {
+				var h engine.BlockHeader
+				if err := json.Unmarshal(val, &h); err == nil {
+					header = &h
+					exists = true
+				}
+				return nil
+			})
+		})
+	}
 
 	if !exists {
 		http.Error(w, "Header not found", http.StatusNotFound)
@@ -167,3 +248,4 @@ func (s *APIService) handleGetHeader(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(header)
 }
+

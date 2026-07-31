@@ -224,7 +224,7 @@ Khi nhận SIGTERM/SIGINT:
 ### Đã Làm Được
 - [x] Layer 3 KZG verification của từng piece nhận từ bootstrap
 - [x] In-memory custody store với thread-safe access và phục hồi tự động khi khởi động
-- [x] **Lưu trữ persistent trên ổ đĩa:** Các pieces, anchors, và recoded pieces được lưu trữ cục bộ dưới dạng file JSON (`data/store_{port}/`)
+- [x] **Lưu trữ persistent theo Block trên ổ đĩa:** Gom nhóm các pieces, anchors, và recoded pieces của mỗi block vào một file JSON duy nhất (`data/store_{port}/blocks/{blockID}.json`) giúp tối ưu hiệu năng I/O và quản lý file.
 - [x] **Key Caching:** Cache keypair PeerID xuống file đĩa (`store_{port}.key`) giúp loại bỏ brute-force startup cost
 - [x] **Token-bucket rate limiting:** Giới hạn tốc độ yêu cầu P2P trên store node theo PeerID để chống spam active pull
 - [x] RLNC decoding: recover original cell data từ k coded pieces

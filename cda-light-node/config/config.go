@@ -11,6 +11,7 @@ type Config struct {
 	PublisherAddr string
 	BootstrapsMap map[int][]string
 	K             int
+	KPiece        int
 	CrashOnFail   bool
 }
 
@@ -19,6 +20,7 @@ func LoadConfig() *Config {
 	publisher := flag.String("publisher", "http://localhost:8080", "Publisher URL")
 	bootstrapsStr := flag.String("bootstraps", "0:http://localhost:8090;1:http://localhost:8091;2:http://localhost:8092;3:http://localhost:8093", "Semicolon-separated mapping of networkColumnIdx:bootstrapURLs (comma-separated for HA fallbacks)")
 	k := flag.Int("k", 4, "Number of chunks K")
+	kPiece := flag.Int("k-piece", 0, "RLNC piece parameter k-piece")
 	crashOnFail := flag.Bool("crash-on-fail", false, "Crash the node if verification fails")
 	flag.Parse()
 
@@ -41,11 +43,17 @@ func LoadConfig() *Config {
 		}
 	}
 
+	kPieceVal := *kPiece
+	if kPieceVal == 0 {
+		kPieceVal = *k
+	}
+
 	return &Config{
 		Port:          *port,
 		PublisherAddr: *publisher,
 		BootstrapsMap: bootstrapsMap,
 		K:             *k,
+		KPiece:        kPieceVal,
 		CrashOnFail:   *crashOnFail,
 	}
 }

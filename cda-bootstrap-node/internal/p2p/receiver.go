@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 
 	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
+	"github.com/dgraph-io/badger/v4"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -30,6 +33,7 @@ type Receiver struct {
 	encoder       *engine.RLNCEncoder
 	broadcaster   *Broadcaster
 	crashOnFail   bool
+	db            *badger.DB
 
 	// Dynamic Peer Registry
 	peersMu      sync.RWMutex
@@ -47,6 +51,7 @@ func NewReceiver(
 	encoder *engine.RLNCEncoder,
 	broadcaster *Broadcaster,
 	crashOnFail bool,
+	colID int,
 ) *Receiver {
 	rcv := &Receiver{
 		host:          h,
@@ -63,7 +68,54 @@ func NewReceiver(
 	}
 	// Connect broadcaster back to registry
 	broadcaster.SetRegistry(rcv)
+
+	if colID >= 0 {
+		baseDir := fmt.Sprintf("data/bootstrap_%d", colID)
+		dbPath := filepath.Join(baseDir, "badger")
+		_ = os.MkdirAll(dbPath, 0755)
+
+		opts := badger.DefaultOptions(dbPath).WithLogger(nil)
+		db, err := badger.Open(opts)
+		if err != nil {
+			panic(fmt.Sprintf("failed to open badger db on bootstrap: %v", err))
+		}
+		rcv.db = db
+
+		// Load active peers from BadgerDB
+		_ = db.View(func(txn *badger.Txn) error {
+			opts := badger.DefaultIteratorOptions
+			it := txn.NewIterator(opts)
+			defer it.Close()
+			prefix := []byte("peer_")
+			for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+				item := it.Item()
+				k := item.Key()
+				pidStr := string(k[len(prefix):])
+				pid, err := peer.Decode(pidStr)
+				if err != nil {
+					continue
+				}
+				_ = item.Value(func(val []byte) error {
+					var info p2pcommon.PeerInfo
+					if err := json.Unmarshal(val, &info); err == nil {
+						rcv.activePeers[pid] = info
+						rcv.lastSeenPeer[pid] = time.Now() // Give 15 seconds to re-register
+					}
+					return nil
+				})
+			}
+			return nil
+		})
+	}
+
 	return rcv
+}
+
+func (rcv *Receiver) Close() error {
+	if rcv.db != nil {
+		return rcv.db.Close()
+	}
+	return nil
 }
 
 // Start listens to libp2p streams
@@ -82,6 +134,11 @@ func (rcv *Receiver) Start(ctx context.Context) {
 				for pid, lastSeen := range rcv.lastSeenPeer {
 					if now.Sub(lastSeen) > 15*time.Second {
 						log.Printf("[P2P Registry] Removing stale peer: %s", pid)
+						if rcv.db != nil {
+							_ = rcv.db.Update(func(txn *badger.Txn) error {
+								return txn.Delete([]byte("peer_" + pid.String()))
+							})
+						}
 						delete(rcv.activePeers, pid)
 						delete(rcv.lastSeenPeer, pid)
 					}
@@ -226,11 +283,23 @@ func (rcv *Receiver) handleRouting(stream network.Stream) {
 	rcv.peersMu.Lock()
 	if !isLightNode {
 		if req.IsLeave {
+			if rcv.db != nil {
+				_ = rcv.db.Update(func(txn *badger.Txn) error {
+					return txn.Delete([]byte("peer_" + req.Peer.PeerID))
+				})
+			}
 			delete(rcv.activePeers, pid)
 			delete(rcv.lastSeenPeer, pid)
 			rcv.peersMu.Unlock()
 			log.Printf("[P2P Registry] Peer gracefully left: %s", pid)
 			return
+		}
+
+		if rcv.db != nil {
+			valData, _ := json.Marshal(req.Peer)
+			_ = rcv.db.Update(func(txn *badger.Txn) error {
+				return txn.Set([]byte("peer_" + req.Peer.PeerID), valData)
+			})
 		}
 		rcv.activePeers[pid] = req.Peer
 		rcv.lastSeenPeer[pid] = time.Now()
@@ -319,3 +388,4 @@ func (rcv *Receiver) respondWithError(stream network.Stream, errMsg string) {
 		Error:   errMsg,
 	})
 }
+

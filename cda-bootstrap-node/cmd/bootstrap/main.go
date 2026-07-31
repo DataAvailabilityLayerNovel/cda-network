@@ -21,6 +21,7 @@ import (
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	bls12381kzg "github.com/consensys/gnark-crypto/ecc/bls12-381/kzg"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -30,6 +31,7 @@ func main() {
 	storeAddr := flag.String("store", "", "override store node address")
 	pubAddr := flag.String("publisher", "", "override publisher node address")
 	kVal := flag.Int("k", 0, "override K chunks parameter")
+	kPieceVal := flag.Int("k-piece", 0, "override K-piece parameter")
 	crashOnFail := flag.Bool("crash-on-fail", false, "Crash the node if verification fails")
 	flag.Parse()
 
@@ -61,8 +63,14 @@ func main() {
 	if *kVal != 0 {
 		cfg.K = *kVal
 	}
+	if *kPieceVal != 0 {
+		cfg.KPiece = *kPieceVal
+	}
+	if cfg.KPiece == 0 {
+		cfg.KPiece = cfg.K
+	}
 
-	log.Printf("Starting Bootstrap Node for ColumnID=%d, APIPort=%d", cfg.ColumnID, cfg.APIPort)
+	log.Printf("Starting Bootstrap Node for ColumnID=%d, APIPort=%d, K=%d, KPiece=%d", cfg.ColumnID, cfg.APIPort, cfg.K, cfg.KPiece)
 
 	// 1. Initialize KZG Provider for verification and proof generation
 	srsSize := uint64(1024)
@@ -76,8 +84,8 @@ func main() {
 	cache := storage.NewLocalCache()
 
 	// 3. Initialize engine subcomponents
-	proofGen := engine.NewProofGenerator(cfg.K, kzg)
-	encoder := engine.NewRLNCEncoder(cfg.K, kzg)
+	proofGen := engine.NewProofGenerator(cfg.KPiece, kzg)
+	encoder := engine.NewRLNCEncoder(cfg.KPiece, kzg)
 
 	// 4. Initialize P2P Host with deterministic bootstrap keypair
 	privKey, pid, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", cfg.ColumnID))
@@ -104,7 +112,7 @@ func main() {
 
 	// 6. Initialize P2P subcomponents
 	broadcaster := p2p.NewBroadcaster(p2pHost, ps)
-	receiver := p2p.NewReceiver(p2pHost, kzg, cfg.PublisherAddr, cfg.K, cache, proofGen, encoder, broadcaster, *crashOnFail)
+	receiver := p2p.NewReceiver(p2pHost, kzg, cfg.PublisherAddr, cfg.KPiece, cache, proofGen, encoder, broadcaster, *crashOnFail, cfg.ColumnID)
 
 	// Subscribe to TopicHeader so this bootstrap node acts as a GossipSub relay
 	// for block headers between the publisher and light/store nodes.
@@ -142,6 +150,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("healthy"))
 	})
+	mux.Handle("/metrics", promhttp.Handler())
 
 	go func() {
 		log.Printf("HTTP Registry Service listening on :%d...", cfg.APIPort)
@@ -157,4 +166,5 @@ func main() {
 	log.Printf("Bootstrap Node services running. Waiting for signal...")
 	<-sigChan
 	log.Printf("Shutting down Bootstrap Node...")
+	_ = receiver.Close()
 }

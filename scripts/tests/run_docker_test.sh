@@ -1,14 +1,20 @@
 #!/bin/bash
 set -e
 
+# Automatically resolve path and change directory to repository root
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+REPO_ROOT="$( cd "$SCRIPT_DIR/../.." && pwd )"
+cd "$REPO_ROOT"
+
 # Default parameters
-COLS=${1:-4}
-STORES_PER_COL=${2:-2}
+COLS=${1:-8}
+STORES_PER_COL=${2:-8}
 LIGHTS=${3:-2}
-K=4
+K=${4:-16}
+K_PIECE=${5:-4}
 
 echo "=== 0. Generating dynamic Docker Compose file ==="
-GENERATED_OUT=$(python3 scripts/generate_compose.py --cols $COLS --stores-per-col $STORES_PER_COL --lights $LIGHTS --k $K --crash-on-fail)
+GENERATED_OUT=$(python3 scripts/generate_compose.py --cols $COLS --stores-per-col $STORES_PER_COL --lights $LIGHTS --k $K --k-piece $K_PIECE --crash-on-fail)
 echo "$GENERATED_OUT"
 
 # Extract the store ports array from the script output
@@ -45,7 +51,7 @@ done
 sleep 5
 
 echo "=== 4. Verifying Dynamic Registration inside Docker ==="
-PEERS0=$(curl -s http://localhost:8090/bootstrap/peers | jq -c '.peers')
+PEERS0=$(curl -s http://localhost:9200/bootstrap/peers | jq -c '.peers')
 echo "Bootstrap Node 0 active peers list: $PEERS0"
 if [[ "$PEERS0" != *"store-0-1"* ]] || [[ "$PEERS0" != *"store-0-2"* ]]; then
     echo "[-] ERROR: Dynamic registration inside Docker failed!"
@@ -53,28 +59,13 @@ if [[ "$PEERS0" != *"store-0-1"* ]] || [[ "$PEERS0" != *"store-0-2"* ]]; then
 fi
 echo "[+] Dynamic registration inside Docker succeeded!"
 
-echo "=== 5. Sending Publish Request to Publisher (ODS 4x4) ==="
-PAYLOAD='{
-  "block_id": "test-block-matrix",
-  "data": [
-    "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
-    "00000000000000000000000000000000000000000000AB0000000000000000000000000000000000000000000000000000000000000000000000000000000002",
-    "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003",
-    "00000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000004",
-    "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005",
-    "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006",
-    "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007",
-    "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008",
-    "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000009",
-    "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a",
-    "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000b",
-    "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c",
-    "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000d",
-    "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e",
-    "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f",
-    "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010"
-  ]
-}'
+echo "=== 5. Sending Publish Request to Publisher (ODS $K x $K) ==="
+PAYLOAD=$(python3 -c "
+import json, sys
+k = int(sys.argv[1])
+data = ['%0128x' % (i + 1) for i in range(k * k)]
+print(json.dumps({'block_id': 'test-block-matrix', 'data': data}))
+" $K)
 
 echo "Publishing block to Publisher Node container..."
 curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" http://localhost:8080/publish > /dev/null
@@ -82,25 +73,32 @@ curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" http://localho
 echo "Waiting for Store Nodes to complete GossipSub and coding..."
 block_id="test-block-matrix"
 
-for i in {1..100}; do
+for i in {1..10000}; do
     all_complete=true
+    incomplete_port=""
     for port in "${ports[@]}"; do
         resp=$(curl -s "http://localhost:${port}/store/status/${block_id}")
         completed=$(echo "$resp" | jq -r '.completed' 2>/dev/null || echo "false")
         if [ "$completed" != "true" ]; then
             all_complete=false
+            incomplete_port="$port"
             break
         fi
     done
     if [ "$all_complete" = "true" ]; then
-        echo "All Store Nodes have completed GossipSub and stored pieces! Took $((i * 200))ms."
+        echo "All Store Nodes have completed GossipSub and stored pieces! Took $((i * 500))ms."
         break
     fi
-    sleep 0.2
+    echo "[iter $i | $((i * 500))ms] Waiting... (last incomplete port: $incomplete_port)"
+    if [ "$i" -eq 10000 ]; then
+        echo "[-] ERROR: Store nodes did not complete within $((i * 500))ms timeout!"
+        exit 1
+    fi
+    sleep 0.5
 done
 
-echo "=== 6. Performing DAS Sampling on Light Node 1 container (8095) for ALL EDS cells ==="
-QUERY1_RESP=$(curl -s "http://localhost:8095/das/sample/test-block-matrix?all=true")
+echo "=== 6. Performing DAS Sampling on Light Node 1 container for ALL EDS cells ==="
+QUERY1_RESP=$(curl -s "http://localhost:9401/das/sample/test-block-matrix?all=true")
 SUCCESS1=$(echo "$QUERY1_RESP" | jq -r '.success')
 
 echo "Light Node 1 DAS Response Summary:"
@@ -108,6 +106,8 @@ echo "$QUERY1_RESP" | jq '{block_id: .block_id, success: .success, total_cells_s
 
 if [ "$SUCCESS1" != "true" ]; then
     echo "[-] ERROR: DAS Verification on Light Node 1 failed!"
+    echo "First 20 failed cell details:"
+    echo "$QUERY1_RESP" | jq '.results[] | select(.verified == false) | {row, col, error}' 2>/dev/null | head -n 20
     exit 1
 fi
 
@@ -116,7 +116,7 @@ echo "Stopping store-0-2 container gracefully..."
 docker compose -f docker-compose.json stop store-0-2
 sleep 2
 
-PEERS0_AFTER=$(curl -s http://localhost:8090/bootstrap/peers | jq -c '.peers')
+PEERS0_AFTER=$(curl -s http://localhost:9200/bootstrap/peers | jq -c '.peers')
 echo "Bootstrap Node 0 active peers list after container stop: $PEERS0_AFTER"
 
 if [[ "$PEERS0_AFTER" == *"store-0-2"* ]]; then
@@ -130,7 +130,7 @@ fi
 echo "[+] Graceful deregistration inside Docker succeeded!"
 
 echo "=== 8. Triggering DAS Sampling after Node Leave (Verify Dynamic Routing) ==="
-QUERY2_RESP=$(curl -s "http://localhost:8096/das/sample/test-block-matrix?row=0&col=0")
+QUERY2_RESP=$(curl -s "http://localhost:9402/das/sample/test-block-matrix?row=0&col=0")
 SUCCESS2=$(echo "$QUERY2_RESP" | jq -r '.success')
 
 echo "Light Node 2 DAS Response (after store-0-2 stopped):"

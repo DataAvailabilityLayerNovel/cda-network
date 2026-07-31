@@ -20,6 +20,7 @@ import (
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/rlnc"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/multiformats/go-multiaddr"
@@ -28,6 +29,7 @@ import (
 type APIService struct {
 	publisherAddr string
 	bootstrapsMap map[int][]string
+	numCols       int // number of network columns (= len(bootstrapsMap))
 	verifier      *verifier.DASVerifier
 	crashOnFail   bool
 	host          host.Host
@@ -66,9 +68,14 @@ func NewAPIService(
 	h host.Host,
 	ps *pubsub.PubSub,
 ) *APIService {
+	numCols := len(bootstrapsMap)
+	if numCols == 0 {
+		numCols = 1
+	}
 	return &APIService{
 		publisherAddr: publisherAddr,
 		bootstrapsMap: bootstrapsMap,
+		numCols:       numCols,
 		verifier:      v,
 		crashOnFail:   crashOnFail,
 		host:          h,
@@ -198,24 +205,24 @@ func (s *APIService) handleDASSample(w http.ResponseWriter, r *http.Request) {
 
 func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeader) SampleResult {
 	n := len(header.ColumnComm)
-	colsPerNetCol := n / 4
-	netColIdx := 0
-	if colsPerNetCol > 0 {
-		netColIdx = col / colsPerNetCol
+	colsPerNetCol := n / s.numCols
+	if colsPerNetCol == 0 {
+		colsPerNetCol = 1
 	}
+	netColIdx := col / colsPerNetCol
 
 	bootAddrs, ok := s.bootstrapsMap[netColIdx]
 	if !ok || len(bootAddrs) == 0 {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("no bootstrap node configured for network column %d", netColIdx)}
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("no bootstrap node configured for network column %d (colsPerNetCol=%d, numCols=%d)", netColIdx, colsPerNetCol, s.numCols)}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	var activeStores []p2pcommon.PeerInfo
 	var lastErr error
 
-	colIdx := netColIdx * (n / 4)
+	colIdx := netColIdx * colsPerNetCol
 	_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", colIdx))
 	if err != nil {
 		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to calculate bootstrap PeerID: %v", err)}
@@ -253,7 +260,7 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 			continue
 		}
 
-		dialCtx, dialCancel := context.WithTimeout(ctx, 2*time.Second) // shorter timeout for faster failover
+		dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second) // longer timeout for heavy VM load
 
 		if err := s.host.Connect(dialCtx, *bootInfo); err != nil {
 			dialCancel()
@@ -324,29 +331,63 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("routing query failed on all bootstraps: %v", lastErr)}
 	}
 
-	// Pick a random store node in the dynamic list to query
-	selectedStore := activeStores[rand.Intn(len(activeStores))]
-	storePID, err := peer.Decode(selectedStore.PeerID)
-	if err != nil {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("invalid store Peer ID: %v", err)}
+	var storeStream network.Stream
+	var connectErrors []string
+
+	// Shuffle active stores to pick random candidates in order
+	shuffledStores := append([]p2pcommon.PeerInfo(nil), activeStores...)
+	for i := range shuffledStores {
+		j := rand.Intn(i + 1)
+		shuffledStores[i], shuffledStores[j] = shuffledStores[j], shuffledStores[i]
 	}
 
-	// Add store multiaddrs to peerstore
-	for _, mStr := range selectedStore.Multiaddrs {
-		m, err := multiaddr.NewMultiaddr(mStr)
-		if err == nil {
-			s.host.Peerstore().AddAddr(storePID, m, 10*time.Minute)
+	maxTries := 3
+	if len(shuffledStores) < maxTries {
+		maxTries = len(shuffledStores)
+	}
+
+	for idx := 0; idx < maxTries; idx++ {
+		selectedStore := shuffledStores[idx]
+		storePID, err := peer.Decode(selectedStore.PeerID)
+		if err != nil {
+			connectErrors = append(connectErrors, fmt.Sprintf("invalid store Peer ID %s: %v", selectedStore.PeerID, err))
+			continue
 		}
+
+		// Add store multiaddrs to peerstore
+		for _, mStr := range selectedStore.Multiaddrs {
+			m, err := multiaddr.NewMultiaddr(mStr)
+			if err == nil {
+				s.host.Peerstore().AddAddr(storePID, m, 10*time.Minute)
+			}
+		}
+
+		dialCtx, dialCancel := context.WithTimeout(ctx, 3*time.Second)
+		err = s.host.Connect(dialCtx, peer.AddrInfo{ID: storePID})
+		dialCancel()
+
+		if err != nil {
+			connectErrors = append(connectErrors, fmt.Sprintf("failed to connect to store node %s: %v", storePID, err))
+			continue
+		}
+
+		stream, err := s.host.NewStream(ctx, storePID, p2pcommon.ProtoStoreGetPieces)
+		if err != nil {
+			connectErrors = append(connectErrors, fmt.Sprintf("failed to open P2P stream on store node %s: %v", storePID, err))
+			continue
+		}
+
+		storeStream = stream
+		break
 	}
 
-	if err := s.host.Connect(ctx, peer.AddrInfo{ID: storePID}); err != nil {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to connect to store node %s: %v", storePID, err)}
-	}
-
-	// Dial store pieces query P2P stream
-	storeStream, err := s.host.NewStream(ctx, storePID, p2pcommon.ProtoStoreGetPieces)
-	if err != nil {
-		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("failed to open P2P stream on store node: %v", err)}
+	if storeStream == nil {
+		return SampleResult{
+			Row:      row,
+			Col:      col,
+			Verified: false,
+			Error:    fmt.Sprintf("failed to query any store node in column group: %s", strings.Join(connectErrors, "; ")),
+		}
 	}
 	defer storeStream.Close()
 

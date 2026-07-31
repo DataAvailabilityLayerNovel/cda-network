@@ -57,7 +57,7 @@ func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, p
 
 	// Append PeerID if not already present
 	if !strings.Contains(addr, "/p2p/") && !strings.Contains(addr, "/ipfs/") {
-		bootColID := (colIdx / 2) * 2
+		bootColID := s.disc.GetBootstrapColID(colIdx)
 		_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", bootColID))
 		if err != nil {
 			return fmt.Errorf("failed to generate bootstrap PeerID: %w", err)

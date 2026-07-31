@@ -25,13 +25,14 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
 	cfg := config.LoadConfig()
 
-	log.Printf("Starting Light Node on port %d, publisher=%s, bootstraps=%v, k=%d",
-		cfg.Port, cfg.PublisherAddr, cfg.BootstrapsMap, cfg.K)
+	log.Printf("Starting Light Node on port %d, publisher=%s, bootstraps=%v, k=%d, k-piece=%d",
+		cfg.Port, cfg.PublisherAddr, cfg.BootstrapsMap, cfg.K, cfg.KPiece)
 
 	// 1. Initialize KZG SRS
 	srsSize := uint64(1024)
@@ -42,7 +43,7 @@ func main() {
 	kzg := cda.NewGnarkKZG(*srs)
 
 	// 2. Initialize Verifier
-	dasVerifier := verifier.NewDASVerifier(cfg.K, kzg)
+	dasVerifier := verifier.NewDASVerifier(cfg.KPiece, kzg)
 
 	// 3. Initialize P2P Host (using seed based on API port)
 	privKey, pid, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-light-%d", cfg.Port))
@@ -70,7 +71,17 @@ func main() {
 	// 4.5. Connect to Bootstrap Nodes via P2P to join GossipSub mesh
 	for colIdx, httpAddrs := range cfg.BootstrapsMap {
 		for _, httpAddr := range httpAddrs {
-			_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", colIdx))
+			n := 2 * cfg.K
+			numCols := len(cfg.BootstrapsMap)
+			if numCols == 0 {
+				numCols = 1
+			}
+			colsPerNetCol := n / numCols
+			if colsPerNetCol == 0 {
+				colsPerNetCol = 1
+			}
+			startColID := colIdx * colsPerNetCol
+			_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", startColID))
 			if err != nil {
 				log.Printf("[P2P] Failed to derive bootstrap keypair for col %d: %v", colIdx, err)
 				continue
@@ -159,6 +170,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("healthy"))
 	})
+	mux.Handle("/metrics", promhttp.Handler())
 
 	// 7. Start HTTP Server
 	addr := fmt.Sprintf(":%d", cfg.Port)
