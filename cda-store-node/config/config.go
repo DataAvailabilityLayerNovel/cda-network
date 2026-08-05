@@ -14,6 +14,8 @@ type Config struct {
 	BootstrapAddr string
 	K             int
 	KPiece        int
+	NumCols       int
+	StoresPerCol  int
 	Peers         []string
 	MyAddr        string
 	CrashOnFail   bool
@@ -27,6 +29,8 @@ func LoadConfig() (*Config, error) {
 	bootAddr := flag.String("bootstrap", "http://localhost:8081", "Bootstrap node URL")
 	k := flag.Int("k", 8, "ODS dimension parameter k")
 	kPiece := flag.Int("k-piece", 0, "RLNC piece parameter k-piece")
+	numCols := flag.Int("num-cols", 8, "Number of network column groups")
+	storesPerCol := flag.Int("stores-per-col", 8, "Number of store nodes per column")
 	peersStr := flag.String("peers", "", "Comma-separated list of peer Store Node URLs")
 	myAddrFlag := flag.String("myaddr", "", "My own accessible address URL (e.g. http://localhost:8082 or http://store-1:8080)")
 	crashOnFail := flag.Bool("crash-on-fail", false, "Crash the node if verification fails")
@@ -66,6 +70,8 @@ func LoadConfig() (*Config, error) {
 		BootstrapAddr: *bootAddr,
 		K:             *k,
 		KPiece:        kPieceVal,
+		NumCols:       *numCols,
+		StoresPerCol:  *storesPerCol,
 		Peers:         peers,
 		MyAddr:        myAddr,
 		CrashOnFail:   *crashOnFail,

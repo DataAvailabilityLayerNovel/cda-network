@@ -27,6 +27,38 @@ func NewDASVerifier(k int, kzg cda.KZGProvider) *DASVerifier {
 	}
 }
 
+func (v *DASVerifier) K() int {
+	return v.k
+}
+
+// IsLinearlyIndependent checks if the new coefficient vector is linearly independent of existing ones.
+func IsLinearlyIndependent(existingCoeffs [][]byte, newCoeff []byte, k int) bool {
+	m := len(existingCoeffs)
+	if m >= k {
+		return false
+	}
+
+	A := make([][]byte, k)
+	for i := 0; i < m; i++ {
+		A[i] = append([]byte(nil), existingCoeffs[i]...)
+	}
+	A[m] = append([]byte(nil), newCoeff...)
+
+	for i := m + 1; i < k; i++ {
+		row := make([]byte, k)
+		row[i] = 1
+		A[i] = row
+	}
+
+	B := make([][]byte, k)
+	for i := 0; i < k; i++ {
+		B[i] = make([]byte, 32)
+	}
+
+	_, err := rlnc.SolveGaussian(A, B)
+	return err == nil
+}
+
 // InvertMatrixFr computes the inverse of a k x k matrix in Fr by solving k systems using rlnc.SolveGaussian.
 func InvertMatrixFr(matrix [][]byte, k int) ([][]fr.Element, error) {
 	inv := make([][]fr.Element, k)

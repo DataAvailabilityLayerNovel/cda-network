@@ -97,6 +97,7 @@ func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece 
 		return fmt.Errorf("failed to publish recoded piece to GossipSub: %w", err)
 	}
 
+	recordGossipMessage()
 	log.Printf("[GossipSub] Successfully gossiped recoded piece for cell [%d, %d] to topic %s", row, col, topicName)
 	return nil
 }

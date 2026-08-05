@@ -200,6 +200,31 @@ func (s *CustodyStore) GetPieceCount(blockID string, row, col int) int {
 	return count
 }
 
+func (s *CustodyStore) GetTotalPieceCount() int {
+	if s.db == nil {
+		return 0
+	}
+	count := 0
+	_ = s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		prefix := []byte("received_")
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
+			_ = item.Value(func(val []byte) error {
+				var pieces []cda.ReceivedPiece
+				if err := json.Unmarshal(val, &pieces); err == nil {
+					count += len(pieces)
+				}
+				return nil
+			})
+		}
+		return nil
+	})
+	return count
+}
+
 func (s *CustodyStore) IsComplete(blockID string, colIdx, k int) bool {
 	if s.db == nil {
 		return false

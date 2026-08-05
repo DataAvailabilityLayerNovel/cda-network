@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -233,32 +234,39 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 		log.Printf("[P2P] Starting Phase 2 Async: computing proofs and seeding RLNC pieces for Column %d", colIdx)
 
 		// Generate KZG Opening Proofs for Column
+		start := time.Now()
 		proofs, err := rcv.proofGen.GenerateColumnProofs(colIdx, columnData)
+		duration := time.Since(start).Seconds()
+
 		if err != nil {
 			log.Printf("Async Proof Generator error for Column %d: %v", colIdx, err)
 			return
 		}
+		KZGProofDuration.Observe(duration)
 		rcv.cache.SetProofs(payload.BlockID, proofs)
 		log.Printf("Successfully generated opening proofs async for Column %d", colIdx)
 
-		// Encode RLNC pieces and broadcast to Store Nodes (3 seeds per row)
+		// Encode RLNC pieces and broadcast 2 seeds to EVERY active Store Node in the column network
 		n := len(columnData)
+		// We generate 2 * rcv.k seeds per row (k for the primary store node, and k for 1 backup store node)
+		totalSeeds := 2 * rcv.k
+
 		for row := 0; row < n; row++ {
-			codedPieces, err := rcv.encoder.EncodeRow3Seeds(row, colIdx, columnData, proofs[row])
+			codedPieces, err := rcv.encoder.EncodeRowNSeeds(row, colIdx, columnData, proofs[row], totalSeeds)
 			if err != nil {
 				log.Printf("Async RLNC encoding error for row %d (col %d): %v", row, colIdx, err)
 				return
 			}
 
-			// Unicast the 3 coded pieces to the Store Node for Cell [row, colIdx]
-			for _, piece := range codedPieces {
-				if err := rcv.broadcaster.BroadcastPiece(payload.BlockID, row, colIdx, piece, pieceCommits); err != nil {
-					log.Printf("Failed to broadcast piece to Store Node for cell [%d, %d]: %v", row, colIdx, err)
+			// Unicast each pair of coded pieces to its assigned Store Node
+			for pieceIdx, piece := range codedPieces {
+				if err := rcv.broadcaster.BroadcastPiece(payload.BlockID, row, colIdx, pieceIdx, piece, pieceCommits); err != nil {
+					log.Printf("Failed to broadcast piece %d to Store Node for cell [%d, %d]: %v", pieceIdx, row, colIdx, err)
 					return
 				}
 			}
 		}
-		log.Printf("Async Phase 2 finished successfully: seeded 3 pieces per row for Column %d", colIdx)
+		log.Printf("Async Phase 2 finished successfully: seeded %d pieces total (%d per store node) for Column %d", totalSeeds, rcv.k, colIdx)
 	}()
 }
 
@@ -337,7 +345,7 @@ func (rcv *Receiver) handleRouting(stream network.Stream) {
 	}
 }
 
-func (rcv *Receiver) GetPeersForCell(row, col int) []p2pcommon.PeerInfo {
+func (rcv *Receiver) GetPeersForCell(row, col int, pieceIdx int) []p2pcommon.PeerInfo {
 	rcv.peersMu.RLock()
 	defer rcv.peersMu.RUnlock()
 
@@ -350,23 +358,32 @@ func (rcv *Receiver) GetPeersForCell(row, col int) []p2pcommon.PeerInfo {
 		return nil
 	}
 
-	// Distribute rows across available store nodes in the column.
-	// We match store nodes whose Row coordinate equals row % len(colPeers).
-	var matched []p2pcommon.PeerInfo
-	targetRowMod := row % len(colPeers)
-	for _, info := range colPeers {
-		if info.Row == targetRowMod {
-			matched = append(matched, info)
-		}
+	// Sort colPeers deterministically by Row coordinate
+	sort.Slice(colPeers, func(i, j int) bool {
+		return colPeers[i].Row < colPeers[j].Row
+	})
+
+	kVal := rcv.k
+	if kVal <= 0 {
+		kVal = 4
 	}
 
-	// Fallback to deterministic modulo indexing if no exact Row match
-	if len(matched) == 0 {
-		idx := row % len(colPeers)
-		matched = append(matched, colPeers[idx])
+	// Find the primary store node for this row
+	// The primary store node's Row coordinate should match row % len(colPeers)
+	primaryIdx := row % len(colPeers)
+
+	// Determine if this pieceIdx is for the primary node or the backup node
+	isBackup := (pieceIdx / kVal) > 0
+
+	var targetIdx int
+	if isBackup {
+		targetIdx = (primaryIdx + 1) % len(colPeers)
+	} else {
+		targetIdx = primaryIdx
 	}
 
-	return matched
+	targetPeer := colPeers[targetIdx]
+	return []p2pcommon.PeerInfo{targetPeer}
 }
 
 func (rcv *Receiver) GetActivePeers() []string {

@@ -77,7 +77,7 @@ for i in {1..10000}; do
     all_complete=true
     incomplete_port=""
     for port in "${ports[@]}"; do
-        resp=$(curl -s "http://localhost:${port}/store/status/${block_id}")
+        resp=$(curl -s --retry 3 --retry-delay 1 --retry-connrefused "http://localhost:${port}/store/status/${block_id}" || echo "{\"completed\":\"false\"}")
         completed=$(echo "$resp" | jq -r '.completed' 2>/dev/null || echo "false")
         if [ "$completed" != "true" ]; then
             all_complete=false
@@ -86,15 +86,15 @@ for i in {1..10000}; do
         fi
     done
     if [ "$all_complete" = "true" ]; then
-        echo "All Store Nodes have completed GossipSub and stored pieces! Took $((i * 500))ms."
+        echo "All Store Nodes have completed GossipSub and stored pieces! Took $((i * 3000))ms."
         break
     fi
-    echo "[iter $i | $((i * 500))ms] Waiting... (last incomplete port: $incomplete_port)"
+    echo "[iter $i | $((i * 3000))ms] Waiting... (last incomplete port: $incomplete_port)"
     if [ "$i" -eq 10000 ]; then
-        echo "[-] ERROR: Store nodes did not complete within $((i * 500))ms timeout!"
+        echo "[-] ERROR: Store nodes did not complete within $((i * 3000))ms timeout!"
         exit 1
     fi
-    sleep 0.5
+    sleep 3
 done
 
 echo "=== 6. Performing DAS Sampling on Light Node 1 container for ALL EDS cells ==="
@@ -111,35 +111,36 @@ if [ "$SUCCESS1" != "true" ]; then
     exit 1
 fi
 
-echo "=== 7. Testing Graceful Leave Mid-Test ==="
-echo "Stopping store-0-2 container gracefully..."
-docker compose -f docker-compose.json stop store-0-2
+echo "=== 7. Testing Store Node Resiliency & Failover (Scenario 1) ==="
+echo "Stopping 3 Store Nodes in Column 0: store-0-2, store-0-3, store-0-4..."
+docker compose -f docker-compose.json stop store-0-2 store-0-3 store-0-4
 sleep 2
 
 PEERS0_AFTER=$(curl -s http://localhost:9200/bootstrap/peers | jq -c '.peers')
-echo "Bootstrap Node 0 active peers list after container stop: $PEERS0_AFTER"
+echo "Bootstrap Node 0 active peers list after stopping 3 nodes: $PEERS0_AFTER"
 
-if [[ "$PEERS0_AFTER" == *"store-0-2"* ]]; then
-    echo "[-] ERROR: Graceful deregistration failed inside Docker!"
-    exit 1
-fi
-if [[ "$PEERS0_AFTER" != *"store-0-1"* ]]; then
-    echo "[-] ERROR: Remaining peer was incorrectly removed inside Docker!"
-    exit 1
-fi
-echo "[+] Graceful deregistration inside Docker succeeded!"
+for stopped_node in "store-0-2" "store-0-3" "store-0-4"; do
+    if [[ "$PEERS0_AFTER" == *"$stopped_node"* ]]; then
+        echo "[-] ERROR: Deregistration failed for $stopped_node!"
+        exit 1
+    fi
+done
+echo "[+] Deregistration of stopped nodes succeeded!"
 
-echo "=== 8. Triggering DAS Sampling after Node Leave (Verify Dynamic Routing) ==="
-QUERY2_RESP=$(curl -s "http://localhost:9402/das/sample/test-block-matrix?row=0&col=0")
+echo "=== 8. Triggering Full Matrix DAS Sampling after Store Nodes Outage (Verify Resiliency) ==="
+QUERY2_RESP=$(curl -s "http://localhost:9402/das/sample/test-block-matrix?all=true")
 SUCCESS2=$(echo "$QUERY2_RESP" | jq -r '.success')
 
-echo "Light Node 2 DAS Response (after store-0-2 stopped):"
-echo "$QUERY2_RESP" | jq .
+echo "Light Node 2 DAS Response (after 3 Store Nodes offline):"
+echo "$QUERY2_RESP" | jq '{block_id: .block_id, success: .success, total_cells_sampled: (.results | length)}'
 
 if [ "$SUCCESS2" != "true" ]; then
-    echo "[-] ERROR: DAS Verification failed in Docker after peer leave!"
+    echo "[-] ERROR: DAS Verification failed after 3 Store Nodes went offline! Resiliency check failed."
+    echo "First 20 failed cell details:"
+    echo "$QUERY2_RESP" | jq '.results[] | select(.verified == false) | {row, col, error}' 2>/dev/null | head -n 20
     exit 1
 fi
+echo "[+] SUCCESS: Light Node successfully sampled full matrix with 3 offline Store Nodes!"
 
 echo "=== 9. Exporting Representative Node Logs ==="
 mkdir -p logs

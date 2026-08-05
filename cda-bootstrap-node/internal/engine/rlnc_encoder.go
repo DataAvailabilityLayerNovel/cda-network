@@ -46,11 +46,14 @@ func EvaluatePieceColumn(columnData [][]byte, pieceIdx, rowIdx, k, frSize int) [
 	return append([]byte(nil), bytesVal[:]...)
 }
 
-// EncodeRow3Seeds performs RLNC encoding on the cell of a specific row and column
-// to generate 3 distinct random seed pieces (d_i, g_i, P_i) using random coefficients g_i.
-func (e *RLNCEncoder) EncodeRow3Seeds(row int, col int, columnData [][]byte, pieceProofs [][]byte) ([]*cda.ReceivedPiece, error) {
+// EncodeRowNSeeds performs RLNC encoding on the cell of a specific row and column
+// to generate `count` distinct random seed pieces (d_i, g_i, P_i) using random coefficients g_i.
+func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pieceProofs [][]byte, count int) ([]*cda.ReceivedPiece, error) {
 	if len(pieceProofs) != e.k {
 		return nil, fmt.Errorf("invalid piece proofs count: got %d, expected %d", len(pieceProofs), e.k)
+	}
+	if count <= 0 {
+		count = e.k
 	}
 
 	// 1. Evaluate piece columns at row to find fragments in evaluation form
@@ -65,10 +68,10 @@ func (e *RLNCEncoder) EncodeRow3Seeds(row int, col int, columnData [][]byte, pie
 		openingProofs[i] = cda.OpeningProof(pieceProofs[i])
 	}
 
-	pieces := make([]*cda.ReceivedPiece, e.k)
+	pieces := make([]*cda.ReceivedPiece, count)
 	var generatedCoeffs [][]byte
 
-	for seedIdx := 0; seedIdx < e.k; seedIdx++ {
+	for seedIdx := 0; seedIdx < count; seedIdx++ {
 		// 2. Generate random coefficients in Fr and check linear independence
 		var coeffs []byte
 		for {
@@ -76,7 +79,7 @@ func (e *RLNCEncoder) EncodeRow3Seeds(row int, col int, columnData [][]byte, pie
 			for i := 0; i < e.k; i++ {
 				b := make([]byte, 1)
 				if _, err := rand.Read(b); err != nil {
-					coeffs[i] = 1
+					coeffs[i] = byte(i + 1)
 				} else {
 					coeffs[i] = (b[0] % 10) + 1 // [1, 10]
 				}
@@ -86,6 +89,9 @@ func (e *RLNCEncoder) EncodeRow3Seeds(row int, col int, columnData [][]byte, pie
 			}
 		}
 		generatedCoeffs = append(generatedCoeffs, coeffs)
+		if len(generatedCoeffs) == e.k {
+			generatedCoeffs = nil
+		}
 
 		// 3. Compute RLNC coded data: d_i = sum(g_{i,j} * S_j)
 		shareSize := len(fragments[0])
@@ -112,6 +118,10 @@ func (e *RLNCEncoder) EncodeRow3Seeds(row int, col int, columnData [][]byte, pie
 	}
 
 	return pieces, nil
+}
+
+func (e *RLNCEncoder) EncodeRow3Seeds(row int, col int, columnData [][]byte, pieceProofs [][]byte) ([]*cda.ReceivedPiece, error) {
+	return e.EncodeRowNSeeds(row, col, columnData, pieceProofs, e.k)
 }
 
 func isLinearlyIndependent(existingCoeffs [][]byte, newCoeff []byte, k int) bool {

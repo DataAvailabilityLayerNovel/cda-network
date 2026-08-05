@@ -17,7 +17,7 @@ import (
 )
 
 type Registry interface {
-	GetPeersForCell(row, col int) []p2pcommon.PeerInfo
+	GetPeersForCell(row, col int, pieceIdx int) []p2pcommon.PeerInfo
 }
 
 type Broadcaster struct {
@@ -83,14 +83,14 @@ func (b *Broadcaster) BroadcastAnchor(blockID string, colIdx int, pieceCommits [
 	return nil
 }
 
-// BroadcastPiece unicasts the RLNC piece to the Store Nodes for cell [row, col]
-func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, piece *cda.ReceivedPiece, pieceCommits [][]byte) error {
+// BroadcastPiece unicasts the RLNC piece to the Store Node assigned for cell [row, col] and pieceIdx
+func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, pieceIdx int, piece *cda.ReceivedPiece, pieceCommits [][]byte) error {
 	if b.reg == nil {
 		return fmt.Errorf("peer registry not set on broadcaster")
 	}
 
-	// Lookup active store nodes registered for cell [row, col]
-	peers := b.reg.GetPeersForCell(row, col)
+	// Lookup active store node registered for cell [row, col] and pieceIdx
+	peers := b.reg.GetPeersForCell(row, col, pieceIdx)
 	if len(peers) == 0 {
 		// Log warning but don't return error. It might be that no store node registered for this row coordinate yet.
 		log.Printf("[P2P Seeder] Warning: No Store Node registered for cell [%d, %d] yet. Seeding skipped.", row, col)
@@ -128,24 +128,27 @@ func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, piece *cda.Re
 			b.host.Peerstore().AddAddr(pid, maddr, peerstoreAddressTTL())
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err = b.host.Connect(ctx, peer.AddrInfo{ID: pid})
+		ctxDial, cancelDial := context.WithTimeout(context.Background(), 5*time.Second)
+		err = b.host.Connect(ctxDial, peer.AddrInfo{ID: pid})
 		if err != nil {
 			log.Printf("[P2P Seeder] Failed to connect to store node %s: %v", pid, err)
-			cancel()
+			cancelDial()
 			continue
 		}
 
-		stream, err := b.host.NewStream(ctx, pid, p2pcommon.ProtoBootstrapSeed)
-		cancel() // cancel context for connection after stream is established or failed
+		streamCtx, streamCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		stream, err := b.host.NewStream(streamCtx, pid, p2pcommon.ProtoBootstrapSeed)
+		cancelDial()
 		if err != nil {
 			log.Printf("[P2P Seeder] Failed to open stream to store node %s: %v", pid, err)
+			streamCancel()
 			continue
 		}
 
 		if err := json.NewEncoder(stream).Encode(payload); err != nil {
 			log.Printf("[P2P Seeder] Failed to send piece to %s: %v", pid, err)
 			stream.Close()
+			streamCancel()
 			continue
 		}
 
@@ -162,6 +165,7 @@ func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, piece *cda.Re
 			log.Printf("[P2P Seeder] Successfully seeded piece for cell [%d, %d] to Store Node %s", row, col, pid)
 		}
 		stream.Close()
+		streamCancel()
 	}
 
 	return nil

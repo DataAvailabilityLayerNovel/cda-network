@@ -1,4 +1,4 @@
-# Tài Liệu Kiến Trúc & Kiểm Thử Hệ Thống CDA (Coded Data Availability) Network
+# Tài Liệu Kiến Trúc & Kiểm Thử Hệ Thống CDA Network
 
 Tài liệu này mô tả chi tiết về hành vi của các node, các luồng kiểm thử đã thực hiện và định hướng thiết kế hệ thống mạng phân tán CDA khi triển khai thực tế.
 
@@ -6,9 +6,9 @@ Tài liệu này mô tả chi tiết về hành vi của các node, các luồng
 
 ## 1. Tổng Quan Hệ Thống CDA
 
-Mạng CDA (Coded Data Availability) được thiết kế nhằm đảm bảo tính khả dụng của dữ liệu (Data Availability) cho các Layer 2 Rollups và blockchain thông qua việc kết hợp các kỹ thuật mã hóa sửa lỗi tiên tiến:
+Mạng CDA được thiết kế nhằm đảm bảo tính khả dụng của dữ liệu (Data Availability) cho các Layer 2 Rollups và blockchain thông qua việc kết hợp các kỹ thuật mã hóa sửa lỗi tiên tiến:
 *   **Mã hóa Reed-Solomon (2D Erasure Coding):** Mở rộng Ma trận dữ liệu gốc (ODS - Original Data Square) kích thước $K \times K$ thành Ma trận dữ liệu mở rộng (EDS - Extended Data Square) kích thước $2K \times 2K$.
-*   **Mã hóa tuyến tính ngẫu nhiên (RLNC - Random Linear Network Coding):** Chia nhỏ từng ô (cell) trong EDS thành $K$ mảnh (fragments) và tạo ra các tổ hợp tuyến tính ngẫu nhiên (coded pieces) nhằm tăng hiệu quả truyền tải và giảm thiểu sự trùng lặp.
+*   **Mã hóa tuyến tính ngẫu nhiên (RLNC - Random Linear Network Coding):** Chia nhỏ từng ô (cell) trong EDS thành $k_{\text{piece}}$ mảnh (fragments) và tạo ra các tổ hợp tuyến tính ngẫu nhiên (coded pieces) nhằm tăng hiệu quả truyền tải và giảm thiểu sự trùng lặp. Việc tách biệt kích thước khối $K$ và tham số mảnh $k_{\text{piece}}$ giúp chúng ta có thể nâng kích thước khối $K$ tùy ý trong khi giữ $k_{\text{piece}}$ ở mức nhỏ (ví dụ: 4, 8 hoặc 16) để duy trì overhead truyền tải P2P tối ưu.
 *   **Cam kết KZG (KZG Commitments & Proofs):** Cung cấp bằng chứng mật mã học giúp kiểm tra tính đúng đắn của mảnh dữ liệu mà không cần giải mã toàn bộ ô.
 
 ---
@@ -40,7 +40,7 @@ graph TD
     *   Thực hiện tính toán song song, không đồng bộ các bằng chứng mở (opening proofs) tại tọa độ $z = row$ cho tất cả các hàng trong cột.
 *   **Mã hóa RLNC & Phân phối:**
     *   Đánh giá đa thức biểu diễn cột tại từng hàng để thu được các mảnh dữ liệu gốc (evaluation form).
-    *   Tạo $K$ mảnh hạt giống (seed pieces) bằng RLNC với vector hệ số ngẫu nhiên trong miền $[1, 10]$ để tránh trùng lặp tuyến tính và lỗi tràn byte (limit 255).
+    *   Tạo $k_{\text{piece}}$ mảnh hạt giống (seed pieces) bằng RLNC với vector hệ số ngẫu nhiên trong miền $[1, 10]$ để tránh trùng lặp tuyến tính và lỗi tràn byte (limit 255).
     *   Gửi trực tiếp các mảnh hạt giống này đến custody Store Node tương ứng trong cột.
 
 ### C. Store Node (Node Lưu Trữ Custody)
@@ -56,10 +56,10 @@ graph TD
     *   Khi tích lũy được $\ge 2$ mảnh độc lập tuyến tính, node tự động thực hiện tái mã hóa (Recode) bằng cách kết hợp tuyến tính ngẫu nhiên các mảnh hiện có nhằm tạo ra mảnh mới.
     *   Lan truyền các mảnh tái mã hóa này đến các Store Node lân cận thông qua cơ chế GossipSub (HTTP POST).
 *   **Truy vấn kéo chủ động (Peer Pull Retrieval):**
-    *   Khi nhận được yêu cầu phục hồi ô nhưng số lượng mảnh độc lập cục bộ $< K$, node sẽ gửi truy vấn HTTP đến các node lân cận được cấu hình qua tham số `-peers`.
+    *   Khi nhận được yêu cầu phục hồi ô nhưng số lượng mảnh độc lập cục bộ $< k_{\text{piece}}$, node sẽ gửi truy vấn HTTP đến các node lân cận được cấu hình qua tham số `-peers`.
     *   Sử dụng cờ truy vấn `?remote=true` để ngăn chặn vòng lặp truy vấn vô hạn (Query Loops) giữa các node trong mạng.
 *   **Phục hồi ô dữ liệu (Cell Reconstruction & Unpadding):**
-    *   Khi thu thập đủ $K$ mảnh độc lập tuyến tính từ lưu trữ cục bộ hoặc từ các node lân cận, node sử dụng phép khử Gauss để giải mã phục hồi ô dữ liệu gốc.
+    *   Khi thu thập đủ $k_{\text{piece}}$ mảnh độc lập tuyến tính từ lưu trữ cục bộ hoặc từ các node lân cận, node sử dụng phép khử Gauss để giải mã phục hồi ô dữ liệu gốc.
     *   Cắt bỏ phần zero-padding (vốn được thêm vào do biểu diễn phần tử trường 32-byte) để trả về đúng dữ liệu gốc (64-byte đối với ODS cell).
 
 ---
@@ -81,11 +81,11 @@ Hai kịch bản kiểm thử tích hợp đầu-cuối (E2E) đã được tri�
 *   **Mô tả:** Mô phỏng mạng lưới 3 Store Node cùng nằm trên một cột mạng để kiểm tra khả năng tái mã hóa, lan truyền Gossip và chủ động kéo mảnh phục hồi ô dữ liệu.
 *   **Sơ đồ luồng dữ liệu kiểm thử:**
     ```
-    Bootstrap Node --> Store Node 1 (8082) [Nhận 4 seeds ban đầu]
+    Bootstrap Node --> Store Node 1 (8082) [Nhận k_piece seeds ban đầu]
                              |
                    (Tái mã hóa & GossipSub)
                              v
-                       Store Node 2 (8083) [Tích lũy được < 4 mảnh]
+                       Store Node 2 (8083) [Tích lũy được < k_piece mảnh]
                              |
                 (Query /store/cell/retrieve)
                              v
@@ -93,7 +93,7 @@ Hai kịch bản kiểm thử tích hợp đầu-cuối (E2E) đã được tri�
                              |
              (Trả về mảnh độc lập tuyến tính)
                              v
-                       Store Node 2 (8083) [Tích lũy đủ K=4 mảnh độc lập]
+                       Store Node 2 (8083) [Tích lũy đủ k_piece mảnh độc lập]
                              |
                        (Reconstruct & Unpad)
                              v
@@ -101,8 +101,8 @@ Hai kịch bản kiểm thử tích hợp đầu-cuối (E2E) đã được tri�
     ```
 *   **Kết quả chạy thử thực tế:**
     - Store Node 2 ban đầu chỉ giữ 0 mảnh hợp lệ.
-    - Khi nhận yêu cầu phục hồi ô `[0, 0]`, Store Node 2 nhận diện thiếu mảnh ($0 < 4$), chuyển hướng yêu cầu kéo mảnh từ Store Node 1.
-    - Store Node 1 trả về các mảnh của nó. Store Node 2 lọc và giữ lại 4 mảnh độc lập tuyến tính.
+    - Khi nhận yêu cầu phục hồi ô `[0, 0]`, Store Node 2 nhận diện thiếu mảnh ($0 < k_{\text{piece}}$), chuyển hướng yêu cầu kéo mảnh từ Store Node 1.
+    - Store Node 1 trả về các mảnh của nó. Store Node 2 lọc và giữ lại $k_{\text{piece}}$ mảnh độc lập tuyến tính.
     - Node giải mã thành công ô dữ liệu gốc, loại bỏ padding và trả về kết quả khớp chính xác với ô dữ liệu gốc đã phát hành (`...00000001`).
 
 ---

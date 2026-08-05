@@ -25,15 +25,18 @@ Store-0-2  Store-1-2
          Light Nodes        ← Light nodes query bootstrap → store để DAS sampling
 ```
 
-### Tham Số Thiết Kế (tham số K=4)
+### Tham Số Thiết Kế (Tách biệt K và k-piece)
 
-| Tham số | Giá trị | Ý nghĩa |
-|---------|---------|---------|
-| `k` | 4 | Số chunks ODS mỗi chiều (4×4 = 16 ô dữ liệu gốc) |
-| `n = 2k` | 8 | Kích thước EDS sau khi mở rộng (8×8 = 64 ô) |
-| Network columns | 4 | Số bootstrap node = n/2 |
-| Data cols per bootstrap | 2 | Mỗi bootstrap quản lý 2 cột dữ liệu EDS |
-| Store nodes per column | ≥2 | Redundancy: mỗi store lưu các hàng theo modulo |
+| Tham số | Giá trị mặc định | Ý nghĩa |
+|---------|-----------------|---------|
+| `K` | 16 (hoặc 4 ở test nhỏ) | Số chunks ODS mỗi chiều ($K \times K$ ô dữ liệu gốc) |
+| `k-piece` | 4 hoặc 8 | Số lượng mảnh độc lập mã hóa RLNC được tạo ra từ mỗi cột ban đầu |
+| `n = 2K` | 32 (hoặc 8 ở test nhỏ) | Kích thước EDS sau khi mở rộng ($2K \times 2K$ ô) |
+| Network columns | 8 (hoặc 4 ở test nhỏ) | Số lượng bootstrap node mạng = n/4 |
+| Data cols per bootstrap | 4 (hoặc 2 ở test nhỏ) | Mỗi bootstrap node quản lý `n / network_columns` cột dữ liệu EDS |
+| Store nodes per column | ≥4 (hoặc 2 ở test nhỏ) | Redundancy: các Store Node lưu trữ các hàng theo modulo |
+
+> **Lưu ý tách biệt thông số:** Trước đây, kích thước khối gốc `K` và số lượng mảnh RLNC `k-piece` được gộp làm một. Hiện tại hệ thống đã tách biệt hoàn chỉnh. Khi tăng kích thước ma trận `K` (ví dụ từ 4 lên 16), số lượng mảnh RLNC phân mảnh từ cột (`k-piece`) vẫn có thể duy trì ở mức nhỏ (ví dụ 4 hoặc 8) để giảm thiểu tối đa overhead truyền tải P2P trong mạng lưới.
 
 ---
 
@@ -56,16 +59,16 @@ Input (ODS hex data)
 1. Decode ODS: 4×4 ô dữ liệu gốc, mỗi ô là field element BLS12-381
     ↓
 2. 2D Reed-Solomon Extension:
-   - IFFT theo hàng → pad zero → FFT → mở rộng thành 8×4 (mở rộng hàng)
-   - IFFT theo cột → pad zero → FFT → mở rộng thành 8×8 (mở rộng cột)
-   → EDS 8×8
+   - IFFT theo hàng → pad zero → FFT → mở rộng hàng
+   - IFFT theo cột → pad zero → FFT → mở rộng cột
+   → EDS $2K \times 2K$
     ↓
 3. KZG Commitment (mỗi cột EDS):
-   - Tính piece commitments C_0..C_{k-1} cho k=4 pieces mỗi cột
+   - Tính piece commitments $C_0..C_{k_{\text{piece}}-1}$ cho $k_{\text{piece}}$ pieces mỗi cột
    - Tính Merkle tree của piece commitments → commits_root
    - Tính combined column commitment (inner product commitment của cột)
     ↓
-4. Block Header: {BlockID, commits_root, column_comms[8], coeffs}
+4. Block Header: {BlockID, commits_root, column_comms[2K], coeffs}
     ↓
 5. Publish Header lên GossipSub topic /cda/1.0.0/header
     ↓
@@ -122,8 +125,8 @@ Phase 1 (Synchronous, ~5ms):
   Layer 3 Sign:   GossipSub broadcast anchor tới store nodes
     ↓
 Phase 2 (Async goroutine):
-  Sinh k=4 opening proofs (KZG) cho từng piece mỗi hàng
-  RLNC encode: sinh n=8 coded pieces (k=4 original + 4 parity)
+  Sinh $k_{\text{piece}}$ opening proofs (KZG) cho từng piece mỗi hàng
+  RLNC encode: sinh $2 \cdot k_{\text{piece}}$ coded pieces ($k_{\text{piece}}$ original + $k_{\text{piece}}$ parity)
   Seed pieces tới registered store nodes qua [/cda/bootstrap/seed-cell/1.0.0]
 ```
 
@@ -175,10 +178,10 @@ Store Node là **nút lưu trữ** trong hệ thống. Mỗi store node chịu t
 
 ### Custody Assignment
 ```
-k=4, n=8: EDS 8×8
+Ví dụ với K=4, n=8: EDS 8×8
 - Store 0-1 (row=0, col=0): lưu hàng 0, 2, 4, 6 của cột subnet 0 (cột 0,1)
 - Store 0-2 (row=1, col=0): lưu hàng 1, 3, 5, 7 của cột subnet 0 (cột 0,1)
-→ Rule: store với rowIdx lưu các hàng r sao cho r % 2 == rowIdx % 2
+→ Rule: store với rowIdx lưu các hàng r sao cho r % (n/K) == rowIdx % (n/K)
 ```
 
 ### Quá Trình Xử Lý Khi Nhận Pieces
@@ -192,7 +195,7 @@ Layer 3 Verify:
     ↓
 Store: custody.StorePiece(blockID, row, col, piece)
     ↓
-Khi đủ k pieces cho cell [row, col]:
+Khi đủ $k_{\text{piece}}$ pieces cho cell [row, col]:
   - RLNC decode: reconstruct original data
   - Broadcast recoded pieces tới column peers (active pull optimization)
 ```
@@ -226,8 +229,8 @@ Khi nhận SIGTERM/SIGINT:
 - [x] In-memory custody store với thread-safe access và phục hồi tự động khi khởi động
 - [x] **Lưu trữ persistent theo Block trên ổ đĩa:** Gom nhóm các pieces, anchors, và recoded pieces của mỗi block vào một file JSON duy nhất (`data/store_{port}/blocks/{blockID}.json`) giúp tối ưu hiệu năng I/O và quản lý file.
 - [x] **Key Caching:** Cache keypair PeerID xuống file đĩa (`store_{port}.key`) giúp loại bỏ brute-force startup cost
-- [x] **Token-bucket rate limiting:** Giới hạn tốc độ yêu cầu P2P trên store node theo PeerID để chống spam active pull
-- [x] RLNC decoding: recover original cell data từ k coded pieces
+- [x] **Token-bucket rate limiting:** Giới hạn tốc độ yêu cầu P2P trên store node theo PeerID để chống spam active pull. Tự động nâng hạn mức mặc định lên 1000 requests/giây (với burst 1000) để đáp ứng các bài test DAS mật độ cao dưới tải nặng của môi trường docker compose.
+- [x] RLNC decoding: recover original cell data từ $k_{\text{piece}}$ coded pieces
 - [x] Active pull: query peers trong cùng column subnet khi thiếu pieces
 - [x] Graceful deregistration khi shutdown
 - [x] HTTP status endpoint để test script kiểm tra completion
@@ -265,13 +268,16 @@ Client → GET /das/sample/{blockID}?row=0&col=3 → Light Node
 3. Query Bootstrap qua P2P [/cda/bootstrap/routing/1.0.0]:
    → Nhận danh sách active store nodes trong column subnet
     ↓
-4. Random chọn 1 store node từ danh sách
+4. Thử kết nối dự phòng tuần tự (Fallback Loop):
+   - Chọn ngẫu nhiên danh sách các store node ứng cử viên trong nhóm cột
+   - Lần lượt kết nối (với timeout 8s) và truy vấn đến tối đa 3 Store Node cho đến khi thành công
     ↓
 5. Query Store Node qua P2P [/cda/store/get-cell-pieces]:
-   → Nhận coded pieces cho cell [row, col]
+   - Nhận coded pieces cho cell [row, col]
+   - Nếu Store Node trả về lỗi logic (vd: rate limit exceeded), tự động chuyển sang Store Node dự phòng kế tiếp
     ↓
 6. Verify locally:
-   - RLNC decode: reconstruct cell data từ k pieces
+   - RLNC decode: reconstruct cell data từ $k_{\text{piece}}$ pieces
    - KZG verify: piece vs column commitment (từ block header)
    - Output: verified=true/false + cell_data
 ```
@@ -281,7 +287,7 @@ Client → GET /das/sample/{blockID}?row=0&col=3 → Light Node
 |------|----------------|--------|
 | Specific cell | `?row=R&col=C` | Sample đúng 1 ô |
 | Random DAS | `?samples=N` | Random N ô (default 4) |
-| Full matrix | `?all=true` | Sample toàn bộ n×n ô (64 ô với k=4) |
+| Full matrix | `?all=true` | Sample toàn bộ $2K \times 2K$ ô |
 
 ### Keypair
 - Seed: `"cda-light-{port}"` (vd: `"cda-light-8095"`)
@@ -349,7 +355,54 @@ Dùng **BLAKE3** hash của PeerID để tính vị trí `(row, col)` trong matr
 
 ---
 
-## 6. Hạn Chế Tổng Thể Của Prototype
+## 6. Dynamic Membership (Store & Light Nodes Join/Leave)
+
+Mạng lưới CDA được thiết kế để hỗ trợ tính năng tự phục hồi (self-healing) và tự động nhận diện thành viên (dynamic membership) khi các node tự do gia nhập (Join) hoặc rời mạng (Leave).
+
+### A. Store Node (Thành viên lưu trữ custody)
+
+Store Node có trạng thái đăng ký động với Bootstrap Node của cột mà nó quản lý.
+
+1. **Gia nhập mạng (Join & Register):**
+   - Khi khởi động, Store Node kết nối với Bootstrap Node được cấu hình và gửi yêu cầu `BootstrapRoutingRequest` chứa `PeerInfo` (ID, Multiaddrs, tọa độ Row, Col).
+   - Bootstrap Node lưu thông tin này vào bảng đăng ký động `activePeers` với thời gian sống **TTL = 15 giây**.
+   - Bootstrap Node phản hồi danh sách các Store Node khác hiện có trong cùng nhóm hàng (`RowPeers`) và cùng cột (`ColPeers`).
+   - Store Node mới lập tức thực hiện kết nối P2P trực tiếp tới các peer này để thiết lập mạng lưới liên kết ngang hàng **Persistent Clique (Mesh)** của subnet cột.
+
+2. **Duy trì hoạt động (Heartbeat & Keepalive):**
+   - Để tránh bị xóa khỏi danh sách do hết hạn TTL, Store Node chạy một luồng nền (sync loop) định kỳ **mỗi 2 giây** gọi hàm `registerAndSyncPeers()`.
+   - Mỗi chu kỳ, Store Node gửi lại request đăng ký lên Bootstrap Node để làm mới (refresh) TTL và đồng thời nhận về danh sách row/col peers cập nhật mới nhất.
+   - Nhờ chu kỳ 2 giây này, các Store Node cũ trong mạng sẽ tự động phát hiện và kết nối với Store Node mới gia nhập chỉ trong vòng tối đa 2 giây.
+
+3. **Rời mạng (Leave):**
+   - **Rời mạng chủ động (Graceful Leave):** Khi nhận tín hiệu tắt máy (`SIGINT/SIGTERM`), Store Node gửi gói tin `BootstrapRoutingRequest` với cờ `IsLeave: true` tới Bootstrap Node. Bootstrap Node sẽ xóa ngay lập tức node đó khỏi registry.
+   - **Rời mạng đột ngột (Ungraceful Leave / Crash):** Nếu Store Node bị sập đột ngột (mất điện, lỗi phần cứng), Bootstrap Node sẽ tự động xóa node khỏi registry sau khi hết hạn **15 giây TTL** mà không nhận được heartbeat.
+
+---
+
+### B. Light Node (Client truy vấn DAS)
+
+Light Node hoạt động hoàn toàn không lưu trạng thái đăng ký (Stateless Client), giúp tối giản tải quản lý thành viên.
+
+1. **Gia nhập mạng (Join):**
+   - Light Node khi khởi động sẽ thực hiện kết nối P2P trực tiếp tới danh sách các Bootstrap Node.
+   - Nó đăng ký (subscribe) vào GossipSub topic chung `/cda/1.0.0/header` để nhận block header mới từ Publisher.
+   - Light Node **không đăng ký** vào bất kỳ bảng thành viên custody nào của Bootstrap Node vì nó không lưu giữ mảnh dữ liệu (nhiệm vụ custody).
+
+2. **Truy vấn Động (On-Demand Discovery):**
+   - Khi cần kiểm thử DAS cho một ô dữ liệu `[row, col]`, Light Node tính toán Bootstrap Node chịu trách nhiệm cho cột `col` và gửi truy vấn `/cda/bootstrap/routing/1.0.0` để lấy danh sách Store Node đang hoạt động thực tế.
+   - Vì danh sách này được truy vấn động trực tiếp từ Bootstrap Node ngay tại thời điểm sample, Light Node luôn nhận được danh sách Store Node mới nhất và chính xác nhất (bao gồm cả các Store Node mới gia nhập).
+
+3. **Xử lý Store Node Offline (Fallback Loop):**
+   - Nếu Store Node mục tiêu đột ngột rời mạng (hoặc bị sập), yêu cầu kết nối của Light Node sẽ gặp lỗi.
+   - Nhờ cơ chế **Fallback Loop (kết nối dự phòng tuần tự)**, Light Node sẽ tự động thử kết nối sang Store Node dự phòng khác trong danh sách (tối đa 3 node) với timeout 8s để đảm bảo việc lấy mảnh dữ liệu vẫn thành công.
+
+4. **Rời mạng (Leave):**
+   - Light Node có thể tắt bất cứ lúc nào mà không cần gửi thông báo rời mạng, vì Bootstrap Node không lưu trữ bất kỳ trạng thái nào của Light Node trong registry.
+
+---
+
+## 7. Hạn Chế Tổng Thể Của Prototype
 
 ### Cryptographic / Security
 
@@ -380,7 +433,7 @@ Dùng **BLAKE3** hash của PeerID để tính vị trí `(row, col)` trong matr
 
 ---
 
-## 7. Tóm Tắt Đánh Giá
+## 8. Tóm Tắt Đánh Giá
 
 ### Những Gì Đã Hoạt Động Tốt
 

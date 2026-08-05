@@ -125,6 +125,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 
 	// 1. Decode hex data cells (ODS)
 	decodedData := make([][]byte, len(req.Data))
+	totalBytes := 0
 	for i, h := range req.Data {
 		b, err := hex.DecodeString(h)
 		if err != nil {
@@ -132,13 +133,24 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		decodedData[i] = b
+		totalBytes += len(b)
 	}
 
 	// 2. Run engine pipeline: ODS -> EDS -> Commitments -> Header
+	start := time.Now()
 	header, pubData, proofs, eds, err := s.pipeline.ProcessODS(decodedData, req.BlockID)
+	duration := time.Since(start).Seconds()
+
 	if err != nil {
 		http.Error(w, "Engine pipeline failed: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Record metrics
+	RSEncodeDuration.Observe(duration)
+	ThroughputBytesTotal.Add(float64(totalBytes))
+	if duration > 0 {
+		ThroughputBytesRate.Set(float64(totalBytes) / duration)
 	}
 
 	// 3. Save Header and Broadcast via GossipSub

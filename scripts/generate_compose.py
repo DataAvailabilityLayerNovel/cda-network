@@ -79,6 +79,8 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                     "-bootstrap", f"/dns4/{bootstrap_name}/tcp/{bootstrap_p2p_port}",
                     "-k", str(k),
                     "-k-piece", str(k_piece),
+                    "-num-cols", str(cols),
+                    "-stores-per-col", str(stores_per_col),
                     "-myaddr", f"http://{store_name}:8080"
                 ] + crash_arg,
                 'ports': [f"{current_store_host_port}:8080", f"{current_store_host_port + 10000}:18080"],
@@ -204,18 +206,171 @@ providers:
     with open('data/grafana/provisioning/dashboards/dashboard.yml', 'w') as f:
         f.write(dashboard_yml)
 
-    # 3. Simple Dashboard JSON
+    # 3. Premium Dashboard JSON
     dashboard_json = {
         "id": None,
-        "title": "CDA Network Performance",
-        "tags": ["cda"],
+        "title": "CDA Network Performance Dashboard",
+        "tags": ["cda", "production"],
         "timezone": "browser",
-        "schemaVersion": 16,
+        "schemaVersion": 26,
         "panels": [
             {
+                "type": "stat",
+                "title": "Healthy / Online Nodes",
+                "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+                "targets": [
+                    {"expr": "sum(up)", "legendFormat": "Nodes Up"}
+                ],
+                "options": {
+                    "colorMode": "value",
+                    "graphMode": "area",
+                    "justifyMode": "center",
+                    "textMode": "value"
+                }
+            },
+            {
+                "type": "gauge",
+                "title": "DAS Success Rate",
+                "gridPos": {"h": 6, "w": 6, "x": 6, "y": 0},
+                "targets": [
+                    {"expr": "cda_light_das_success_rate", "legendFormat": "{{instance}}"}
+                ],
+                "fieldConfig": {
+                    "defaults": {
+                        "min": 0,
+                        "max": 100,
+                        "unit": "percent",
+                        "thresholds": {
+                            "mode": "absolute",
+                            "steps": [
+                                {"value": None, "color": "red"},
+                                {"value": 90, "color": "orange"},
+                                {"value": 99.9, "color": "green"}
+                            ]
+                        }
+                    }
+                }
+            },
+            {
+                "type": "stat",
+                "title": "Byzantine Forged Pieces Blocked",
+                "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+                "targets": [
+                    {"expr": "sum(cda_store_byzantine_detection_count)", "legendFormat": "Detections"}
+                ],
+                "options": {
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "center",
+                    "textMode": "value"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "thresholds": {
+                            "mode": "absolute",
+                            "steps": [
+                                {"value": None, "color": "green"},
+                                {"value": 1, "color": "red"}
+                            ]
+                        }
+                    }
+                }
+            },
+            {
+                "type": "stat",
+                "title": "Publisher Throughput",
+                "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+                "targets": [
+                    {"expr": "sum(rate(cda_publisher_throughput_bytes_total[10s]))", "legendFormat": "Bytes/sec"}
+                ],
+                "fieldConfig": {
+                    "defaults": {
+                        "unit": "Bps"
+                    }
+                }
+            },
+            {
                 "type": "graph",
-                "title": "Node CPU Usage",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+                "title": "DAS Sampling Latency (95th vs Average)",
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+                "targets": [
+                    {
+                        "expr": "histogram_quantile(0.95, sum(rate(cda_light_das_sample_latency_seconds_bucket[10s])) by (le))",
+                        "legendFormat": "95th Percentile Latency"
+                    },
+                    {
+                        "expr": "sum(rate(cda_light_das_sample_latency_seconds_sum[10s])) / sum(rate(cda_light_das_sample_latency_seconds_count[10s]))",
+                        "legendFormat": "Average Latency"
+                    }
+                ],
+                "yaxes": [
+                    {"format": "s", "show": True},
+                    {"format": "short", "show": False}
+                ]
+            },
+            {
+                "type": "graph",
+                "title": "Node Encoding & Proof Durations",
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+                "targets": [
+                    {
+                        "expr": "sum(rate(cda_publisher_rs_encode_duration_seconds_sum[10s])) / sum(rate(cda_publisher_rs_encode_duration_seconds_count[10s]))",
+                        "legendFormat": "Publisher RS Encode (Avg)"
+                    },
+                    {
+                        "expr": "sum(rate(cda_bootstrap_kzg_proof_duration_seconds_sum[10s])) / sum(rate(cda_bootstrap_kzg_proof_duration_seconds_count[10s]))",
+                        "legendFormat": "Bootstrap KZG Proof (Avg)"
+                    },
+                    {
+                        "expr": "sum(rate(cda_store_reconstruct_duration_seconds_sum[10s])) / sum(rate(cda_store_reconstruct_duration_seconds_count[10s]))",
+                        "legendFormat": "Store Reconstruction (Avg)"
+                    }
+                ],
+                "yaxes": [
+                    {"format": "s", "show": True},
+                    {"format": "short", "show": False}
+                ]
+            },
+            {
+                "type": "bargauge",
+                "title": "Store Node Storage Rank (Stored Custody Pieces)",
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+                "targets": [
+                    {
+                        "expr": "cda_store_linear_independent_pieces_count",
+                        "legendFormat": "{{instance}}"
+                    }
+                ],
+                "options": {
+                    "orientation": "vertical",
+                    "displayMode": "lcd"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "min": 0,
+                        "max": 128
+                    }
+                }
+            },
+            {
+                "type": "graph",
+                "title": "Store Node Network Rates (P2P Queries & GossipSub Propagation)",
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+                "targets": [
+                    {
+                        "expr": "sum(cda_store_p2p_request_rate)",
+                        "legendFormat": "Total P2P Requests/sec"
+                    },
+                    {
+                        "expr": "sum(cda_gossipsub_message_propagation_rate)",
+                        "legendFormat": "Total Gossip Pieces/sec"
+                    }
+                ]
+            },
+            {
+                "type": "graph",
+                "title": "System CPU Usage (%)",
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
                 "targets": [
                     {
                         "expr": "rate(process_cpu_seconds_total[10s]) * 100",
@@ -225,23 +380,12 @@ providers:
             },
             {
                 "type": "graph",
-                "title": "Node Resident Memory (MB)",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+                "title": "System Memory Usage (MB)",
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
                 "targets": [
                     {
                         "expr": "process_resident_memory_bytes / 1024 / 1024",
                         "legendFormat": "{{job}} ({{instance}})"
-                    }
-                ]
-            },
-            {
-                "type": "stat",
-                "title": "Healthy / Online Nodes",
-                "gridPos": {"h": 4, "w": 24, "x": 0, "y": 8},
-                "targets": [
-                    {
-                        "expr": "sum(up)",
-                        "legendFormat": "Nodes Up"
                     }
                 ]
             }
