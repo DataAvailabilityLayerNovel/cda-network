@@ -69,8 +69,8 @@ $$C^{\text{col}}_c = \sum_{j=0}^{k-1} x_j \cdot C_{c, j}$$
                                                    │
                                                    └── PHASE 2: COMPUTE & RLNC SEEDING LAYER (Async Heavy Task)
                                                         ├── 1. Compute Proof: Gen N x k Proofs Π_{j,r}
-                                                        ├── 2. Generate m_min = 3 RLNC seeds per Row r
-                                                        └── 3. UNICAST SEEDS: Send (d_i, g_i, P_i) [i=1..3]
+                                                        ├── 2. Generate 2 * k_piece RLNC seeds per Row r
+                                                        └── 3. UNICAST SEEDS: Send k_piece seeds to Primary & k_piece seeds to Backup
                                                                                             │
                                                                                             ▼
                                                                              [ STORE NODES (Custody Cell [r, c]) ]
@@ -78,7 +78,7 @@ $$C^{\text{col}}_c = \sum_{j=0}^{k-1} x_j \cdot C_{c, j}$$
                                                                              ├── 2. Verify Piece RLNC: Verify(∑g_j*C_j, r, d, P)
                                                                              ├── 3. Rank(g) Check (Ensure Rank >= 2)
                                                                              ├── 4. Recode RLNC -> (d_new, g_new, P_new)
-                                                                             └── 5. GossipSub Recoded Pieces trong Cột c
+                                                                             └── 5. GossipSub Recoded Pieces trong Cột c (Cho toàn bộ custody columns)
                                                                                                  ▲
                                                                                                  │ (Query Random Cells - DAS)
                                                                              [ LIGHT NODE / VERIFIER ]
@@ -135,9 +135,8 @@ Mỗi Bootstrap Node phụ trách một Cột $c$ và xử lý dữ liệu theo 
 #### ⚙️ Phase 2: Compute & Seed RLNC Pieces (Async Heavy Task)
 *Mục tiêu:* Sinh các mảnh mã hóa RLNC hạt giống ban đầu cho từng ô lưu ký.
 1. **FK20 Proof Generation:** Chạy FK20 tính $N \times k$ proofs cơ sở $\Pi_{j,r}$ cho toàn Cột $c$.
-2. **RLNC Seed Generation ($m_{\text{min}} = 3$):** Tại mỗi Hàng $r$ (Cell $[r, c]$), sinh $3$ vector hệ số ngẫu nhiên $g_1, g_2, g_3 \in \mathbb{F}_r^k$ và tính:
-   $$d_{i, r} = \sum_{j=0}^{k-1} g_{i, j} \cdot S_{j, r}, \quad P_{i, r} = \sum_{j=0}^{k-1} g_{i, j} \cdot \Pi_{j, r} \quad (i \in \{1, 2, 3\})$$
-3. **Unicast Seeding:** Gửi $3$ bộ mảnh mã hóa hạt giống $(d_{i,r}, g_i, P_{i,r})$ trực tiếp tới các Store Nodes thuộc Custody Cell $[r, c]$ để đảm bảo đủ Rank ($\ge 2$) cho quá trình Recode P2P.
+2. **RLNC Seed Generation:** Tại mỗi Hàng $r$ (Cell $[r, c]$), sinh $2 \times k_{\text{piece}}$ mảnh mã hóa hạt giống (trong đó $k_{\text{piece}}$ mảnh cho Primary Node và $k_{\text{piece}}$ mảnh cho Backup Node).
+3. **Unicast Seeding & Backup Routing:** Gửi $k_{\text{piece}}$ mảnh hạt giống trực tiếp tới **Primary Store Node** (đáp ứng đúng chỉ số hàng $r \pmod{\text{len}(\text{colPeers})}$) và $k_{\text{piece}}$ mảnh tới **Backup Store Node** (node kế tiếp trong danh sách hoạt động của cột mạng). Việc này đảm bảo tính dự phòng cao và đẩy nhanh tốc độ lan truyền dữ liệu mà không bị hardcode.
 
 
 
@@ -170,9 +169,9 @@ Khi nhận các mảnh mã hóa RLNC $(d, g, P)$ (từ Unicast Seeding của Boo
    * *Nếu Rank không tăng* (mảnh bị trùng lặp tuyến tính) $\rightarrow$ Drop để tránh lãng phí bộ nhớ và băng thông.
 
 3. **Mã hóa lại (P2P Recoding) & Phát tán GossipSub:**
-   * Ngay khi tích lũy đủ $m \ge 2$ mảnh hợp lệ độc lập tuyến tính (đảm bảo từ tập hạt giống $m_{\text{min}} = 3$), Store Node sinh ngẫu nhiên các hệ số $\beta_1, \dots, \beta_m \in \mathbb{F}_r$ để tạo mảnh mã hóa mới:
+   * Ngay khi tích lũy đủ $m \ge 2$ mảnh hợp lệ độc lập tuyến tính (được bảo đảm khi nhận đủ mảnh từ Bootstrap Node hoặc qua GossipSub/Active Pull), Store Node sinh ngẫu nhiên các hệ số $\beta_1, \dots, \beta_m \in \mathbb{F}_r$ để tạo mảnh mã hóa mới:
      $$d_{\text{new}} = \sum_{i=1}^{m} \beta_i \cdot d_i, \quad g_{\text{new}} = \sum_{i=1}^{m} \beta_i \cdot g_i, \quad P_{\text{new}} = \sum_{i=1}^{m} \beta_i \cdot P_i$$
-   * **Lưu trữ & Chuyển tiếp:** Lưu bộ mảnh mới $(d_{\text{new}}, g_{\text{new}}, P_{\text{new}})$ vào DB cục bộ (BadgerDB/LevelDB) và GossipSub tới các Store Nodes khác trong Cột $c$.
+   * **Lưu trữ & Chuyển tiếp:** Lưu bộ mảnh mới $(d_{\text{new}}, g_{\text{new}}, P_{\text{new}})$ vào DB cục bộ (BadgerDB/LevelDB) và GossipSub tới tất cả các cột dữ liệu trong tầm custody (tất cả các topic GossipSub cột tương ứng từ `startCol` đến `endCol - 1` mà store node đăng ký lắng nghe).
 
 
 

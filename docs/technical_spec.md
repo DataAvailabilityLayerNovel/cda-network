@@ -127,7 +127,7 @@ Phase 1 (Synchronous, ~5ms):
 Phase 2 (Async goroutine):
   Sinh $k_{\text{piece}}$ opening proofs (KZG) cho từng piece mỗi hàng
   RLNC encode: sinh $2 \cdot k_{\text{piece}}$ coded pieces ($k_{\text{piece}}$ original + $k_{\text{piece}}$ parity)
-  Seed pieces tới registered store nodes qua [/cda/bootstrap/seed-cell/1.0.0]
+  Seed pieces tới Store Nodes: gửi $k_{\text{piece}}$ pieces tới Primary Store Node và $k_{\text{piece}}$ pieces tới Backup Store Node của hàng đó qua [/cda/bootstrap/seed-cell/1.0.0]
 ```
 
 ### Peer Registry
@@ -211,7 +211,7 @@ Store-0-2 trả pieces → Store-0-1 combine → trả về light node
 ```
 
 ### GossipSub Topics (Subscribe)
-- `/cda/1.0.0/col/{colIdx}` → nhận anchor (piece commitments) từ bootstrap
+- `/cda/1.0.0/col/{colIdx}` (cho tất cả `colIdx` trong tầm custody từ `startCol` đến `endCol - 1`) → nhận anchor (piece commitments) và các mảnh recode từ các store node khác trong nhóm cột dữ liệu.
 - `/cda/1.0.0/row/{rowIdx}` → (reserved) cross-column coordination
 
 ### Keypair

@@ -18,7 +18,7 @@ Theo mặc định, kịch bản kiểm thử sẽ triển khai 1 mạng giả l
 
 Để chạy kịch bản mạng với các thông số mặc định này, chỉ cần thực thi:
 ```bash
-./run_docker_test.sh
+bash scripts/tests/run_docker_test.sh
 ```
 
 *(Trong kịch bản này, script sẽ tự động tạo cấu hình compose, xoá các state cũ, build image, chạy các node, và thực hiện E2E Testing bao gồm kiểm tra DAS và việc một node bị tắt ngẫu nhiên (Graceful leave)).*
@@ -35,12 +35,12 @@ Kịch bản chạy chấp nhận 3 tham số (theo đúng thứ tự):
 
 **Cú pháp:**
 ```bash
-./run_docker_test.sh <COLS> <STORES_PER_COL> <LIGHTS>
+bash scripts/tests/run_docker_test.sh <COLS> <STORES_PER_COL> <LIGHTS>
 ```
 
 **Ví dụ:** Triển khai ma trận gồm 6 cột mạng, 3 store nodes trên mỗi cột, và 4 light nodes:
 ```bash
-./run_docker_test.sh 6 3 4
+bash scripts/tests/run_docker_test.sh 6 3 4
 ```
 
 ---
