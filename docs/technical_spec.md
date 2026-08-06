@@ -437,20 +437,24 @@ Light Node hoạt động hoàn toàn không lưu trạng thái đăng ký (Stat
 
 ### Những Gì Đã Hoạt Động Tốt
 
-```
-✅ Toàn bộ pipeline mã hóa: ODS → EDS → KZG commitments → RLNC pieces
-✅ 3-layer cryptographic verification trên bootstrap node
-✅ Dynamic peer discovery và routing không hardcode
-✅ DAS sampling với algebraic verification cục bộ trên light node
-✅ Graceful join/leave với bootstrap registry
-✅ E2E test hoàn chỉnh bao gồm node failure simulation
-✅ Docker-based deployment với docker-compose
-✅ GossipSub P2P propagation cho block headers (sau fix timing race)
-✅ Lưu trữ persistent cục bộ cho store node (file-based JSON)
-✅ Cache keypair PeerID để tránh brute-force khi restart
-✅ Rate limiting cho các stream active pull
-✅ Bootstrap HA failover và dự phòng kết nối
-```
+#### 1. Các Tính Năng Cốt Lõi Và Mạng Lưới P2P
+- **Toàn bộ pipeline mã hóa:** Mã hóa 2D Reed-Solomon trên ODS, tạo cam kết KZG, tính toán proof và phân mảnh RLNC ($k$-piece) được tách biệt hoàn toàn giúp tối ưu overhead truyền tải.
+- **Xác thực mật mã 3 lớp (3-layer verification):** Đảm bảo tính toàn vẹn của dữ liệu tại Bootstrap Node (Merkle proof + KZG column + combined column commitment) và Store Node (KZG opening proof).
+- **Dynamic Registry & Routing:** Tự động khám phá peer động dựa trên registry TTL keepalive trên Bootstrap Node và fallback loop kết nối dự phòng tuần tự trên Light Node khi DAS.
+- **DAS Sampling thành công:** Phục hồi ô dữ liệu gốc cục bộ bằng cách giải hệ phương trình RLNC và kiểm tra KZG proof cục bộ trên Light Node.
+
+#### 2. Các Tối Ưu Hóa & Cải Tiến Gần Đây (Môi Trường Tải Cao)
+- **Cơ chế Cắt Tỉa Dữ Liệu Linh Hoạt (Pruning):**
+  - Hỗ trợ Pruning tự động loại bỏ các mảnh dữ liệu thô (`received_` keys) trên các node non-custody sau một chu trình xử lý (dựa theo `prune-ttl` cấu hình).
+  - Pruning có thể bật/tắt dễ dàng qua đối tham số khởi chạy của docker compose để thuận tiện cho giả lập/triển khai thực tế.
+  - Các ô non-custody sau khi kết thúc Active Pull sẽ được tự động recode và lưu trữ mảnh recode đơn lẻ, tạo điều kiện cho tiến trình Pruning hoạt động hiệu quả giúp tiết kiệm dung lượng đĩa tối đa.
+- **Kháng Lỗi & Tự Phục Hồi Cao (Resiliency & Failover):**
+  - Tích hợp thành công cơ chế **Seeding Retry** (thử lại 3 lần kèm 100ms backoff) tại Bootstrap Node để khắc phục triệt để lỗi nghẽn luồng P2P (Yamux stream reset `0x1002`) dưới tải trọng cao.
+  - Kiểm chứng thành công bài test tắt store node custody (`store-0-1`), buộc Light Node phải query qua các store node non-custody đã bị prune, kích hoạt gom mảnh P2P động và khôi phục cell thành công.
+- **Tối ưu hóa đường truyền Publisher → Bootstrap:**
+  - Lọc và loại bỏ các bootstrap node offline khỏi danh sách phân phối. Publisher chỉ truyền các cột dữ liệu EDS tương ứng với dải cột mà Bootstrap Node đó thực sự quản lý, giảm thiểu hoàn toàn thời gian nghẽn kết nối (connection timeout).
+- **Kiểm thử khả năng mở rộng ma trận ($K$):**
+  - Nâng cấp thành công ma trận kiểm thử cột lên $K=32$ ($K_{\text{piece}}=8$) bằng cách tối ưu hóa truyền tải payload qua tệp JSON tạm thời (`cda_payload.json` trong workspace), tránh giới hạn shell command line.
 
 ### Ưu Tiên Cải Thiện Để Deploy Thực Tế
 
@@ -459,4 +463,53 @@ Light Node hoạt động hoàn toàn không lưu trạng thái đăng ký (Stat
 3. **Scale light node fleet** — Statistical security của DAS phụ thuộc vào số lượng light node độc lập sampling; cần tối thiểu hàng chục node   
 4. **NAT traversal** — libp2p AutoNAT + Circuit Relay để nodes hoạt động sau firewall/NAT
 5. **DNS seed / genesis bootstrap list** — Cho phép tự động hóa quá trình cấu hình bootstrap khi node mới gia nhập mạng
+
+---
+
+## 9. Ánh Xạ Hành Vi Với Mã Nguồn Thực Tế
+
+Dưới đây là bảng ánh xạ chi tiết các hành vi của từng loại Node được mô tả trong tài liệu kỹ thuật này với các đường dẫn cụ thể đến file chương trình nguồn và các hàm xử lý tương ứng:
+
+### A. Publisher Node
+
+| Mô tả hành vi trong tài liệu | File mã nguồn thực thi | Hàm/Phương thức cụ thể |
+| :--- | :--- | :--- |
+| **Pipeline xử lý ODS:** Decode dữ liệu thô sang phần tử trường BLS12-381, thực hiện mã hóa 2D Reed-Solomon, tính toán Piece commitments (KZG) và Merkle proof root. | [pipeline.go](file:///home/ubuntu/cda-network/cda-publisher-node/internal/engine/pipeline.go) | [ProcessODS](file:///home/ubuntu/cda-network/cda-publisher-node/internal/engine/pipeline.go#L36) |
+| **Giao thức P2P:** Phân phối các cột của ma trận EDS tới các Bootstrap Node chịu trách nhiệm tương ứng qua stream `/cda/publisher/push-chunk/1.0.0`. | [sender.go](file:///home/ubuntu/cda-network/cda-publisher-node/internal/p2p/sender.go) | [SendColumnChunk](file:///home/ubuntu/cda-network/cda-publisher-node/internal/p2p/sender.go#L35) |
+| **API Endpoint:** Tiếp nhận yêu cầu xuất bản block, chạy pipeline và broadcast block header qua GossipSub topic `/cda/1.0.0/header`. | [api.go](file:///home/ubuntu/cda-network/cda-publisher-node/internal/service/api.go) | [handlePublish](file:///home/ubuntu/cda-network/cda-publisher-node/internal/service/api.go#L97) |
+| **HTTP Serve Fallback:** Cung cấp HTTP endpoint `GET /header/{blockID}` để các Light Node truy vấn cấu trúc header khi cần thiết. | [api.go](file:///home/ubuntu/cda-network/cda-publisher-node/internal/service/api.go) | [handleGetHeader](file:///home/ubuntu/cda-network/cda-publisher-node/internal/service/api.go#L221) |
+
+### B. Bootstrap Node
+
+| Mô tả hành vi trong tài liệu | File mã nguồn thực thi | Hàm/Phương thức cụ thể |
+| :--- | :--- | :--- |
+| **Tiếp nhận cột:** Nhận luồng dữ liệu cột từ Publisher Node qua stream `/cda/publisher/push-chunk/1.0.0` và kích hoạt quá trình xác thực động. | [receiver.go](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/p2p/receiver.go) | [handleReceiveColumn](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/p2p/receiver.go#L177) |
+| **Xác thực 3 lớp (L1 & L2):** Xác thực Merkle proof của từng mảnh cam kết và cam kết cột kết hợp với Header nhận được. | [publisher_verify.go](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/verifier/publisher_verify.go) | [VerifyPublisherData](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/verifier/publisher_verify.go#L22) |
+| **Gossip Anchor (L3):** Phát tán các cam kết mảnh (anchor payload) của cột lên GossipSub topic `/cda/1.0.0/col/{colIdx}`. | [broadcaster.go](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/p2p/broadcaster.go) | [BroadcastAnchor](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/p2p/broadcaster.go#L41) |
+| **Sinh KZG Opening Proofs (Async):** Tạo ra các bằng chứng mở rộng KZG cho từng ô của hàng (chạy bất đồng bộ trong Phase 2). | [proof_generator.go](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/engine/proof_generator.go) | [GenerateColumnProofs](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/engine/proof_generator.go#L26) |
+| **RLNC Coding (Async):** Phân mảnh hàng và sinh ra các mảnh mã hóa RLNC thô cùng với các mảnh backup. | [rlnc_encoder.go](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/engine/rlnc_encoder.go) | [EncodeRowNSeeds](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/engine/rlnc_encoder.go#L51) |
+| **Seed Mảnh to Store Nodes:** Unicast trực tiếp các mảnh thô tới Store Node chính/dự phòng thông qua stream `/cda/bootstrap/seed-cell/1.0.0` (có kèm vòng lặp thử lại 3 lần). | [broadcaster.go](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/p2p/broadcaster.go) | [BroadcastPiece](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/p2p/broadcaster.go#L87) |
+| **Dynamic Registry & Routing:** Quản lý bảng đăng ký Store Node động, duy trì TTL 15s và xử lý các sự kiện rời mạng chủ động `IsLeave: true`. | [receiver.go](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/p2p/receiver.go) | [handleRouting](file:///home/ubuntu/cda-network/cda-bootstrap-node/internal/p2p/receiver.go#L302) |
+
+### C. Store Node
+
+| Mô tả hành vi trong tài liệu | File mã nguồn thực thi | Hàm/Phương thức cụ thể |
+| :--- | :--- | :--- |
+| **Tiếp nhận & Xác thực Piece:** Nhận mảnh thô từ Bootstrap Node, xác thực KZG proof cục bộ đối với cam kết cột nhận được. | [receiver.go](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/receiver.go) | [handleSeedStream](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/receiver.go#L252) & [processPiece](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/receiver.go#L272) |
+| **Lưu trữ dữ liệu thô & Recoded:** Ghi các mảnh thô xuống cơ sở dữ liệu BadgerDB dưới tiền tố `received_` và mảnh recode dưới tiền tố `recoded_`. | [custody.go](file:///home/ubuntu/cda-network/cda-store-node/internal/storage/custody.go) | [StorePiece](file:///home/ubuntu/cda-network/cda-store-node/internal/storage/custody.go#L93) & [StoreRecodedPiece](file:///home/ubuntu/cda-network/cda-store-node/internal/storage/custody.go#L136) |
+| **Active Pull (Peer Recovery):** Tự động truy vấn các node cùng subnet cột để kéo đủ mảnh khi phát hiện số lượng mảnh nhỏ hơn `K_PIECE` trong quá trình coding. | [receiver.go](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/receiver.go) | [pullMissingPiecesFromPeers](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/receiver.go#L416) |
+| **Gossip Mảnh Recode:** Broadcast mảnh recode lên GossipSub topic `/cda/1.0.0/col/{colIdx}` để các node lân cận trong cột cùng nhận diện. | [broadcaster.go](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/broadcaster.go) | [BroadcastRecodedPiece](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/broadcaster.go#L63) |
+| **Rate Limiting:** Sử dụng thuật toán Token Bucket để giới hạn tần suất yêu cầu P2P từ các Store Node khác, tránh spam active pull. | [receiver.go](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/receiver.go) | [allowRequest](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/receiver.go#L785) |
+| **Pruning (Dọn dẹp):** Định kỳ quét cơ sở dữ liệu, xóa các mảnh thô (prune `received_` keys) đối với các cell non-custody đã lưu trữ mảnh recode thành công. | [receiver.go](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/receiver.go) | [startPruner](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/receiver.go#L831) & [PruneRawPieces](file:///home/ubuntu/cda-network/cda-store-node/internal/storage/custody.go#L267) |
+| **P2P Query Handler (Fetch):** Lắng nghe các truy vấn lấy mảnh từ Light Node hoặc từ các Store Node khác, thực hiện thu thập và gom mảnh in-memory. | [receiver.go](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/receiver.go) | [handleFetchStream](file:///home/ubuntu/cda-network/cda-store-node/internal/p2p/receiver.go#L550) |
+
+### D. Light Node
+
+| Mô tả hành vi trong tài liệu | File mã nguồn thực thi | Hàm/Phương thức cụ thể |
+| :--- | :--- | :--- |
+| **DAS Sampling Entrypoint:** Nhận request HTTP mẫu từ client, quản lý cache Block Header và điều hướng DAS. | [api.go](file:///home/ubuntu/cda-network/cda-light-node/internal/service/api.go) | [handleDASSample](file:///home/ubuntu/cda-network/cda-light-node/internal/service/api.go#L107) |
+| **Dynamic Routing Info:** Truy vấn động các Bootstrap Node để xác định danh sách các Store Node đang hoạt động trong column subnet tương ứng. | [api.go](file:///home/ubuntu/cda-network/cda-light-node/internal/service/api.go) | [getRoutingInfo](file:///home/ubuntu/cda-network/cda-light-node/internal/service/api.go#L226) |
+| **DAS Sampling (Fetch & Fallback Loop):** Shuffled danh sách các store node, thiết lập vòng lặp kết nối P2P lấy mảnh `/cda/store/get-cell-pieces/1.0.0` với timeout 8s, tự động chuyển sang node backup nếu node chính bị sập hoặc trả lỗi logic. | [api.go](file:///home/ubuntu/cda-network/cda-light-node/internal/service/api.go) | [sampleCell](file:///home/ubuntu/cda-network/cda-light-node/internal/service/api.go#L365) |
+| **Tái cấu trúc & Xác thực cục bộ (KZG):** Tải ma trận hệ số, giải nghịch đảo ma trận để phục hồi ô dữ liệu gốc và xác thực KZG opening proof cục bộ. | [das_verifier.go](file:///home/ubuntu/cda-network/cda-light-node/internal/verifier/das_verifier.go) | [VerifyReconstructedCell](file:///home/ubuntu/cda-network/cda-light-node/internal/verifier/das_verifier.go#L156) |
+
 
