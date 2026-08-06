@@ -12,6 +12,8 @@ type Config struct {
 	PublisherAddr string `json:"publisher_addr"`
 	K             int    `json:"k"`
 	KPiece        int    `json:"k_piece"`
+	PruneEnable   bool   `json:"prune_enable"`
+	PruneTTL      string `json:"prune_ttl"`
 }
 
 func DefaultConfig() *Config {
@@ -22,6 +24,8 @@ func DefaultConfig() *Config {
 		PublisherAddr: "http://localhost:8080",
 		K:             4,
 		KPiece:        4,
+		PruneEnable:   false,
+		PruneTTL:      "5m",
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -19,6 +20,8 @@ type Config struct {
 	Peers         []string
 	MyAddr        string
 	CrashOnFail   bool
+	PruneEnable   bool
+	PruneTTL      time.Duration
 }
 
 func LoadConfig() (*Config, error) {
@@ -34,6 +37,8 @@ func LoadConfig() (*Config, error) {
 	peersStr := flag.String("peers", "", "Comma-separated list of peer Store Node URLs")
 	myAddrFlag := flag.String("myaddr", "", "My own accessible address URL (e.g. http://localhost:8082 or http://store-1:8080)")
 	crashOnFail := flag.Bool("crash-on-fail", false, "Crash the node if verification fails")
+	pruneEnable := flag.Bool("prune-enable", false, "Enable pruning of non-custody raw pieces")
+	pruneTTLStr := flag.String("prune-ttl", "5m", "TTL duration before pruning non-custody cells")
 
 	flag.Parse()
 
@@ -62,6 +67,11 @@ func LoadConfig() (*Config, error) {
 		kPieceVal = *k
 	}
 
+	pruneTTL, err := time.ParseDuration(*pruneTTLStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid prune-ttl: %w", err)
+	}
+
 	return &Config{
 		Port:          *port,
 		RowIdx:        *rowIdx,
@@ -75,5 +85,7 @@ func LoadConfig() (*Config, error) {
 		Peers:         peers,
 		MyAddr:        myAddr,
 		CrashOnFail:   *crashOnFail,
+		PruneEnable:   *pruneEnable,
+		PruneTTL:      pruneTTL,
 	}, nil
 }

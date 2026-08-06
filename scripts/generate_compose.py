@@ -3,7 +3,9 @@ import argparse
 import json
 import os
 
-def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=False):
+def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=False, active_cols=None, prune_enable=False, prune_ttl=None):
+    if active_cols is None:
+        active_cols = cols
     crash_arg = ["-crash-on-fail=true"] if crash_on_fail else []
     compose = {
         'services': {},
@@ -35,7 +37,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
     cols_per_net_col = n // cols if cols > 0 else 1
 
     # Columns
-    for c in range(cols):
+    for c in range(active_cols):
         col_id = c * cols_per_net_col
         bootstrap_port = 9200 + c
         bootstrap_p2p_port = bootstrap_port + 10000
@@ -52,7 +54,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                 "-col", str(col_id),
                 "-publisher", "http://publisher:8080",
                 "-k-piece", str(k_piece)
-            ] + crash_arg,
+            ] + crash_arg + (["-prune-enable=true"] if prune_enable else []) + (["-prune-ttl", prune_ttl] if prune_ttl else []),
             'ports': [f"{bootstrap_port}:{bootstrap_port}", f"{bootstrap_p2p_port}:{bootstrap_p2p_port}"],
             'networks': ['cda-net'],
             'depends_on': ['publisher']
@@ -82,7 +84,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                     "-num-cols", str(cols),
                     "-stores-per-col", str(stores_per_col),
                     "-myaddr", f"http://{store_name}:8080"
-                ] + crash_arg,
+                ] + crash_arg + (["-prune-enable=true"] if prune_enable else []) + (["-prune-ttl", prune_ttl] if prune_ttl else []),
                 'ports': [f"{current_store_host_port}:8080", f"{current_store_host_port + 10000}:18080"],
                 'networks': ['cda-net'],
                 'depends_on': [bootstrap_name]
@@ -136,7 +138,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
 
     return compose, store_ports
 
-def generate_prometheus_config(cols, stores_per_col, lights):
+def generate_prometheus_config(active_cols, stores_per_col, lights):
     os.makedirs('data', exist_ok=True)
     prometheus_yml = """global:
   scrape_interval: 2s
@@ -150,7 +152,7 @@ scrape_configs:
     static_configs:
       - targets:
 """
-    for c in range(cols):
+    for c in range(active_cols):
         prometheus_yml += f"          - 'bootstrap-{c}:{9200+c}'\n"
 
     prometheus_yml += """
@@ -158,7 +160,7 @@ scrape_configs:
     static_configs:
       - targets:
 """
-    for c in range(cols):
+    for c in range(active_cols):
         for s in range(1, stores_per_col + 1):
             prometheus_yml += f"          - 'store-{c}-{s}:8080'\n"
 
@@ -395,9 +397,11 @@ providers:
         json.dump(dashboard_json, f, indent=2)
     print("Generated Grafana provisioning configuration successfully.")
 
-def generate_publisher_config(k, k_piece, cols, cols_per_net_col):
+def generate_publisher_config(k, k_piece, cols, cols_per_net_col, active_cols=None):
+    if active_cols is None:
+        active_cols = cols
     peers = {}
-    for c in range(cols):
+    for c in range(active_cols):
         col_id = c * cols_per_net_col
         bootstrap_p2p_port = 9200 + c + 10000
         for data_col in range(col_id, col_id + cols_per_net_col):
@@ -418,21 +422,25 @@ if __name__ == '__main__':
     parser.add_argument('--k', type=int, default=16, help='K parameter for erasure coding (matrix size)')
     parser.add_argument('--k-piece', type=int, default=4, help='KPiece parameter for RLNC/KZG')
     parser.add_argument('--cols', type=int, default=8, help='Number of columns to simulate')
+    parser.add_argument('--active-cols', type=int, default=None, help='Number of active columns to run in Compose')
     parser.add_argument('--stores-per-col', type=int, default=8, help='Number of store nodes per column')
     parser.add_argument('--lights', type=int, default=2, help='Number of light nodes')
     parser.add_argument('--crash-on-fail', action='store_true', help='Enable crash on fail for nodes')
+    parser.add_argument('--prune-enable', action='store_true', help='Enable pruning for store and bootstrap nodes')
+    parser.add_argument('--prune-ttl', type=str, default=None, help='TTL duration before pruning (e.g. 5m)')
     parser.add_argument('--out', type=str, default='docker-compose.json', help='Output file')
     
     args = parser.parse_args()
 
-    compose_dict, store_ports = generate_compose(args.k, args.k_piece, args.cols, args.stores_per_col, args.lights, args.crash_on_fail)
+    active_cols = args.active_cols if args.active_cols is not None else args.cols
+    compose_dict, store_ports = generate_compose(args.k, args.k_piece, args.cols, args.stores_per_col, args.lights, args.crash_on_fail, active_cols, args.prune_enable, args.prune_ttl)
     
     n = 2 * args.k
     cols_per_net_col = n // args.cols if args.cols > 0 else 1
     
-    generate_prometheus_config(args.cols, args.stores_per_col, args.lights)
+    generate_prometheus_config(active_cols, args.stores_per_col, args.lights)
     generate_grafana_provisioning()
-    generate_publisher_config(args.k, args.k_piece, args.cols, cols_per_net_col)
+    generate_publisher_config(args.k, args.k_piece, args.cols, cols_per_net_col, active_cols)
     
     with open(args.out, 'w') as f:
         json.dump(compose_dict, f, indent=2)

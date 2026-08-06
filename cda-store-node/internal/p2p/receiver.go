@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,6 +54,12 @@ type Receiver struct {
 	totalStoredPieces   int64
 	totalStoredPiecesMu sync.Mutex
 	cellMu              sync.Mutex
+
+	// Pruning configurations and state
+	pruneEnable      bool
+	pruneTTL         time.Duration
+	pruneMu          sync.Mutex
+	cellLastActivity map[string]time.Time
 }
 
 func NewReceiver(
@@ -69,6 +76,8 @@ func NewReceiver(
 	cache *storage.CustodyStore,
 	broadcaster *Broadcaster,
 	crashOnFail bool,
+	pruneEnable bool,
+	pruneTTL time.Duration,
 ) *Receiver {
 	return &Receiver{
 		host:              h,
@@ -87,6 +96,9 @@ func NewReceiver(
 		crashOnFail:       crashOnFail,
 		rateLimiters:      make(map[peer.ID]*tokenBucket),
 		totalStoredPieces: int64(cache.GetTotalPieceCount()),
+		pruneEnable:       pruneEnable,
+		pruneTTL:          pruneTTL,
+		cellLastActivity:  make(map[string]time.Time),
 	}
 }
 
@@ -114,6 +126,10 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	rcv.host.SetStreamHandler(p2pcommon.ProtoBootstrapSeed, rcv.handleSeedStream)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreFetch, rcv.handleFetchStream)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreGetPieces, rcv.handleFetchStream)
+
+	if rcv.pruneEnable {
+		go rcv.startPruner(ctx)
+	}
 
 	// 2. Subscribe to Column GossipSub topics
 	n := 2 * rcv.kBlock
@@ -353,6 +369,13 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 	LinearIndependentPiecesCount.Set(float64(currCount))
 	log.Printf("[P2P] Received piece for cell [%d, %d]. Linear independence check: independent. Stored piece (local rank increased to %d/%d).", row, col, len(existingPieces)+1, rcv.kPiece)
 
+	if rcv.pruneEnable {
+		rcv.pruneMu.Lock()
+		key := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+		rcv.cellLastActivity[key] = time.Now()
+		rcv.pruneMu.Unlock()
+	}
+
 	// 6. P2P Recoding & GossipSub forwarding
 	updatedPieces := rcv.cache.GetPieces(blockID, row, col)
 	rcv.cellMu.Unlock()
@@ -366,6 +389,13 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 			rcv.cellMu.Lock()
 			rcv.cache.StoreRecodedPiece(blockID, row, col, *recodedPiece)
 			rcv.cellMu.Unlock()
+
+			if rcv.pruneEnable {
+				rcv.pruneMu.Lock()
+				key := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+				rcv.cellLastActivity[key] = time.Now()
+				rcv.pruneMu.Unlock()
+			}
 			log.Printf("[GossipSub] Recoding success for cell [%d, %d]. Gossiping recoded piece with coeffs %x to column neighbor peers...", row, col, recodedPiece.Data.Coeffs)
 			if err := rcv.broadcaster.BroadcastRecodedPiece(blockID, row, col, recodedPiece, pieceCommits); err != nil {
 				log.Printf("[GossipSub] Failed to gossip recoded piece for cell [%d, %d]: %v", row, col, err)
@@ -492,6 +522,29 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 			break
 		}
 	}
+
+	if len(allPieces) >= rcv.kPiece {
+		pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
+		recodedPiece, err := rcv.rm.RecodePieces(allPieces)
+		if err == nil {
+			rcv.cellMu.Lock()
+			rcv.cache.StoreRecodedPiece(blockID, row, col, *recodedPiece)
+			rcv.cellMu.Unlock()
+			log.Printf("[StoreNode] Successfully recoded cell [%d, %d] in active pull.", row, col)
+
+			// Try to gossip it
+			isCustody := (row % rcv.storesPerCol) == rcv.rowIdx
+			if isCustody {
+				if err := rcv.broadcaster.BroadcastRecodedPiece(blockID, row, col, recodedPiece, pieceCommits); err != nil {
+					log.Printf("[GossipSub] Failed to gossip recoded piece for cell [%d, %d]: %v", row, col, err)
+				} else {
+					log.Printf("[GossipSub] Successfully gossiped recoded piece for cell [%d, %d] to peers.", row, col)
+				}
+			}
+		} else {
+			log.Printf("[StoreNode] Failed to recode cell [%d, %d] in active pull: %v", row, col, err)
+		}
+	}
 }
 
 func (rcv *Receiver) handleFetchStream(stream network.Stream) {
@@ -572,6 +625,7 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 				cancelDial()
 				continue
 			}
+			log.Printf("[StoreNode] Fetch query: requesting pieces for cell [%d, %d] from peer %s...", req.Row, req.Col, pid)
 
 			fetchReq := p2pcommon.StoreFetchRequest{
 				BlockID:     req.BlockID,
@@ -594,6 +648,7 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 			}
 			pStream.Close()
 			cancelDial()
+			log.Printf("[StoreNode] Fetch query: received response from peer %s with %d pieces", pid, len(peerResp.Pieces))
 
 			for _, pPayload := range peerResp.Pieces {
 				decData, err1 := hex.DecodeString(pPayload.Data)
@@ -657,6 +712,7 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 			log.Printf("[StoreNode] Failed to recover cell: %v", err)
 		}
 	}
+	log.Printf("[StoreNode] Fetch query completed for cell [%d, %d]. Total independent pieces gathered: %d/%d (Recovery Success: %v)", req.Row, req.Col, len(allPieces), rcv.kPiece, recovered)
 
 	// Respond back
 	respPieces := make([]p2pcommon.CodedPiece, len(allPieces))
@@ -770,4 +826,52 @@ func (tb *tokenBucket) allow() bool {
 		return true
 	}
 	return false
+}
+
+func (rcv *Receiver) startPruner(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			rcv.pruneMu.Lock()
+			now := time.Now()
+			var toPrune []string
+			for key, lastSeen := range rcv.cellLastActivity {
+				if now.Sub(lastSeen) > rcv.pruneTTL {
+					toPrune = append(toPrune, key)
+				}
+			}
+			for _, key := range toPrune {
+				delete(rcv.cellLastActivity, key)
+			}
+			rcv.pruneMu.Unlock()
+
+			// Perform pruning for non-custody cells
+			for _, key := range toPrune {
+				parts := strings.Split(key, "_")
+				if len(parts) >= 3 {
+					blockID := strings.Join(parts[:len(parts)-2], "_")
+					rowStr := parts[len(parts)-2]
+					colStr := parts[len(parts)-1]
+
+					var row, col int
+					_, err1 := fmt.Sscanf(rowStr, "%d", &row)
+					_, err2 := fmt.Sscanf(colStr, "%d", &col)
+					if err1 == nil && err2 == nil {
+						isCustody := (row % rcv.storesPerCol) == rcv.rowIdx
+						if !isCustody {
+							recoded := rcv.cache.GetRecodedPieces(blockID, row, col)
+							if len(recoded) > 0 {
+								log.Printf("[Pruning] Cell [%d, %d] is non-custody and has a recoded piece. Pruning raw pieces from BadgerDB...", row, col)
+								rcv.cache.PruneRawPieces(blockID, row, col)
+							}
+						}
+					}
+				}
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }

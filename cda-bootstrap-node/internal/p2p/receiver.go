@@ -40,6 +40,9 @@ type Receiver struct {
 	peersMu      sync.RWMutex
 	activePeers  map[peer.ID]p2pcommon.PeerInfo
 	lastSeenPeer map[peer.ID]time.Time
+
+	pruneEnable bool
+	pruneTTL    time.Duration
 }
 
 func NewReceiver(
@@ -53,6 +56,8 @@ func NewReceiver(
 	broadcaster *Broadcaster,
 	crashOnFail bool,
 	colID int,
+	pruneEnable bool,
+	pruneTTL time.Duration,
 ) *Receiver {
 	rcv := &Receiver{
 		host:          h,
@@ -66,6 +71,8 @@ func NewReceiver(
 		crashOnFail:   crashOnFail,
 		activePeers:   make(map[peer.ID]p2pcommon.PeerInfo),
 		lastSeenPeer:  make(map[peer.ID]time.Time),
+		pruneEnable:   pruneEnable,
+		pruneTTL:      pruneTTL,
 	}
 	// Connect broadcaster back to registry
 	broadcaster.SetRegistry(rcv)
@@ -150,6 +157,21 @@ func (rcv *Receiver) Start(ctx context.Context) {
 			}
 		}
 	}()
+
+	// Periodically prune local cache (if enabled)
+	if rcv.pruneEnable {
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			for {
+				select {
+				case <-ticker.C:
+					rcv.cache.Prune(rcv.pruneTTL)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 }
 
 func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
@@ -251,6 +273,8 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 		// We generate 2 * rcv.k seeds per row (k for the primary store node, and k for 1 backup store node)
 		totalSeeds := 2 * rcv.k
 
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 16) // Limit concurrent broadcasts to 16 to avoid overloading libp2p
 		for row := 0; row < n; row++ {
 			codedPieces, err := rcv.encoder.EncodeRowNSeeds(row, colIdx, columnData, proofs[row], totalSeeds)
 			if err != nil {
@@ -258,14 +282,19 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 				return
 			}
 
-			// Unicast each pair of coded pieces to its assigned Store Node
 			for pieceIdx, piece := range codedPieces {
-				if err := rcv.broadcaster.BroadcastPiece(payload.BlockID, row, colIdx, pieceIdx, piece, pieceCommits); err != nil {
-					log.Printf("Failed to broadcast piece %d to Store Node for cell [%d, %d]: %v", pieceIdx, row, colIdx, err)
-					return
-				}
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(r, pIdx int, p *cda.ReceivedPiece) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					if err := rcv.broadcaster.BroadcastPiece(payload.BlockID, r, colIdx, pIdx, p, pieceCommits); err != nil {
+						log.Printf("Failed to broadcast piece %d to Store Node for cell [%d, %d]: %v", pIdx, r, colIdx, err)
+					}
+				}(row, pieceIdx, piece)
 			}
 		}
+		wg.Wait()
 		log.Printf("Async Phase 2 finished successfully: seeded %d pieces total (%d per store node) for Column %d", totalSeeds, rcv.k, colIdx)
 	}()
 }

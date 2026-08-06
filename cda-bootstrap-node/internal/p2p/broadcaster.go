@@ -128,44 +128,64 @@ func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, pieceIdx int,
 			b.host.Peerstore().AddAddr(pid, maddr, peerstoreAddressTTL())
 		}
 
-		ctxDial, cancelDial := context.WithTimeout(context.Background(), 5*time.Second)
-		err = b.host.Connect(ctxDial, peer.AddrInfo{ID: pid})
-		if err != nil {
-			log.Printf("[P2P Seeder] Failed to connect to store node %s: %v", pid, err)
+		// Retry up to 3 times in case of transient stream resets or dial failures
+		success := false
+		var lastErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			ctxDial, cancelDial := context.WithTimeout(context.Background(), 5*time.Second)
+			err = b.host.Connect(ctxDial, peer.AddrInfo{ID: pid})
+			if err != nil {
+				lastErr = err
+				cancelDial()
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			streamCtx, streamCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			stream, err := b.host.NewStream(streamCtx, pid, p2pcommon.ProtoBootstrapSeed)
 			cancelDial()
-			continue
-		}
+			if err != nil {
+				lastErr = err
+				streamCancel()
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 
-		streamCtx, streamCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		stream, err := b.host.NewStream(streamCtx, pid, p2pcommon.ProtoBootstrapSeed)
-		cancelDial()
-		if err != nil {
-			log.Printf("[P2P Seeder] Failed to open stream to store node %s: %v", pid, err)
-			streamCancel()
-			continue
-		}
+			if err := json.NewEncoder(stream).Encode(payload); err != nil {
+				lastErr = err
+				stream.Close()
+				streamCancel()
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 
-		if err := json.NewEncoder(stream).Encode(payload); err != nil {
-			log.Printf("[P2P Seeder] Failed to send piece to %s: %v", pid, err)
+			var ack struct {
+				Success bool   `json:"success"`
+				Error   string `json:"error,omitempty"`
+			}
+			if err := json.NewDecoder(stream).Decode(&ack); err != nil {
+				lastErr = err
+				stream.Close()
+				streamCancel()
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 			stream.Close()
 			streamCancel()
-			continue
+
+			if !ack.Success {
+				lastErr = fmt.Errorf("store node failed to verify: %s", ack.Error)
+				break // Validation failure is a hard error, do not retry
+			}
+
+			log.Printf("[P2P Seeder] Successfully seeded piece for cell [%d, %d] to Store Node %s (attempt %d)", row, col, pid, attempt)
+			success = true
+			break
 		}
 
-		// Read response
-		var ack struct {
-			Success bool   `json:"success"`
-			Error   string `json:"error,omitempty"`
+		if !success {
+			log.Printf("[P2P Seeder] Failed to seed piece for cell [%d, %d] to Store Node %s after 3 attempts: %v", row, col, pid, lastErr)
 		}
-		if err := json.NewDecoder(stream).Decode(&ack); err != nil {
-			log.Printf("[P2P Seeder] Failed to read ACK from %s: %v", pid, err)
-		} else if !ack.Success {
-			log.Printf("[P2P Seeder] Store node %s failed to verify piece: %s", pid, ack.Error)
-		} else {
-			log.Printf("[P2P Seeder] Successfully seeded piece for cell [%d, %d] to Store Node %s", row, col, pid)
-		}
-		stream.Close()
-		streamCancel()
 	}
 
 	return nil

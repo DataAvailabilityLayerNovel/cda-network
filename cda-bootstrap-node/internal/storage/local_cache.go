@@ -2,6 +2,7 @@ package storage
 
 import (
 	"sync"
+	"time"
 )
 
 type CachedColumn struct {
@@ -10,6 +11,7 @@ type CachedColumn struct {
 	ColumnData   [][]byte
 	PieceCommits [][]byte
 	Proofs       [][][]byte // row -> pieceIdx -> proof bytes
+	CreatedAt    time.Time
 }
 
 type LocalCache struct {
@@ -32,6 +34,7 @@ func (c *LocalCache) Store(blockID string, colIdx int, colData [][]byte, pieceCo
 		ColIdx:       colIdx,
 		ColumnData:   colData,
 		PieceCommits: pieceCommits,
+		CreatedAt:    time.Now(),
 	}
 }
 
@@ -50,4 +53,15 @@ func (c *LocalCache) Get(blockID string) (*CachedColumn, bool) {
 
 	entry, exists := c.cached[blockID]
 	return entry, exists
+}
+
+func (c *LocalCache) Prune(olderThan time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	for blockID, entry := range c.cached {
+		if now.Sub(entry.CreatedAt) > olderThan {
+			delete(c.cached, blockID)
+		}
+	}
 }

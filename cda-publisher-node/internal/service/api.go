@@ -209,9 +209,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		colProofs := proofs[c*k : c*k+k]
 
 		if err := s.sender.SendColumnChunk(header.BlockID, c, colData, pieceCommitsBytes, colProofs); err != nil {
-			log.Printf("Failed to distribute column %d to bootstrap: %v", c, err)
-			http.Error(w, fmt.Sprintf("P2P distribution failed for column %d: %v", c, err), http.StatusInternalServerError)
-			return
+			log.Printf("[Publisher] Warning: Failed to distribute column %d to bootstrap (likely offline): %v", c, err)
 		}
 	}
 

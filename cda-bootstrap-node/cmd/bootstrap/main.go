@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"cda-bootstrap-node/config"
 	"cda-bootstrap-node/internal/engine"
@@ -33,6 +34,8 @@ func main() {
 	kVal := flag.Int("k", 0, "override K chunks parameter")
 	kPieceVal := flag.Int("k-piece", 0, "override K-piece parameter")
 	crashOnFail := flag.Bool("crash-on-fail", false, "Crash the node if verification fails")
+	pruneEnable := flag.Bool("prune-enable", false, "Enable pruning of local cache")
+	pruneTTL := flag.String("prune-ttl", "", "TTL duration before pruning local cache")
 	flag.Parse()
 
 	var cfg *config.Config
@@ -69,6 +72,17 @@ func main() {
 	if cfg.KPiece == 0 {
 		cfg.KPiece = cfg.K
 	}
+	
+	// Apply CLI prune overrides if specified
+	// We check if flag was explicitly provided
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "prune-enable" {
+			cfg.PruneEnable = *pruneEnable
+		}
+		if f.Name == "prune-ttl" {
+			cfg.PruneTTL = *pruneTTL
+		}
+	})
 
 	log.Printf("Starting Bootstrap Node for ColumnID=%d, APIPort=%d, K=%d, KPiece=%d", cfg.ColumnID, cfg.APIPort, cfg.K, cfg.KPiece)
 
@@ -112,7 +126,11 @@ func main() {
 
 	// 6. Initialize P2P subcomponents
 	broadcaster := p2p.NewBroadcaster(p2pHost, ps)
-	receiver := p2p.NewReceiver(p2pHost, kzg, cfg.PublisherAddr, cfg.KPiece, cache, proofGen, encoder, broadcaster, *crashOnFail, cfg.ColumnID)
+	parsedTTL, errTTL := time.ParseDuration(cfg.PruneTTL)
+	if errTTL != nil {
+		parsedTTL = 5 * time.Minute
+	}
+	receiver := p2p.NewReceiver(p2pHost, kzg, cfg.PublisherAddr, cfg.KPiece, cache, proofGen, encoder, broadcaster, *crashOnFail, cfg.ColumnID, cfg.PruneEnable, parsedTTL)
 
 	// Subscribe to TopicHeader so this bootstrap node acts as a GossipSub relay
 	// for block headers between the publisher and light/store nodes.

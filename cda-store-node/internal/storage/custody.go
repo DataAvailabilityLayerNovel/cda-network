@@ -264,3 +264,13 @@ func (s *CustodyStore) IsComplete(blockID string, colIdx, k int) bool {
 	return complete
 }
 
+func (s *CustodyStore) PruneRawPieces(blockID string, row, col int) {
+	if s.db == nil {
+		return
+	}
+	key := []byte(fmt.Sprintf("received_%s_%d_%d", blockID, row, col))
+	_ = s.db.Update(func(txn *badger.Txn) error {
+		return txn.Delete(key)
+	})
+}
+
