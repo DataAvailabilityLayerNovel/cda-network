@@ -16,18 +16,23 @@ type AnchoredData struct {
 }
 
 type CustodyStore struct {
-	db *badger.DB
+	db   *badger.DB
+	port int
 }
 
 func NewCustodyStore(port int) *CustodyStore {
-	store := &CustodyStore{}
+	store := &CustodyStore{port: port}
 
 	if port > 0 {
 		baseDir := fmt.Sprintf("data/store_%d", port)
 		dbPath := filepath.Join(baseDir, "badger")
 		_ = os.MkdirAll(dbPath, 0755)
 
-		opts := badger.DefaultOptions(dbPath).WithLogger(nil) // Suppress noisy logs
+		opts := badger.DefaultOptions(dbPath).
+			WithLogger(nil).
+			WithValueLogFileSize(12 * 1024 * 1024). // 12 MB value log file size
+			WithMemTableSize(8 * 1024 * 1024).     // 8 MB memtable size
+			WithValueThreshold(256)                 // values larger than 256 bytes go to vlog
 		db, err := badger.Open(opts)
 		if err != nil {
 			panic(fmt.Sprintf("failed to open badger db: %v", err))
@@ -36,6 +41,10 @@ func NewCustodyStore(port int) *CustodyStore {
 	}
 
 	return store
+}
+
+func (s *CustodyStore) Port() int {
+	return s.port
 }
 
 func (s *CustodyStore) Close() error {
@@ -264,13 +273,57 @@ func (s *CustodyStore) IsComplete(blockID string, colIdx, k int) bool {
 	return complete
 }
 
-func (s *CustodyStore) PruneRawPieces(blockID string, row, col int) {
+func (s *CustodyStore) PruneRawPieces(blockID string, row, col int) int {
 	if s.db == nil {
-		return
+		return 0
 	}
+	deletedCount := 0
 	key := []byte(fmt.Sprintf("received_%s_%d_%d", blockID, row, col))
 	_ = s.db.Update(func(txn *badger.Txn) error {
+		item, err := txn.Get(key)
+		if err == nil {
+			_ = item.Value(func(val []byte) error {
+				var pieces []cda.ReceivedPiece
+				if err := json.Unmarshal(val, &pieces); err == nil {
+					deletedCount = len(pieces)
+				}
+				return nil
+			})
+		}
 		return txn.Delete(key)
 	})
+
+	if deletedCount > 0 {
+		go func() {
+			for {
+				err := s.db.RunValueLogGC(0.5)
+				if err != nil {
+					break
+				}
+			}
+		}()
+	}
+
+	return deletedCount
+}
+
+func (s *CustodyStore) GetDBSize() int64 {
+	if s.port <= 0 {
+		return 0
+	}
+	baseDir := fmt.Sprintf("data/store_%d", s.port)
+	dbPath := filepath.Join(baseDir, "badger")
+
+	var size int64
+	_ = filepath.Walk(dbPath, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	return size
 }
 

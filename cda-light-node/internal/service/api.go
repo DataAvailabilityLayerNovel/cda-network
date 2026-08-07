@@ -9,6 +9,8 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +47,11 @@ type APIService struct {
 
 	routingCacheMu sync.RWMutex
 	routingCache   map[int]cachedRoutingInfo
+
+	port int
+
+	waitingHeadersMu sync.Mutex
+	waitingHeaders   map[string]chan struct{}
 }
 
 type BlockHeader struct {
@@ -75,29 +82,42 @@ func NewAPIService(
 	crashOnFail bool,
 	h host.Host,
 	ps *pubsub.PubSub,
+	port int,
+	numCols int,
 ) *APIService {
-	numCols := len(bootstrapsMap)
-	if numCols == 0 {
-		numCols = 1
+	if numCols <= 0 {
+		numCols = 8
 	}
 	return &APIService{
-		publisherAddr: publisherAddr,
-		bootstrapsMap: bootstrapsMap,
-		numCols:       numCols,
-		verifier:      v,
-		crashOnFail:   crashOnFail,
-		host:          h,
-		ps:            ps,
-		headers:       make(map[string]*BlockHeader),
-		routingCache:  make(map[int]cachedRoutingInfo),
+		publisherAddr:  publisherAddr,
+		bootstrapsMap:  bootstrapsMap,
+		numCols:        numCols,
+		verifier:       v,
+		crashOnFail:    crashOnFail,
+		host:           h,
+		ps:             ps,
+		headers:        make(map[string]*BlockHeader),
+		routingCache:   make(map[int]cachedRoutingInfo),
+		port:           port,
+		waitingHeaders: make(map[string]chan struct{}),
 	}
 }
 
 func (s *APIService) CacheHeader(header *BlockHeader) {
 	s.headersMu.Lock()
-	defer s.headersMu.Unlock()
 	s.headers[header.BlockID] = header
-	log.Printf("[P2P Sync] Cached block header for block %s received via GossipSub", header.BlockID)
+	s.headersMu.Unlock()
+
+	height := p2pcommon.ParseHeightFromBlockID(header.BlockID)
+	log.Printf("[Height: %d] [LightNode] Cached block header for block %s", height, header.BlockID)
+
+	// Signal any waiting HTTP handler goroutines
+	s.waitingHeadersMu.Lock()
+	if ch, exists := s.waitingHeaders[header.BlockID]; exists {
+		close(ch)
+		delete(s.waitingHeaders, header.BlockID)
+	}
+	s.waitingHeadersMu.Unlock()
 }
 
 func (s *APIService) RegisterHandlers(mux *http.ServeMux) {
@@ -122,26 +142,67 @@ func (s *APIService) handleDASSample(w http.ResponseWriter, r *http.Request) {
 	s.headersMu.RUnlock()
 
 	if !exists {
-		log.Printf("[LightNode] Header not found in local P2P cache for block %s. Fetching via HTTP fallback...", blockID)
+		height := p2pcommon.ParseHeightFromBlockID(blockID)
+		log.Printf("[Height: %d] [LightNode] Header for %s not in local cache. Fetching from Publisher via HTTP...", height, blockID)
+
 		headerUrl := fmt.Sprintf("%s/header/%s", s.publisherAddr, blockID)
 		resp, err := http.Get(headerUrl)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to fetch block header: %v", err), http.StatusBadGateway)
-			return
+		if err == nil && resp.StatusCode == http.StatusOK {
+			header = &BlockHeader{}
+			if err := json.NewDecoder(resp.Body).Decode(header); err == nil {
+				s.CacheHeader(header)
+				exists = true
+			}
+			resp.Body.Close()
+		} else if resp != nil {
+			resp.Body.Close()
 		}
-		defer resp.Body.Close()
+	}
 
-		if resp.StatusCode == http.StatusNotFound {
-			http.Error(w, "Block Header not found on Publisher", http.StatusNotFound)
-			return
-		}
+	if !exists {
+		height := p2pcommon.ParseHeightFromBlockID(blockID)
+		log.Printf("[Height: %d] [LightNode] Block %s not published yet. Waiting for GossipSub broadcast or Publisher upload...", height, blockID)
 
-		header = &BlockHeader{}
-		if err := json.NewDecoder(resp.Body).Decode(header); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to parse block header: %v", err), http.StatusInternalServerError)
-			return
+		s.waitingHeadersMu.Lock()
+		ch, existsCh := s.waitingHeaders[blockID]
+		if !existsCh {
+			ch = make(chan struct{})
+			s.waitingHeaders[blockID] = ch
 		}
-		s.CacheHeader(header)
+		s.waitingHeadersMu.Unlock()
+
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		timeout := time.After(60 * time.Second)
+		headerUrl := fmt.Sprintf("%s/header/%s", s.publisherAddr, blockID)
+
+		for !exists {
+			select {
+			case <-ch:
+				s.headersMu.RLock()
+				header, exists = s.headers[blockID]
+				s.headersMu.RUnlock()
+			case <-ticker.C:
+				resp, err := http.Get(headerUrl)
+				if err == nil {
+					if resp.StatusCode == http.StatusOK {
+						header = &BlockHeader{}
+						if err := json.NewDecoder(resp.Body).Decode(header); err == nil {
+							s.CacheHeader(header)
+							exists = true
+						}
+					}
+					resp.Body.Close()
+				}
+			case <-r.Context().Done():
+				http.Error(w, "Request context canceled while waiting for header", http.StatusRequestTimeout)
+				return
+			case <-timeout:
+				http.Error(w, "Timeout waiting for block header via GossipSub and HTTP", http.StatusNotFound)
+				return
+			}
+		}
 	}
 
 	// Determine matrix size N
@@ -161,21 +222,33 @@ func (s *APIService) handleDASSample(w http.ResponseWriter, r *http.Request) {
 	var results []SampleResult
 
 	if allStr == "true" {
-		// Sample EVERY single cell in the EDS (N x N) concurrently
-		results = make([]SampleResult, n*n)
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, 16) // limit concurrency to 16 goroutines
+		colsPerNetCol := n / s.numCols
+		if colsPerNetCol == 0 {
+			colsPerNetCol = 1
+		}
+
+		var activeCells [][2]int
 		for rIdx := 0; rIdx < n; rIdx++ {
 			for cIdx := 0; cIdx < n; cIdx++ {
-				wg.Add(1)
-				go func(r, c int) {
-					defer wg.Done()
-					sem <- struct{}{}
-					defer func() { <-sem }()
-					res := s.sampleCell(blockID, r, c, header)
-					results[r*n+c] = res
-				}(rIdx, cIdx)
+				netColIdx := cIdx / colsPerNetCol
+				if _, active := s.bootstrapsMap[netColIdx]; active {
+					activeCells = append(activeCells, [2]int{rIdx, cIdx})
+				}
 			}
+		}
+
+		results = make([]SampleResult, len(activeCells))
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 16) // limit concurrency to 16 goroutines
+		for idx, cell := range activeCells {
+			wg.Add(1)
+			go func(idx int, r, c int) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				res := s.sampleCell(blockID, r, c, header)
+				results[idx] = res
+			}(idx, cell[0], cell[1])
 		}
 		wg.Wait()
 	} else if rowStr != "" && colStr != "" {
@@ -197,9 +270,27 @@ func (s *APIService) handleDASSample(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		colsPerNetCol := n / s.numCols
+		if colsPerNetCol == 0 {
+			colsPerNetCol = 1
+		}
+
+		var activeCols []int
+		for cIdx := 0; cIdx < n; cIdx++ {
+			netColIdx := cIdx / colsPerNetCol
+			if _, active := s.bootstrapsMap[netColIdx]; active {
+				activeCols = append(activeCols, cIdx)
+			}
+		}
+
+		if len(activeCols) == 0 {
+			http.Error(w, "No active columns configured for sampling", http.StatusInternalServerError)
+			return
+		}
+
 		for i := 0; i < numSamples; i++ {
 			row := rand.Intn(n)
-			col := rand.Intn(n)
+			col := activeCols[rand.Intn(len(activeCols))]
 			res := s.sampleCell(blockID, row, col, header)
 			results = append(results, res)
 		}
@@ -415,6 +506,9 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 			continue
 		}
 
+		height := p2pcommon.ParseHeightFromBlockID(blockID)
+		log.Printf("[DAS] [Height: %d] Querying cell [%d, %d] of block %s. Dialing store node %s...", height, row, col, blockID, storePID)
+
 		// Add store multiaddrs to peerstore
 		for _, mStr := range selectedStore.Multiaddrs {
 			m, err := multiaddr.NewMultiaddr(mStr)
@@ -503,6 +597,9 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 			}
 		}
 
+		log.Printf("[DAS] [Height: %d] Received response from store node %s with %d pieces. Independent pieces accumulated: %d/%d",
+			height, storePID, len(combinedResp.Pieces), len(recvPieces), targetK)
+
 		if len(recvPieces) >= targetK {
 			querySuccess = true
 			break
@@ -540,6 +637,23 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 			log.Fatalf("DAS verification failed (CRASH) for cell [%d, %d]: algebraic direct verification failed", row, col)
 		}
 		return SampleResult{Row: row, Col: col, Verified: false, Error: "algebraic direct verification failed"}
+	}
+
+	height := p2pcommon.ParseHeightFromBlockID(blockID)
+	log.Printf("[DAS] [Height: %d] Cell [%d, %d] algebraic verification succeeded! Reconstructed cell data (hex): %x", height, row, col, recoveredCell)
+
+	if s.port > 0 {
+		logDir := fmt.Sprintf("data/light_%d", s.port)
+		_ = os.MkdirAll(logDir, 0755)
+		logPath := filepath.Join(logDir, "das_success.log")
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err == nil {
+			defer f.Close()
+			timestamp := time.Now().Format("2006-01-02 15:04:05")
+			logLine := fmt.Sprintf("[%s] [Height: %d] Block %s, Cell [%d, %d]: DAS sampling verification succeeded. Reconstructed cell: %x\n",
+				timestamp, height, blockID, row, col, recoveredCell)
+			_, _ = f.WriteString(logLine)
+		}
 	}
 
 	return SampleResult{

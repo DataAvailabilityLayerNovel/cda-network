@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	p2pcommon "cda-p2p"
@@ -21,15 +22,18 @@ type Registry interface {
 }
 
 type Broadcaster struct {
-	host host.Host
-	ps   *pubsub.PubSub
-	reg  Registry
+	host   host.Host
+	ps     *pubsub.PubSub
+	reg    Registry
+	mu     sync.Mutex
+	topics map[string]*pubsub.Topic
 }
 
 func NewBroadcaster(h host.Host, ps *pubsub.PubSub) *Broadcaster {
 	return &Broadcaster{
-		host: h,
-		ps:   ps,
+		host:   h,
+		ps:     ps,
+		topics: make(map[string]*pubsub.Topic),
 	}
 }
 
@@ -67,9 +71,22 @@ func (b *Broadcaster) BroadcastAnchor(blockID string, colIdx int, pieceCommits [
 	}
 
 	topicName := p2pcommon.TopicCol(colIdx)
-	topic, err := b.ps.Join(topicName)
-	if err != nil {
-		return fmt.Errorf("failed to join GossipSub topic %s: %w", topicName, err)
+	b.mu.Lock()
+	if b.topics == nil {
+		b.topics = make(map[string]*pubsub.Topic)
+	}
+	topic, ok := b.topics[topicName]
+	var joinErr error
+	if !ok {
+		topic, joinErr = b.ps.Join(topicName)
+		if joinErr == nil {
+			b.topics[topicName] = topic
+		}
+	}
+	b.mu.Unlock()
+
+	if !ok && joinErr != nil {
+		return fmt.Errorf("failed to join GossipSub topic %s: %w", topicName, joinErr)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

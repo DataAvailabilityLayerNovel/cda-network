@@ -86,6 +86,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                     "-myaddr", f"http://{store_name}:8080"
                 ] + crash_arg + (["-prune-enable=true"] if prune_enable else []) + (["-prune-ttl", prune_ttl] if prune_ttl else []),
                 'ports': [f"{current_store_host_port}:8080", f"{current_store_host_port + 10000}:18080"],
+                'volumes': [f"./data/store_{current_store_host_port}:/app/data/store_8080"],
                 'networks': ['cda-net'],
                 'depends_on': [bootstrap_name]
             }
@@ -108,9 +109,11 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                 "-publisher", "http://publisher:8080",
                 "-bootstraps", bootstraps_arg,
                 "-k", str(k),
-                "-k-piece", str(k_piece)
+                "-k-piece", str(k_piece),
+                "-num-cols", str(cols)
             ] + crash_arg,
             'ports': [f"{light_port}:{light_port}", f"{light_port + 10000}:{light_port + 10000}"],
+            'volumes': [f"./data/light_{light_port}:/app/data/light_{light_port}"],
             'networks': ['cda-net'],
             'depends_on': ['publisher']
         }
@@ -334,9 +337,39 @@ providers:
                 ]
             },
             {
-                "type": "bargauge",
-                "title": "Store Node Storage Rank (Stored Custody Pieces)",
+                "type": "graph",
+                "title": "Store Node Stored Pieces over Time (Active pieces count)",
                 "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+                "targets": [
+                    {
+                        "expr": "cda_store_linear_independent_pieces_count",
+                        "legendFormat": "{{instance}}"
+                    }
+                ],
+                "yaxes": [
+                    {"format": "short", "show": True},
+                    {"format": "short", "show": False}
+                ]
+            },
+            {
+                "type": "graph",
+                "title": "Store Node Database Size on Disk (BadgerDB)",
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+                "targets": [
+                    {
+                        "expr": "cda_store_db_size_bytes",
+                        "legendFormat": "{{instance}}"
+                    }
+                ],
+                "yaxes": [
+                    {"format": "bytes", "show": True},
+                    {"format": "short", "show": False}
+                ]
+            },
+            {
+                "type": "bargauge",
+                "title": "Current Stored Pieces Rank",
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
                 "targets": [
                     {
                         "expr": "cda_store_linear_independent_pieces_count",
@@ -357,7 +390,7 @@ providers:
             {
                 "type": "graph",
                 "title": "Store Node Network Rates (P2P Queries & GossipSub Propagation)",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
                 "targets": [
                     {
                         "expr": "sum(cda_store_p2p_request_rate)",
@@ -372,7 +405,7 @@ providers:
             {
                 "type": "graph",
                 "title": "System CPU Usage (%)",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30},
                 "targets": [
                     {
                         "expr": "rate(process_cpu_seconds_total[10s]) * 100",
@@ -383,7 +416,7 @@ providers:
             {
                 "type": "graph",
                 "title": "System Memory Usage (MB)",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 30},
                 "targets": [
                     {
                         "expr": "process_resident_memory_bytes / 1024 / 1024",

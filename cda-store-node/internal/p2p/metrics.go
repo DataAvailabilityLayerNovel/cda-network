@@ -43,6 +43,11 @@ var (
 		Name: "cda_store_linear_independent_pieces_count",
 		Help: "Number of linear independent pieces stored in custody.",
 	})
+
+	DatabaseSizeBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "cda_store_db_size_bytes",
+		Help: "Total size of the BadgerDB directory in bytes.",
+	})
 )
 
 var (
@@ -60,6 +65,7 @@ func init() {
 		GossipSubMessageRateGauge,
 		ByzantineDetectionsTotal,
 		LinearIndependentPiecesCount,
+		DatabaseSizeBytes,
 	)
 }
 

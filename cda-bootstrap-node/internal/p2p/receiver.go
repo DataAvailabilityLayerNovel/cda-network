@@ -184,7 +184,8 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 	}
 
 	colIdx := payload.ColIdx
-	log.Printf("[P2P] Received Push stream for Column %d, Block %s", colIdx, payload.BlockID)
+	height := p2pcommon.ParseHeightFromBlockID(payload.BlockID)
+	log.Printf("[Height: %d] [P2P] Received Push stream for Column %d, Block %s", height, colIdx, payload.BlockID)
 
 	// 1. Decode hex data cells and commitments
 	columnData := make([][]byte, len(payload.ColumnData))
@@ -219,26 +220,26 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 	ok, err := verifier.VerifyPublisherData(rcv.kzg, rcv.publisherAddr, payload.BlockID, colIdx, columnData, pieceCommits, merkleProofs, rcv.k)
 	if err != nil {
 		if rcv.crashOnFail {
-			log.Fatalf("Verifier error for Column %d (CRASH): %v", colIdx, err)
+			log.Fatalf("[Height: %d] Verifier error for Column %d (CRASH): %v", height, colIdx, err)
 		}
-		log.Printf("Verifier error for Column %d: %v", colIdx, err)
+		log.Printf("[Height: %d] Verifier error for Column %d: %v", height, colIdx, err)
 		rcv.respondWithError(stream, "Verification error: "+err.Error())
 		return
 	}
 	if !ok {
 		if rcv.crashOnFail {
-			log.Fatalf("Verifier failed (CRASH): data from publisher for Column %d is not consistent", colIdx)
+			log.Fatalf("[Height: %d] Verifier failed (CRASH): data from publisher for Column %d is not consistent", height, colIdx)
 		}
-		log.Printf("Verifier failed: data from publisher for Column %d is not consistent", colIdx)
+		log.Printf("[Height: %d] Verifier failed: data from publisher for Column %d is not consistent", height, colIdx)
 		rcv.respondWithError(stream, "Data consistency check failed")
 		return
 	}
 
-	log.Printf("[P2P] Verification succeeded for Column %d", colIdx)
+	log.Printf("[Height: %d] [P2P] Verification succeeded for Column %d", height, colIdx)
 
 	// 3. Gossip commitments and Merkle proofs immediately (Fast Path Phase 1)
 	if err := rcv.broadcaster.BroadcastAnchor(payload.BlockID, colIdx, pieceCommits, merkleProofs); err != nil {
-		log.Printf("Failed to broadcast anchor for Column %d: %v", colIdx, err)
+		log.Printf("[Height: %d] Failed to broadcast anchor for Column %d: %v", height, colIdx, err)
 		rcv.respondWithError(stream, "Anchor broadcast failed: "+err.Error())
 		return
 	}
@@ -253,7 +254,7 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 
 	// 5. Phase 2 (Async Heavy Task)
 	go func() {
-		log.Printf("[P2P] Starting Phase 2 Async: computing proofs and seeding RLNC pieces for Column %d", colIdx)
+		log.Printf("[Height: %d] [P2P] Starting Phase 2 Async: computing proofs and seeding RLNC pieces for Column %d", height, colIdx)
 
 		// Generate KZG Opening Proofs for Column
 		start := time.Now()
@@ -261,12 +262,12 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 		duration := time.Since(start).Seconds()
 
 		if err != nil {
-			log.Printf("Async Proof Generator error for Column %d: %v", colIdx, err)
+			log.Printf("[Height: %d] Async Proof Generator error for Column %d: %v", height, colIdx, err)
 			return
 		}
 		KZGProofDuration.Observe(duration)
 		rcv.cache.SetProofs(payload.BlockID, proofs)
-		log.Printf("Successfully generated opening proofs async for Column %d", colIdx)
+		log.Printf("[Height: %d] Successfully generated opening proofs async for Column %d", height, colIdx)
 
 		// Encode RLNC pieces and broadcast 2 seeds to EVERY active Store Node in the column network
 		n := len(columnData)
@@ -278,7 +279,7 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 		for row := 0; row < n; row++ {
 			codedPieces, err := rcv.encoder.EncodeRowNSeeds(row, colIdx, columnData, proofs[row], totalSeeds)
 			if err != nil {
-				log.Printf("Async RLNC encoding error for row %d (col %d): %v", row, colIdx, err)
+				log.Printf("[Height: %d] Async RLNC encoding error for row %d (col %d): %v", height, row, colIdx, err)
 				return
 			}
 
@@ -289,13 +290,13 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 					defer wg.Done()
 					defer func() { <-sem }()
 					if err := rcv.broadcaster.BroadcastPiece(payload.BlockID, r, colIdx, pIdx, p, pieceCommits); err != nil {
-						log.Printf("Failed to broadcast piece %d to Store Node for cell [%d, %d]: %v", pIdx, r, colIdx, err)
+						log.Printf("[Height: %d] Failed to broadcast piece %d to Store Node for cell [%d, %d]: %v", height, pIdx, r, colIdx, err)
 					}
 				}(row, pieceIdx, piece)
 			}
 		}
 		wg.Wait()
-		log.Printf("Async Phase 2 finished successfully: seeded %d pieces total (%d per store node) for Column %d", totalSeeds, rcv.k, colIdx)
+		log.Printf("[Height: %d] Async Phase 2 finished successfully: seeded %d pieces total (%d per store node) for Column %d", height, totalSeeds, rcv.k, colIdx)
 	}()
 }
 

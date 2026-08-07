@@ -65,7 +65,8 @@ func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, p
 		addr = fmt.Sprintf("%s/p2p/%s", addr, bootPID.String())
 	}
 
-	log.Printf("[P2P] Connecting to peer at %s to send Column %d", addr, colIdx)
+	height := p2pcommon.ParseHeightFromBlockID(blockID)
+	log.Printf("[P2P] [Height: %d] Connecting to peer at %s to send Column %d", height, addr, colIdx)
 
 	maddr, err := multiaddr.NewMultiaddr(addr)
 	if err != nil {
@@ -84,7 +85,7 @@ func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, p
 		return fmt.Errorf("failed to connect to bootstrap node %s: %w", info.ID, err)
 	}
 
-	log.Printf("[P2P] Dialing stream %s to %s", p2pcommon.ProtoPublisherPush, info.ID)
+	log.Printf("[P2P] [Height: %d] Dialing stream %s to %s", height, p2pcommon.ProtoPublisherPush, info.ID)
 	stream, err := s.host.NewStream(ctx, info.ID, p2pcommon.ProtoPublisherPush)
 	if err != nil {
 		return fmt.Errorf("failed to open stream: %w", err)
@@ -134,7 +135,7 @@ func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, p
 		return fmt.Errorf("remote peer returned error: %s", response.Error)
 	}
 
-	log.Printf("[P2P] Stream finished successfully for Column %d", colIdx)
+	log.Printf("[P2P] [Height: %d] Stream finished successfully for Column %d", height, colIdx)
 	return nil
 }
 

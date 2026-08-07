@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +62,10 @@ type Receiver struct {
 	pruneTTL         time.Duration
 	pruneMu          sync.Mutex
 	cellLastActivity map[string]time.Time
+
+	// Block completion file logging
+	completedMu     sync.Mutex
+	completedBlocks map[string]bool
 }
 
 func NewReceiver(
@@ -99,6 +105,7 @@ func NewReceiver(
 		pruneEnable:       pruneEnable,
 		pruneTTL:          pruneTTL,
 		cellLastActivity:  make(map[string]time.Time),
+		completedBlocks:   make(map[string]bool),
 	}
 }
 
@@ -121,6 +128,26 @@ func (rcv *Receiver) SetPeers(rowPeers, colPeers []p2pcommon.PeerInfo) {
 func (rcv *Receiver) Start(ctx context.Context) {
 	StartMetricsTicker(ctx)
 	LinearIndependentPiecesCount.Set(float64(rcv.totalStoredPieces))
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				actualPieces := rcv.cache.GetTotalPieceCount()
+				rcv.totalStoredPiecesMu.Lock()
+				rcv.totalStoredPieces = int64(actualPieces)
+				rcv.totalStoredPiecesMu.Unlock()
+				LinearIndependentPiecesCount.Set(float64(actualPieces))
+
+				dbSize := rcv.cache.GetDBSize()
+				DatabaseSizeBytes.Set(float64(dbSize))
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// 1. Set stream handlers
 	rcv.host.SetStreamHandler(p2pcommon.ProtoBootstrapSeed, rcv.handleSeedStream)
@@ -200,7 +227,8 @@ func (rcv *Receiver) processGossipMessage(data []byte) {
 }
 
 func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []string, proofsStr []p2pcommon.SerializedMerkleProof) {
-	log.Printf("[StoreNode] Received Anchor Gossip for Column %d, Block %s", colIdx, blockID)
+	height := p2pcommon.ParseHeightFromBlockID(blockID)
+	log.Printf("[Height: %d] [StoreNode] Received Anchor Gossip for Column %d, Block %s", height, colIdx, blockID)
 
 	// 1. Fetch Block Header from Publisher
 	header, err := verifier.FetchBlockHeader(rcv.publisherAddr, blockID)
@@ -246,7 +274,7 @@ func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []stri
 
 	// 4. Save anchored commitments
 	rcv.cache.AnchorCommitments(blockID, colIdx, pieceCommits)
-	log.Printf("[StoreNode] Successfully anchored commitments for Block %s, Column %d", blockID, colIdx)
+	log.Printf("[Height: %d] [StoreNode] Successfully anchored commitments for Block %s, Column %d", height, blockID, colIdx)
 }
 
 func (rcv *Receiver) handleSeedStream(stream network.Stream) {
@@ -300,7 +328,8 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 	pieceCommits, exists := rcv.cache.GetAnchoredCommitments(blockID, col)
 	if !exists {
 		// Fallback: fetch header and anchor commitments
-		log.Printf("[StoreNode] Anchored commitments not found in cache for block %s. Fetching from publisher...", blockID)
+		height := p2pcommon.ParseHeightFromBlockID(blockID)
+		log.Printf("[Height: %d] [StoreNode] Anchored commitments not found in cache for block %s. Fetching from publisher...", height, blockID)
 		_, err := verifier.FetchBlockHeader(rcv.publisherAddr, blockID)
 		if err != nil {
 			return fmt.Errorf("failed to fetch header: %w", err)
@@ -375,6 +404,8 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 		rcv.cellLastActivity[key] = time.Now()
 		rcv.pruneMu.Unlock()
 	}
+
+	go rcv.CheckAndLogCompletion(blockID)
 
 	// 6. P2P Recoding & GossipSub forwarding
 	updatedPieces := rcv.cache.GetPieces(blockID, row, col)
@@ -510,6 +541,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 				latestPieces = append(latestPieces, p)
 				log.Printf("[StoreNode] Active pull: stored independent piece for cell [%d, %d] from peer %s (count: %d/%d)", row, col, pid, len(latestPieces), rcv.kPiece)
 				allPieces = latestPieces
+				go rcv.CheckAndLogCompletion(blockID)
 			}
 			rcv.cellMu.Unlock()
 
@@ -531,6 +563,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 			rcv.cache.StoreRecodedPiece(blockID, row, col, *recodedPiece)
 			rcv.cellMu.Unlock()
 			log.Printf("[StoreNode] Successfully recoded cell [%d, %d] in active pull.", row, col)
+			go rcv.CheckAndLogCompletion(blockID)
 
 			// Try to gossip it
 			isCustody := (row % rcv.storesPerCol) == rcv.rowIdx
@@ -581,7 +614,8 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 	}
 	rcv.cellMu.Unlock()
 
-	log.Printf("[StoreNode] Retrieving cell [%d, %d] for block %s. Local pieces: %d", req.Row, req.Col, req.BlockID, len(allPieces))
+	height := p2pcommon.ParseHeightFromBlockID(req.BlockID)
+	log.Printf("[Height: %d] [StoreNode] Retrieving cell [%d, %d] for block %s. Local pieces: %d", height, req.Row, req.Col, req.BlockID, len(allPieces))
 
 	// Get commitments
 	pieceCommits, _ := rcv.cache.GetAnchoredCommitments(req.BlockID, req.Col)
@@ -770,6 +804,47 @@ func (rcv *Receiver) IsComplete(blockID string) bool {
 		}
 	}
 	return true
+}
+
+func (rcv *Receiver) CheckAndLogCompletion(blockID string) {
+	rcv.completedMu.Lock()
+	if rcv.completedBlocks == nil {
+		rcv.completedBlocks = make(map[string]bool)
+	}
+	if rcv.completedBlocks[blockID] {
+		rcv.completedMu.Unlock()
+		return
+	}
+	rcv.completedMu.Unlock()
+
+	if rcv.IsComplete(blockID) {
+		rcv.completedMu.Lock()
+		if rcv.completedBlocks[blockID] {
+			rcv.completedMu.Unlock()
+			return
+		}
+		rcv.completedBlocks[blockID] = true
+		rcv.completedMu.Unlock()
+
+		height := p2pcommon.ParseHeightFromBlockID(blockID)
+		port := rcv.cache.Port()
+		if port > 0 {
+			logDir := fmt.Sprintf("data/store_%d", port)
+			_ = os.MkdirAll(logDir, 0755)
+			logPath := filepath.Join(logDir, "completion.log")
+
+			f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err == nil {
+				defer f.Close()
+				timestamp := time.Now().Format("2006-01-02 15:04:05")
+				logLine := fmt.Sprintf("[%s] [Height: %d] Block %s: Column registry reached IsComplete status successfully.\n", timestamp, height, blockID)
+				_, _ = f.WriteString(logLine)
+				log.Printf("[Height: %d] [StoreNode] Column registry reached IsComplete status successfully. Logged to %s.", height, logPath)
+			} else {
+				log.Printf("[Height: %d] [StoreNode] Warning: failed to write completion log: %v", height, err)
+			}
+		}
+	}
 }
 
 func (rcv *Receiver) respondWithError(stream network.Stream, errMsg string) {

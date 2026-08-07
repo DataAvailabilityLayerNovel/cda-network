@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -12,6 +14,21 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/zeebo/blake3"
 )
+
+// ParseHeightFromBlockID extracts the numeric block height from a block ID string.
+// Supports formats like "block-123", "bot-block-456", "height_789", etc.
+func ParseHeightFromBlockID(blockID string) int {
+	parts := strings.FieldsFunc(blockID, func(r rune) bool {
+		return r == '-' || r == '_'
+	})
+	for i := len(parts) - 1; i >= 0; i-- {
+		val, err := strconv.Atoi(parts[i])
+		if err == nil {
+			return val
+		}
+	}
+	return 0
+}
 
 func CalculateCell(pid peer.ID, k1, k2 int, salt string) (row, col int) {
 	if k1 <= 0 || k2 <= 0 {

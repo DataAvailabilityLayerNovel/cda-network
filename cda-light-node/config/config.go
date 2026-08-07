@@ -13,6 +13,7 @@ type Config struct {
 	K             int
 	KPiece        int
 	CrashOnFail   bool
+	NumCols       int
 }
 
 func LoadConfig() *Config {
@@ -22,6 +23,7 @@ func LoadConfig() *Config {
 	k := flag.Int("k", 4, "Number of chunks K")
 	kPiece := flag.Int("k-piece", 0, "RLNC piece parameter k-piece")
 	crashOnFail := flag.Bool("crash-on-fail", false, "Crash the node if verification fails")
+	numCols := flag.Int("num-cols", 8, "Total number of network columns")
 	flag.Parse()
 
 	bootstrapsMap := make(map[int][]string)
@@ -55,5 +57,6 @@ func LoadConfig() *Config {
 		K:             *k,
 		KPiece:        kPieceVal,
 		CrashOnFail:   *crashOnFail,
+		NumCols:       *numCols,
 	}
 }

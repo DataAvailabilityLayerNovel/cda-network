@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"cda-publisher-node/internal/engine"
@@ -26,6 +27,7 @@ type APIService struct {
 	ps              *pubsub.PubSub
 	db              *badger.DB
 	sequencerPubKey string
+	mu              sync.Mutex
 }
 
 type PublishRequest struct {
@@ -95,6 +97,9 @@ func VerifySignature(blockID string, data []string, sigHex, pubKeyHex string) er
 }
 
 func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -161,7 +166,8 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	log.Printf("Successfully generated Block Header for BlockID: %s", header.BlockID)
+	height := p2pcommon.ParseHeightFromBlockID(header.BlockID)
+	log.Printf("[Height: %d] Successfully generated Block Header for BlockID: %s", height, header.BlockID)
 
 	topic, err := s.ps.Join(p2pcommon.TopicHeader)
 	if err != nil {
@@ -181,7 +187,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 					if err := topic.Publish(context.Background(), headerBytes); err != nil {
 						log.Printf("[GossipSub] Failed to publish header: %v", err)
 					} else {
-						log.Printf("[GossipSub] Successfully published Block Header for %s on GossipSub topic %s (mesh peers: %d)", header.BlockID, p2pcommon.TopicHeader, len(peers))
+						log.Printf("[Height: %d] [GossipSub] Successfully published Block Header for %s on GossipSub topic %s (mesh peers: %d)", height, header.BlockID, p2pcommon.TopicHeader, len(peers))
 						published = true
 					}
 					break
@@ -209,7 +215,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		colProofs := proofs[c*k : c*k+k]
 
 		if err := s.sender.SendColumnChunk(header.BlockID, c, colData, pieceCommitsBytes, colProofs); err != nil {
-			log.Printf("[Publisher] Warning: Failed to distribute column %d to bootstrap (likely offline): %v", c, err)
+			log.Printf("[Height: %d] [Publisher] Warning: Failed to distribute column %d to bootstrap (likely offline): %v", height, c, err)
 		}
 	}
 

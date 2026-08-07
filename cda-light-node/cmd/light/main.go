@@ -136,7 +136,7 @@ func main() {
 	}
 
 	// 5. Initialize HTTP API Service
-	apiService := service.NewAPIService(cfg.PublisherAddr, cfg.BootstrapsMap, dasVerifier, cfg.CrashOnFail, p2pHost, ps)
+	apiService := service.NewAPIService(cfg.PublisherAddr, cfg.BootstrapsMap, dasVerifier, cfg.CrashOnFail, p2pHost, ps, cfg.Port, cfg.NumCols)
 
 	// 6. Subscribe to Header GossipSub topic
 	topic, err := ps.Join(p2pcommon.TopicHeader)

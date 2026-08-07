@@ -68,7 +68,7 @@ $$C^{\text{col}}_c = \sum_{j=0}^{k-1} x_j \cdot C_{c, j}$$
                                                    │                         (Nhận & Anchor tập C_j chuẩn trước)
                                                    │
                                                    └── PHASE 2: COMPUTE & RLNC SEEDING LAYER (Async Heavy Task)
-                                                        ├── 1. Compute Proof: Gen N x k Proofs Π_{j,r}
+                                                        ├── 1. Compute Proof: Gen N x k_piece Proofs Π_{j,r}
                                                         ├── 2. Generate 2 * k_piece RLNC seeds per Row r
                                                         └── 3. UNICAST SEEDS: Send k_piece seeds to Primary & k_piece seeds to Backup
                                                                                             │
