@@ -44,6 +44,16 @@ var (
 		Help: "Number of linear independent pieces stored in custody.",
 	})
 
+	CustodyPiecesCount = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "cda_store_custody_pieces_count",
+		Help: "Number of pieces stored strictly for assigned custody cells.",
+	})
+
+	RecodedPiecesCount = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "cda_store_recoded_pieces_count",
+		Help: "Number of pieces retained for non-custody network column cells.",
+	})
+
 	DatabaseSizeBytes = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "cda_store_db_size_bytes",
 		Help: "Total size of the BadgerDB directory in bytes.",
@@ -65,6 +75,8 @@ func init() {
 		GossipSubMessageRateGauge,
 		ByzantineDetectionsTotal,
 		LinearIndependentPiecesCount,
+		CustodyPiecesCount,
+		RecodedPiecesCount,
 		DatabaseSizeBytes,
 	)
 }

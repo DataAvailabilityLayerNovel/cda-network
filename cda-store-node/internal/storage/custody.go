@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	"github.com/dgraph-io/badger/v4"
@@ -149,14 +150,7 @@ func (s *CustodyStore) StoreRecodedPiece(blockID string, row, col int, piece cda
 	key := []byte(fmt.Sprintf("recoded_%s_%d_%d", blockID, row, col))
 
 	_ = s.db.Update(func(txn *badger.Txn) error {
-		var pieces []cda.ReceivedPiece
-		item, err := txn.Get(key)
-		if err == nil {
-			_ = item.Value(func(val []byte) error {
-				return json.Unmarshal(val, &pieces)
-			})
-		}
-		pieces = append(pieces, piece)
+		pieces := []cda.ReceivedPiece{piece}
 		valData, err := json.Marshal(pieces)
 		if err != nil {
 			return err
@@ -218,7 +212,34 @@ func (s *CustodyStore) GetTotalPieceCount() int {
 		opts := badger.DefaultIteratorOptions
 		it := txn.NewIterator(opts)
 		defer it.Close()
-		prefix := []byte("received_")
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := string(item.Key())
+			if strings.HasPrefix(key, "received_") || strings.HasPrefix(key, "recoded_") {
+				_ = item.Value(func(val []byte) error {
+					var pieces []cda.ReceivedPiece
+					if err := json.Unmarshal(val, &pieces); err == nil {
+						count += len(pieces)
+					}
+					return nil
+				})
+			}
+		}
+		return nil
+	})
+	return count
+}
+
+func (s *CustodyStore) GetRecodedPieceCount() int {
+	if s.db == nil {
+		return 0
+	}
+	count := 0
+	_ = s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		prefix := []byte("recoded_")
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			item := it.Item()
 			_ = item.Value(func(val []byte) error {
@@ -228,6 +249,42 @@ func (s *CustodyStore) GetTotalPieceCount() int {
 				}
 				return nil
 			})
+		}
+		return nil
+	})
+	return count
+}
+
+func (s *CustodyStore) GetCustodyPieceCount(storesPerCol, rowIdx int) int {
+	if s.db == nil || storesPerCol <= 0 {
+		return 0
+	}
+	count := 0
+	_ = s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		prefix := []byte("received_")
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
+			key := string(item.Key())
+			// key format: "received_{blockID}_{row}_{col}"
+			parts := strings.Split(key, "_")
+			if len(parts) >= 3 {
+				rowStr := parts[len(parts)-2]
+				var row int
+				if _, err := fmt.Sscanf(rowStr, "%d", &row); err == nil {
+					if (row % storesPerCol) == rowIdx {
+						_ = item.Value(func(val []byte) error {
+							var pieces []cda.ReceivedPiece
+							if err := json.Unmarshal(val, &pieces); err == nil {
+								count += len(pieces)
+							}
+							return nil
+						})
+					}
+				}
+			}
 		}
 		return nil
 	})
@@ -278,19 +335,29 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int) int {
 		return 0
 	}
 	deletedCount := 0
-	key := []byte(fmt.Sprintf("received_%s_%d_%d", blockID, row, col))
+	rawKey := []byte(fmt.Sprintf("received_%s_%d_%d", blockID, row, col))
+	recodedKey := []byte(fmt.Sprintf("recoded_%s_%d_%d", blockID, row, col))
+
 	_ = s.db.Update(func(txn *badger.Txn) error {
-		item, err := txn.Get(key)
+		var rawPieces []cda.ReceivedPiece
+		item, err := txn.Get(rawKey)
 		if err == nil {
 			_ = item.Value(func(val []byte) error {
-				var pieces []cda.ReceivedPiece
-				if err := json.Unmarshal(val, &pieces); err == nil {
-					deletedCount = len(pieces)
-				}
-				return nil
+				return json.Unmarshal(val, &rawPieces)
 			})
+			deletedCount = len(rawPieces)
 		}
-		return txn.Delete(key)
+
+		// If no recoded piece exists yet for this non-custody cell, retain 1 raw piece in recoded_
+		_, recodedErr := txn.Get(recodedKey)
+		if recodedErr == badger.ErrKeyNotFound && len(rawPieces) > 0 {
+			retained := []cda.ReceivedPiece{rawPieces[0]}
+			if valData, err := json.Marshal(retained); err == nil {
+				_ = txn.Set(recodedKey, valData)
+			}
+		}
+
+		return txn.Delete(rawKey)
 	})
 
 	if deletedCount > 0 {

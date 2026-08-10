@@ -62,6 +62,7 @@ type Receiver struct {
 	pruneTTL         time.Duration
 	pruneMu          sync.Mutex
 	cellLastActivity map[string]time.Time
+	prunedCells      map[string]bool
 
 	// Block completion file logging
 	completedMu     sync.Mutex
@@ -105,6 +106,7 @@ func NewReceiver(
 		pruneEnable:       pruneEnable,
 		pruneTTL:          pruneTTL,
 		cellLastActivity:  make(map[string]time.Time),
+		prunedCells:       make(map[string]bool),
 		completedBlocks:   make(map[string]bool),
 	}
 }
@@ -136,10 +138,14 @@ func (rcv *Receiver) Start(ctx context.Context) {
 			select {
 			case <-ticker.C:
 				actualPieces := rcv.cache.GetTotalPieceCount()
+				custodyPieces := rcv.cache.GetCustodyPieceCount(rcv.storesPerCol, rcv.rowIdx)
+				recodedPieces := rcv.cache.GetRecodedPieceCount()
 				rcv.totalStoredPiecesMu.Lock()
 				rcv.totalStoredPieces = int64(actualPieces)
 				rcv.totalStoredPiecesMu.Unlock()
 				LinearIndependentPiecesCount.Set(float64(actualPieces))
+				CustodyPiecesCount.Set(float64(custodyPieces))
+				RecodedPiecesCount.Set(float64(recodedPieces))
 
 				dbSize := rcv.cache.GetDBSize()
 				DatabaseSizeBytes.Set(float64(dbSize))
@@ -401,7 +407,9 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 	if rcv.pruneEnable {
 		rcv.pruneMu.Lock()
 		key := fmt.Sprintf("%s_%d_%d", blockID, row, col)
-		rcv.cellLastActivity[key] = time.Now()
+		if !rcv.prunedCells[key] {
+			rcv.cellLastActivity[key] = time.Now()
+		}
 		rcv.pruneMu.Unlock()
 	}
 
@@ -424,7 +432,9 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 			if rcv.pruneEnable {
 				rcv.pruneMu.Lock()
 				key := fmt.Sprintf("%s_%d_%d", blockID, row, col)
-				rcv.cellLastActivity[key] = time.Now()
+				if !rcv.prunedCells[key] {
+					rcv.cellLastActivity[key] = time.Now()
+				}
 				rcv.pruneMu.Unlock()
 			}
 			log.Printf("[GossipSub] Recoding success for cell [%d, %d]. Gossiping recoded piece with coeffs %x to column neighbor peers...", row, col, recodedPiece.Data.Coeffs)
@@ -936,11 +946,16 @@ func (rcv *Receiver) startPruner(ctx context.Context) {
 					if err1 == nil && err2 == nil {
 						isCustody := (row % rcv.storesPerCol) == rcv.rowIdx
 						if !isCustody {
-							recoded := rcv.cache.GetRecodedPieces(blockID, row, col)
-							if len(recoded) > 0 {
-								log.Printf("[Pruning] Cell [%d, %d] is non-custody and has a recoded piece. Pruning raw pieces from BadgerDB...", row, col)
-								rcv.cache.PruneRawPieces(blockID, row, col)
+							rcv.pruneMu.Lock()
+							if rcv.prunedCells[key] {
+								rcv.pruneMu.Unlock()
+								continue
 							}
+							rcv.prunedCells[key] = true
+							rcv.pruneMu.Unlock()
+
+							log.Printf("[Pruning] Cell [%d, %d] of block %s is non-custody. Pruning raw pieces from BadgerDB...", row, col, blockID)
+							rcv.cache.PruneRawPieces(blockID, row, col)
 						}
 					}
 				}

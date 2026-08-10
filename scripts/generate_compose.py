@@ -218,6 +218,15 @@ providers:
         "tags": ["cda", "production"],
         "timezone": "browser",
         "schemaVersion": 26,
+        "refresh": "5s",
+        "time": {
+            "from": "now-5m",
+            "to": "now"
+        },
+        "timepicker": {
+            "refresh_intervals": ["1s", "5s", "10s", "30s", "1m"],
+            "time_options": ["5m", "15m", "1h", "6h", "12h", "24h"]
+        },
         "panels": [
             {
                 "type": "stat",
@@ -338,7 +347,7 @@ providers:
             },
             {
                 "type": "graph",
-                "title": "Store Node Stored Pieces over Time (Active pieces count)",
+                "title": "Total Stored Pieces per Store Node (Custody + Recoded Non-Custody)",
                 "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
                 "targets": [
                     {
@@ -367,24 +376,35 @@ providers:
                 ]
             },
             {
-                "type": "bargauge",
-                "title": "Current Stored Pieces Rank",
+                "type": "table",
+                "title": "Store Node Total Stored Pieces Table",
                 "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
                 "targets": [
                     {
                         "expr": "cda_store_linear_independent_pieces_count",
-                        "legendFormat": "{{instance}}"
+                        "legendFormat": "{{instance}}",
+                        "instant": True
+                    }
+                ],
+                "transformations": [
+                    {
+                        "id": "reduce",
+                        "options": {
+                            "reducers": ["last"]
+                        }
+                    },
+                    {
+                        "id": "organize",
+                        "options": {
+                            "renameByName": {
+                                "Field": "Store Node Instance",
+                                "Last": "Total Stored Pieces"
+                            }
+                        }
                     }
                 ],
                 "options": {
-                    "orientation": "vertical",
-                    "displayMode": "lcd"
-                },
-                "fieldConfig": {
-                    "defaults": {
-                        "min": 0,
-                        "max": 128
-                    }
+                    "showHeader": True
                 }
             },
             {

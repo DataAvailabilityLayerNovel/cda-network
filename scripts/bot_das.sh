@@ -30,8 +30,11 @@ while true; do
     BLOCK_ID="${BLOCK_PREFIX}-${COUNTER}"
     echo "========================================="
     echo "[DAS Bot] Thực hiện lấy mẫu DAS cho block: $BLOCK_ID"
-    "$SCRIPT_DIR/das.sh" "$BLOCK_ID" "http://localhost:9401"
-    
-    COUNTER=$((COUNTER + 1))
+    if "$SCRIPT_DIR/das.sh" "$BLOCK_ID" "http://localhost:9401"; then
+        echo "[DAS Bot] Lấy mẫu $BLOCK_ID thành công! Chuyển sang block tiếp theo sau ${INTERVAL}s."
+        COUNTER=$((COUNTER + 1))
+    else
+        echo "[DAS Bot] Lấy mẫu $BLOCK_ID chưa thành công hoặc timeout. Sẽ thử lại sau ${INTERVAL}s..."
+    fi
     sleep $INTERVAL
 done

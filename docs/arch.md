@@ -81,19 +81,19 @@ Hai kịch bản kiểm thử tích hợp đầu-cuối (E2E) đã được tri�
 *   **Mô tả:** Mô phỏng mạng lưới 3 Store Node cùng nằm trên một cột mạng để kiểm tra khả năng tái mã hóa, lan truyền Gossip và chủ động kéo mảnh phục hồi ô dữ liệu.
 *   **Sơ đồ luồng dữ liệu kiểm thử:**
     ```
-    Bootstrap Node --> Store Node 1 (8082) [Nhận k_piece seeds ban đầu]
+    Bootstrap Node --> Store Node 1 [Nhận k_piece seeds ban đầu]
                              |
                    (Tái mã hóa & GossipSub)
                              v
-                       Store Node 2 (8083) [Tích lũy được < k_piece mảnh]
+                       Store Node 2 [Tích lũy được < k_piece mảnh]
                              |
                 (Query /store/cell/retrieve)
                              v
-                       Store Node 1 (8082) & Store Node 3 (8084)
+                       Store Node 1 & Store Node 3
                              |
              (Trả về mảnh độc lập tuyến tính)
                              v
-                       Store Node 2 (8083) [Tích lũy đủ k_piece mảnh độc lập]
+                       Store Node 2 [Tích lũy đủ k_piece mảnh độc lập]
                              |
                        (Reconstruct & Unpad)
                              v
