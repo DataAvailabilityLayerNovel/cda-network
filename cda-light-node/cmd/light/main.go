@@ -72,9 +72,9 @@ func main() {
 	for colIdx, httpAddrs := range cfg.BootstrapsMap {
 		for _, httpAddr := range httpAddrs {
 			n := 2 * cfg.K
-			numCols := len(cfg.BootstrapsMap)
-			if numCols == 0 {
-				numCols = 1
+			numCols := cfg.NumCols
+			if numCols <= 0 {
+				numCols = 8
 			}
 			colsPerNetCol := n / numCols
 			if colsPerNetCol == 0 {
@@ -158,6 +158,9 @@ func main() {
 			var header service.BlockHeader
 			if err := json.Unmarshal(msg.Data, &header); err == nil {
 				apiService.CacheHeader(&header)
+				if cfg.AutoDAS {
+					go apiService.TriggerAutoDAS(&header, cfg.AutoDASSamples)
+				}
 			}
 		}
 	}()

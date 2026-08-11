@@ -7,13 +7,15 @@ import (
 )
 
 type Config struct {
-	Port          int
-	PublisherAddr string
-	BootstrapsMap map[int][]string
-	K             int
-	KPiece        int
-	CrashOnFail   bool
-	NumCols       int
+	Port           int
+	PublisherAddr  string
+	BootstrapsMap  map[int][]string
+	K              int
+	KPiece         int
+	CrashOnFail    bool
+	NumCols        int
+	AutoDAS        bool
+	AutoDASSamples int
 }
 
 func LoadConfig() *Config {
@@ -24,6 +26,8 @@ func LoadConfig() *Config {
 	kPiece := flag.Int("k-piece", 0, "RLNC piece parameter k-piece")
 	crashOnFail := flag.Bool("crash-on-fail", false, "Crash the node if verification fails")
 	numCols := flag.Int("num-cols", 8, "Total number of network columns")
+	autoDAS := flag.Bool("auto-das", true, "Automatically trigger DAS when a new BlockHeader is received via GossipSub")
+	autoDASSamples := flag.Int("auto-das-samples", 0, "Number of samples for Auto-DAS (0 for all active cells, >0 for random samples)")
 	flag.Parse()
 
 	bootstrapsMap := make(map[int][]string)
@@ -51,12 +55,14 @@ func LoadConfig() *Config {
 	}
 
 	return &Config{
-		Port:          *port,
-		PublisherAddr: *publisher,
-		BootstrapsMap: bootstrapsMap,
-		K:             *k,
-		KPiece:        kPieceVal,
-		CrashOnFail:   *crashOnFail,
-		NumCols:       *numCols,
+		Port:           *port,
+		PublisherAddr:  *publisher,
+		BootstrapsMap:  bootstrapsMap,
+		K:              *k,
+		KPiece:         kPieceVal,
+		CrashOnFail:    *crashOnFail,
+		NumCols:        *numCols,
+		AutoDAS:        *autoDAS,
+		AutoDASSamples: *autoDASSamples,
 	}
 }
