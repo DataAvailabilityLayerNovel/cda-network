@@ -25,6 +25,7 @@ type APIService struct {
 	pipeline        *engine.Pipeline
 	sender          *p2p.Sender
 	ps              *pubsub.PubSub
+	headerTopic     *pubsub.Topic
 	db              *badger.DB
 	sequencerPubKey string
 	mu              sync.Mutex
@@ -48,10 +49,20 @@ func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.Pub
 		}
 	}
 
+	var headerTopic *pubsub.Topic
+	if ps != nil {
+		var err error
+		headerTopic, err = ps.Join(p2pcommon.TopicHeader)
+		if err != nil {
+			log.Printf("[Publisher] Warning: Failed to join GossipSub header topic: %v", err)
+		}
+	}
+
 	return &APIService{
 		pipeline:        pipeline,
 		sender:          sender,
 		ps:              ps,
+		headerTopic:     headerTopic,
 		db:              db,
 		sequencerPubKey: sequencerPubKey,
 	}
@@ -169,33 +180,15 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	height := p2pcommon.ParseHeightFromBlockID(header.BlockID)
 	log.Printf("[Height: %d] Successfully generated Block Header for BlockID: %s", height, header.BlockID)
 
-	topic, err := s.ps.Join(p2pcommon.TopicHeader)
-	if err != nil {
-		log.Printf("[GossipSub] Failed to join header topic: %v", err)
-	} else {
+	if s.headerTopic != nil {
 		headerBytes, err := json.Marshal(header)
 		if err != nil {
 			log.Printf("[GossipSub] Failed to marshal header: %v", err)
 		} else {
-			// Wait until at least 1 mesh peer is present (max 5s), then publish.
-			// This prevents silent message drop when GossipSub mesh is not yet formed.
-			published := false
-			deadline := time.Now().Add(5 * time.Second)
-			for time.Now().Before(deadline) {
-				peers := topic.ListPeers()
-				if len(peers) > 0 {
-					if err := topic.Publish(context.Background(), headerBytes); err != nil {
-						log.Printf("[GossipSub] Failed to publish header: %v", err)
-					} else {
-						log.Printf("[Height: %d] [GossipSub] Successfully published Block Header for %s on GossipSub topic %s (mesh peers: %d)", height, header.BlockID, p2pcommon.TopicHeader, len(peers))
-						published = true
-					}
-					break
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-			if !published {
-				log.Printf("[GossipSub] Warning: No mesh peers found for topic %s after 5s, header will only be served via HTTP fallback", p2pcommon.TopicHeader)
+			if err := s.headerTopic.Publish(context.Background(), headerBytes); err != nil {
+				log.Printf("[GossipSub] Failed to publish header for %s: %v", header.BlockID, err)
+			} else {
+				log.Printf("[Height: %d] [GossipSub] Successfully published Block Header for %s on GossipSub topic %s", height, header.BlockID, p2pcommon.TopicHeader)
 			}
 		}
 	}
