@@ -20,8 +20,11 @@ Tạo cấu hình Docker Compose giả lập với 8 cột mạng, 8 store node 
 # Dọn dẹp 
 bash scripts/cleanup.sh
 
-# Tạo cấu hình docker-compose.json
-python3 scripts/generate_compose.py --cols 8 --active-cols 1 --stores-per-col 8 --lights 1 --k 16 --k-piece 4 --prune-enable --prune-ttl 15s
+# Cách 1: Khởi động ĐẦY ĐỦ 8 Cột Mạng (Khuyến nghị để DAS toàn bộ ma trận ?all=true)
+python3 scripts/generate_compose.py --cols 8 --stores-per-col 8 --lights 1 --k 16 --k-piece 4 --prune-enable --prune-ttl 15s
+
+# Cách 2: Khởi động Rút Gọn 1 Cột Mạng (Tiết kiệm tài nguyên máy, chỉ test riêng Cột 0)
+# python3 scripts/generate_compose.py --cols 8 --active-cols 1 --stores-per-col 8 --lights 1 --k 16 --k-piece 4 --prune-enable --prune-ttl 15s
 
 # Build và chạy mạng lưới trong nền
 docker compose -f docker-compose.json up -d --build
@@ -34,13 +37,24 @@ Chạy bot đẩy dữ liệu để xuất bản 3 block với thời gian dãn 
 python3 scripts/block_publisher_bot.py --interval 10 --k 16 --count 3 --start-height 1
 ```
 
-### Bước 2.5: Khởi chạy DAS Bot (Light Node)
-Song song với tiến trình đẩy block của Publisher Bot, bạn có thể chạy kịch bản tự động lấy mẫu dữ liệu (DAS) của Light Node để truy vấn và xác thực tính sẵn có của block:
+### Bước 2.5: Cơ Chế Reactive Auto-DAS (Tự Động Kích Hoạt Ngay Khi Nhận Header)
+Light Node hiện đã được tích hợp cơ chế **Reactive Auto-DAS theo sự kiện**:
+- Ngay khi Publisher phát sóng `BlockHeader` mới qua kênh GossipSub `/cda/1.0.0/header`, Light Node **tự động kích hoạt luồng lấy mẫu DAS ngay lập tức** cho toàn bộ các cột active mà không cần chạy bất kỳ bot thăm dò tuần tự bên ngoài nào.
+- Toàn bộ kết quả xác thực đại số được tự động ghi nhận trực tiếp theo thời gian thực vào:
+  ```bash
+  cat data/light_9401/das_success.log
+  ```
+- Hoặc bạn có thể xem trực tiếp log sự kiện của Light Node qua Docker:
+  ```bash
+  docker compose -f docker-compose.json logs -f light-1 | grep "Auto-DAS"
+  ```
+  *Log mẫu thời gian thực khi có block mới:*
+  ```text
+  [Auto-DAS] [Height: 1] 🚀 Reactive Event: Received Header for block-1 via GossipSub. Automatically sampling 128 cells...
+  [Auto-DAS] [Height: 1] ✅ 100% DAS VERIFIED for block-1 (128/128 cells verified in 4.2s)
+  ```
 
-```bash
-# Thực hiện DAS sampling các block bắt đầu từ block-1
-bash scripts/bot_das.sh block-1
-```
+
 
 ### Bước 3: Theo dõi qua log console (Stdout)
 Bạn có thể xem log Stdout của các Store Node để kiểm tra xem họ đã thông báo đạt trạng thái hoàn thành chưa:

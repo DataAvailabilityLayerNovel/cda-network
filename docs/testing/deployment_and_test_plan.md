@@ -150,3 +150,75 @@ scrape_configs:
 2. **DAS Sampling Latency (Heatmap):** Biểu đồ phân bổ độ trễ DAS của các Light Node, giúp phát hiện các ô bị nghẽn mạng hoặc Store Node phản hồi chậm.
 3. **Store Node Storage Rank (Bar Chart):** Hiển thị số lượng mảnh độc lập tuyến tính tích lũy được trên từng Store Node (giám sát tiến độ GossipSub và đồng bộ dữ liệu cột).
 4. **System Process CPU/Memory Load (Line Chart):** Giám sát tải phần cứng của các container để điều chỉnh tối ưu hóa cấu hình tài nguyên hệ thống.
+
+---
+
+## 4. Hướng Dẫn Thực Thi Các Kịch Bản Kiểm Thử Tự Động (Test Execution Guide)
+
+Dưới đây là bảng tổng hợp các kịch bản kiểm thử tự động, lệnh thực thi tương ứng và tiêu chuẩn xác nhận kết quả:
+
+### 4.1. Kịch Bản 1: Kiểm Thử Khám Phá Ma Trận Đơn Seed Cho Light Node (Single-Seed DAS)
+* **File Kịch Bản:** [scripts/tests/test_light_single_seed_das.sh](file:///home/ubuntu/cda-network/scripts/tests/test_light_single_seed_das.sh)
+* **Mục Đích:** Kiểm chứng Light Node chỉ cần cấu hình 1 Seed Bootstrap duy nhất (`Bootstrap 0`), vẫn tự động khám phá và lấy mẫu DAS thành công 100% trên toàn bộ 32 cột ma trận ($1024$ ô EDS).
+* **Lệnh Thực Thi:**
+  ```bash
+  bash scripts/tests/test_light_single_seed_das.sh
+  ```
+* **Kết Quả Kỳ Vọng:**
+  - Tự động dựng mạng $K=16$, 8 Bootstrap Nodes, 16 Store Nodes.
+  - DAS từng ô đơn lẻ qua các cột khác nhau trả về `verified: true`.
+  - Full Matrix DAS (`?all=true`) xác thực thành công **1024/1024 ô** (`success: true`).
+
+---
+
+### 4.2. Kịch Bản 2: Theo Dõi Vòng Đời Tham Gia & Rời Mạng Của Store Node (Join & Leave Lifecycle)
+* **File Kịch Bản:** [scripts/tests/test_store_join_leave_lifecycle.sh](file:///home/ubuntu/cda-network/scripts/tests/test_store_join_leave_lifecycle.sh)
+* **Mục Đích:** Trực quan hóa 3 giai đoạn hoạt động thực tế của Store Node:
+  1. **Dynamic Join:** Store Node mới gia nhập, nhận hạt giống RLNC và phục vụ DAS.
+  2. **Graceful Leave:** Tắt node bằng `SIGTERM` (`kill -15`), node tự gửi `IsLeave: true` và được dọn dẹp tức thì ($< 1\text{s}$).
+  3. **Ungraceful Crash:** Tắt node đột ngột bằng `SIGKILL` (`kill -9`), Bootstrap tự động phát hiện và xóa node quá hạn Heartbeat TTL ($15\text{s}$).
+* **Lệnh Thực Thi:**
+  ```bash
+  bash scripts/tests/test_store_join_leave_lifecycle.sh
+  ```
+* **Kết Quả Kỳ Vọng:**
+  - Tất cả 3 giai đoạn đều được xác nhận tự động qua API `/bootstrap/peers` và Light Node DAS queries.
+
+---
+
+### 4.3. Kịch Bản 3: Kiểm Thử Tích Hợp Cụm Docker Compose E2E (Full Matrix Docker Test)
+* **File Kịch Bản:** [scripts/tests/run_docker_test.sh](file:///home/ubuntu/cda-network/scripts/tests/run_docker_test.sh)
+* **Mục Đích:** Khởi chạy toàn bộ hệ thống trong môi trường container cô lập đa subnet, xuất bản block dữ liệu thực tế và kiểm tra độ trễ hoàn thành custody của toàn bộ cụm Store Nodes.
+* **Lệnh Thực Thi:**
+  ```bash
+  bash scripts/tests/run_docker_test.sh
+  ```
+* **Kết Quả Kỳ Vọng:**
+  - Toàn bộ Store Nodes báo cáo `completed = true`.
+  - Light Node container thực hiện DAS toàn bộ $2K \times 2K$ ô đạt 100% thành công.
+
+---
+
+### 4.4. Kịch Bản 4: Kiểm Thử Phục Hồi Dữ Liệu Khối Mất Toàn Bộ Cột Mạng (Scenario 3)
+* **File Kịch Bản:** [scripts/tests/test_scenario_3.sh](file:///home/ubuntu/cda-network/scripts/tests/test_scenario_3.sh)
+* **Mục Đích:** Tắt toàn bộ Store Nodes thuộc 1 Cột mạng, tập hợp các cột còn lại và giải mã Reed-Solomon 2D ngược để tái tạo 100% dữ liệu gốc ODS.
+* **Lệnh Thực Thi:**
+  ```bash
+  bash scripts/tests/test_scenario_3.sh
+  ```
+* **Tài Liệu Chi Tiết:** [scenario_3_reconstruction_test_guide.md](file:///home/ubuntu/cda-network/docs/testing/scenario_3_reconstruction_test_guide.md)
+
+---
+
+### 4.5. Tiện Ích Xuất Bản Khối & Lấy Mẫu Thủ Công (CLI Utilities)
+* **Xuất bản khối thủ công:**
+  ```bash
+  # Cú pháp: ./scripts/publish.sh [BLOCK_ID] [PUBLISHER_URL]
+  ./scripts/publish.sh manual-block-1 http://localhost:8080
+  ```
+* **Lấy mẫu DAS thủ công:**
+  ```bash
+  # Cú pháp: ./scripts/das.sh [BLOCK_ID] [LIGHT_NODE_URL]
+  ./scripts/das.sh manual-block-1 http://localhost:8499
+  ```
+

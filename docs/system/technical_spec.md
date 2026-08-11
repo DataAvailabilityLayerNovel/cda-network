@@ -1,14 +1,13 @@
-# CDA Network — Mô Tả Kỹ Thuật Chi Tiết
+# CDA Network — Đặc Tả Kỹ Thuật & Hiện Thực Hệ Thống Thực Tế
 
-> **Phiên bản:** 1.0  
-> **Ngày:** 2026-07-30  
-> **Trạng thái:** Prototype / Research Implementation
+> **Tài liệu:** Đặc tả chi tiết kiến trúc hiện thực (System & Implementation Specification)  
+> **Trạng thái:** Live Implementation / Production-Ready Baseline  
 
 ---
 
-## Tổng Quan Kiến Trúc
+## Tổng Quan Hệ Thống
 
-CDA (Column Data Availability) Network là hệ thống Data Availability Layer theo mô hình **2D Reed-Solomon + KZG polynomial commitment**. Dữ liệu gốc được mở rộng thành Extended Data Square (EDS), phân phối theo cột tới các Store Node, và Light Node có thể xác minh tính sẵn có của dữ liệu thông qua DAS (Data Availability Sampling) mà không cần tải toàn bộ dữ liệu.
+Tài liệu này cung cấp bản thiết kế kỹ thuật chi tiết và mô tả hiện thực thực tế của toàn bộ các thành phần trong codebase CDA Network: từ cấu trúc mã nguồn, pipeline xử lý, giao thức stream P2P libp2p, thuật toán phân bổ custody/pruning đến các trạng thái đã hoàn thành và hạn chế kỹ thuật của từng loại node (Publisher, Bootstrap, Store, Light Node).
 
 ### Sơ Đồ Tổng Quan
 
