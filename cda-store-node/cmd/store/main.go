@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -35,7 +36,7 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	log.Printf("Starting Store Node at Port=%d, MyAddr=%s for Cell [%d, %d]", cfg.Port, cfg.MyAddr, cfg.RowIdx, cfg.ColIdx)
+	log.Printf("Starting Store Node at Port=%d, MyAddr=%s (Requested Row=%d, Col=%d)", cfg.Port, cfg.MyAddr, cfg.RowIdx, cfg.ColIdx)
 
 	// 1. Initialize KZG SRS
 	srsSize := uint64(1024)
@@ -48,7 +49,7 @@ func main() {
 	// 2. Initialize Custody Cache Storage
 	cache := storage.NewCustodyStore(cfg.Port)
 
-	// 3. Generate or load deterministic keypair for targets (cfg.RowIdx, cfg.ColIdx)
+	// 3. Generate or load keypair (Auto-derive custody coordinates or use targeted coordinates)
 	keyFileName := fmt.Sprintf("store_%d.key", cfg.Port)
 	var privKey crypto.PrivKey
 	var pid peer.ID
@@ -66,12 +67,26 @@ func main() {
 		}
 	}
 
+	gridRows := 2 * cfg.K
+	gridCols := 2 * cfg.K
+
 	if privKey == nil {
-		gridRows := 2 * cfg.K
-		gridCols := 2 * cfg.K
-		privKey, pid, err = p2pcommon.GenerateKeypairForCell(cfg.RowIdx, cfg.ColIdx, gridRows, gridCols, "cda-salt-2026")
-		if err != nil {
-			log.Fatalf("Failed to generate deterministic keypair for cell coordinate: %v", err)
+		if cfg.RowIdx >= 0 && cfg.ColIdx >= 0 {
+			// Targeted cell key generation (for deterministic testing)
+			privKey, pid, err = p2pcommon.GenerateKeypairForCell(cfg.RowIdx, cfg.ColIdx, gridRows, gridCols, "cda-salt-2026")
+			if err != nil {
+				log.Fatalf("Failed to generate deterministic keypair for cell coordinate: %v", err)
+			}
+		} else {
+			// Production Auto-derive Mode: generate random Ed25519 key and compute deterministic cell
+			privKey, _, err = crypto.GenerateEd25519Key(rand.Reader)
+			if err != nil {
+				log.Fatalf("Failed to generate random private key: %v", err)
+			}
+			pid, err = peer.IDFromPrivateKey(privKey)
+			if err != nil {
+				log.Fatalf("Failed to extract PeerID: %v", err)
+			}
 		}
 
 		keyData, err := crypto.MarshalPrivateKey(privKey)
@@ -81,6 +96,16 @@ func main() {
 				log.Printf("[P2P Identity] Saved generated keypair to %s", keyFileName)
 			}
 		}
+	}
+
+	// Calculate and assign custody coordinates from PeerID
+	autoRow, autoCol := p2pcommon.CalculateCell(pid, gridRows, gridCols, "cda-salt-2026")
+	if cfg.RowIdx < 0 || cfg.ColIdx < 0 {
+		cfg.RowIdx = autoRow
+		cfg.ColIdx = autoCol
+		log.Printf("[P2P Identity] Auto-derived custody coordinates: Row=%d, Col=%d from PeerID %s", cfg.RowIdx, cfg.ColIdx, pid.String())
+	} else {
+		log.Printf("[P2P Identity] Using custody coordinates: Row=%d, Col=%d (PeerID=%s)", cfg.RowIdx, cfg.ColIdx, pid.String())
 	}
 
 	p2pPort := cfg.Port + 10000 // Compute P2P port deterministically (e.g. 8080 -> 18080)
@@ -132,38 +157,22 @@ func main() {
 		}
 	}()
 
-	// 6. Connect to column Bootstrap Node and Register coordinates via P2P stream
-	_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", cfg.ColIdx))
+	// 6. Connect to column Bootstrap Node (with Single-Seed Discovery) and Register coordinates
+	n := 2 * cfg.K
+	numCols := cfg.NumCols
+	if numCols <= 0 {
+		numCols = 8
+	}
+	colsPerNetCol := n / numCols
+	if colsPerNetCol == 0 {
+		colsPerNetCol = 1
+	}
+	targetNetCol := cfg.ColIdx / colsPerNetCol
+	targetColStart := targetNetCol * colsPerNetCol
+
+	_, targetBootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", targetColStart))
 	if err != nil {
 		log.Fatalf("Failed to calculate bootstrap PeerID: %v", err)
-	}
-
-	bootAddr := cfg.BootstrapAddr
-	if strings.HasPrefix(bootAddr, "http://") || strings.HasPrefix(bootAddr, "https://") {
-		u, err := url.Parse(bootAddr)
-		if err == nil {
-			hostStr := u.Hostname()
-			portStr := u.Port()
-			if portVal, err := strconv.Atoi(portStr); err == nil {
-				p2pPort := portVal + 10000
-				if hostStr == "localhost" || hostStr == "127.0.0.1" {
-					bootAddr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p2pPort)
-				} else {
-					bootAddr = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, p2pPort)
-				}
-			}
-		}
-	}
-
-	bootstrapAddrFull := fmt.Sprintf("%s/p2p/%s", bootAddr, bootPID.String())
-	bootstrapMaddr, err := multiaddr.NewMultiaddr(bootstrapAddrFull)
-	if err != nil {
-		log.Fatalf("Invalid bootstrap multiaddr %s: %v", bootstrapAddrFull, err)
-	}
-
-	bootInfo, err := peer.AddrInfoFromP2pAddr(bootstrapMaddr)
-	if err != nil {
-		log.Fatalf("Failed to parse bootstrap PeerInfo: %v", err)
 	}
 
 	// Dynamic resolution of own multiaddr
@@ -173,6 +182,84 @@ func main() {
 		hostName = u.Hostname()
 	}
 	myP2PAddr := fmt.Sprintf("/dns4/%s/tcp/%d", hostName, p2pPort)
+
+	// Helper to resolve address to multiaddr
+	resolveToMultiaddr := func(addrStr string, bootPID peer.ID) (multiaddr.Multiaddr, error) {
+		resolved := addrStr
+		if strings.HasPrefix(resolved, "http://") || strings.HasPrefix(resolved, "https://") {
+			u, err := url.Parse(resolved)
+			if err == nil {
+				hostStr := u.Hostname()
+				portStr := u.Port()
+				if portVal, err := strconv.Atoi(portStr); err == nil {
+					pPort := portVal + 10000
+					if hostStr == "localhost" || hostStr == "127.0.0.1" {
+						resolved = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", pPort)
+					} else {
+						resolved = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, pPort)
+					}
+				}
+			}
+		}
+		if !strings.Contains(resolved, "/p2p/") {
+			resolved = fmt.Sprintf("%s/p2p/%s", resolved, bootPID.String())
+		}
+		return multiaddr.NewMultiaddr(resolved)
+	}
+
+	targetBootAddr := cfg.BootstrapAddr
+
+	// If Store node's column is NOT managed by Seed Node (0), query Seed Node to discover Column Bootstrap
+	if targetColStart != 0 && cfg.SeedAddr != "" {
+		_, seedPID, err := p2pcommon.GenerateDeterministicKeypair("cda-bootstrap-0")
+		if err == nil {
+			seedMaddr, err := resolveToMultiaddr(cfg.SeedAddr, seedPID)
+			if err == nil {
+				if seedInfo, err := peer.AddrInfoFromP2pAddr(seedMaddr); err == nil {
+					log.Printf("[P2P Discovery] Querying Seed Node %s for Column %d Bootstrap...", seedInfo.ID, targetColStart)
+					ctxSeed, cancelSeed := context.WithTimeout(context.Background(), 5*time.Second)
+					if err := p2pHost.Connect(ctxSeed, *seedInfo); err == nil {
+						if stream, err := p2pHost.NewStream(ctxSeed, seedInfo.ID, p2pcommon.ProtoBootstrapRouting); err == nil {
+							req := p2pcommon.BootstrapRoutingRequest{
+								Peer: p2pcommon.PeerInfo{
+									PeerID:     pid.String(),
+									Multiaddrs: []string{myP2PAddr},
+									Row:        cfg.RowIdx,
+									Col:        cfg.ColIdx,
+								},
+								TargetCol: targetColStart,
+								TargetRow: cfg.RowIdx,
+							}
+							if err := json.NewEncoder(stream).Encode(req); err == nil {
+								var resp p2pcommon.BootstrapRoutingResponse
+								if err := json.NewDecoder(stream).Decode(&resp); err == nil {
+									for _, p := range resp.ColPeers {
+										if p.Row == -2 && p.Col == targetColStart && len(p.Multiaddrs) > 0 {
+											targetBootAddr = p.Multiaddrs[0]
+											log.Printf("[P2P Discovery] Discovered Column %d Bootstrap: %s", targetColStart, targetBootAddr)
+											break
+										}
+									}
+								}
+							}
+							stream.Close()
+						}
+					}
+					cancelSeed()
+				}
+			}
+		}
+	}
+
+	bootstrapMaddr, err := resolveToMultiaddr(targetBootAddr, targetBootPID)
+	if err != nil {
+		log.Fatalf("Invalid bootstrap multiaddr %s: %v", targetBootAddr, err)
+	}
+
+	bootInfo, err := peer.AddrInfoFromP2pAddr(bootstrapMaddr)
+	if err != nil {
+		log.Fatalf("Failed to parse bootstrap PeerInfo: %v", err)
+	}
 
 	registerAndSyncPeers := func() {
 		connCtx, connCancel := context.WithTimeout(ctx, 3*time.Second)
