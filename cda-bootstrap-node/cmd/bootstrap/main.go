@@ -8,8 +8,11 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,7 +24,9 @@ import (
 	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	bls12381kzg "github.com/consensys/gnark-crypto/ecc/bls12-381/kzg"
+	"github.com/libp2p/go-libp2p/core/peer"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/multiformats/go-multiaddr"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -31,6 +36,7 @@ func main() {
 	colID := flag.Int("col", 0, "override column index")
 	storeAddr := flag.String("store", "", "override store node address")
 	pubAddr := flag.String("publisher", "", "override publisher node address")
+	seedAddr := flag.String("seed", "", "override seed bootstrap address")
 	kVal := flag.Int("k", 0, "override K chunks parameter")
 	kPieceVal := flag.Int("k-piece", 0, "override K-piece parameter")
 	crashOnFail := flag.Bool("crash-on-fail", false, "Crash the node if verification fails")
@@ -62,6 +68,9 @@ func main() {
 	}
 	if *pubAddr != "" {
 		cfg.PublisherAddr = *pubAddr
+	}
+	if *seedAddr != "" {
+		cfg.SeedAddr = *seedAddr
 	}
 	if *kVal != 0 {
 		cfg.K = *kVal
@@ -154,6 +163,72 @@ func main() {
 
 	// Start P2P Receiver Stream Listeners
 	receiver.Start(ctx)
+
+	// Dynamic Peer Registration with Seed Bootstrap (if configured and not self)
+	if cfg.SeedAddr != "" && cfg.ColumnID != 0 {
+		_, seedPID, err := p2pcommon.GenerateDeterministicKeypair("cda-bootstrap-0")
+		if err == nil {
+			seedAddr := cfg.SeedAddr
+			if strings.HasPrefix(seedAddr, "http://") || strings.HasPrefix(seedAddr, "https://") {
+				u, err := url.Parse(seedAddr)
+				if err == nil {
+					hostStr := u.Hostname()
+					portStr := u.Port()
+					if portVal, err := strconv.Atoi(portStr); err == nil {
+						seedP2PPort := portVal + 10000
+						if hostStr == "localhost" || hostStr == "127.0.0.1" {
+							seedAddr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", seedP2PPort)
+						} else {
+							seedAddr = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, seedP2PPort)
+						}
+					}
+				}
+			}
+			seedAddrFull := fmt.Sprintf("%s/p2p/%s", seedAddr, seedPID.String())
+			seedMaddr, err := multiaddr.NewMultiaddr(seedAddrFull)
+			if err == nil {
+				seedInfo, err := peer.AddrInfoFromP2pAddr(seedMaddr)
+				if err == nil {
+					myP2PAddr := fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p2pPort)
+					go func() {
+						ticker := time.NewTicker(3 * time.Second)
+						defer ticker.Stop()
+						registerWithSeed := func() {
+							connCtx, connCancel := context.WithTimeout(ctx, 3*time.Second)
+							defer connCancel()
+							if err := p2pHost.Connect(connCtx, *seedInfo); err != nil {
+								return
+							}
+							stream, err := p2pHost.NewStream(connCtx, seedInfo.ID, p2pcommon.ProtoBootstrapRouting)
+							if err != nil {
+								return
+							}
+							defer stream.Close()
+							req := p2pcommon.BootstrapRoutingRequest{
+								Peer: p2pcommon.PeerInfo{
+									PeerID:     pid.String(),
+									Multiaddrs: []string{myP2PAddr},
+									Row:        -2, // Mark as Bootstrap Node for ColumnID
+									Col:        cfg.ColumnID,
+								},
+								TargetCol: cfg.ColumnID,
+							}
+							_ = json.NewEncoder(stream).Encode(req)
+						}
+						registerWithSeed()
+						for {
+							select {
+							case <-ticker.C:
+								registerWithSeed()
+							case <-ctx.Done():
+								return
+							}
+						}
+					}()
+				}
+			}
+		}
+	}
 
 	// Expose HTTP server for external queries (like /bootstrap/peers) on APIPort
 	mux := http.NewServeMux()
