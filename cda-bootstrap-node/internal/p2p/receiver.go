@@ -352,14 +352,41 @@ func (rcv *Receiver) handleRouting(stream network.Stream) {
 			continue // skip self
 		}
 		if isLightNode {
-			colPeers = append(colPeers, info)
-			rowPeers = append(rowPeers, info)
+			if req.TargetCol >= 0 {
+				if info.Col == req.TargetCol || (info.Row == -2 && info.Col == req.TargetCol) {
+					colPeers = append(colPeers, info)
+				}
+			} else {
+				colPeers = append(colPeers, info)
+			}
+			if req.TargetRow >= 0 {
+				if info.Row == req.TargetRow {
+					rowPeers = append(rowPeers, info)
+				}
+			} else {
+				rowPeers = append(rowPeers, info)
+			}
 		} else {
 			if info.Row == req.Peer.Row {
 				rowPeers = append(rowPeers, info)
 			}
 			if info.Col == req.Peer.Col {
 				colPeers = append(colPeers, info)
+			}
+		}
+	}
+
+	// If light node queried specific column/row but no exact match, return all active peers as fallback
+	if isLightNode && (len(colPeers) == 0 || len(rowPeers) == 0) {
+		for p, info := range rcv.activePeers {
+			if p == pid {
+				continue
+			}
+			if len(colPeers) == 0 {
+				colPeers = append(colPeers, info)
+			}
+			if len(rowPeers) == 0 {
+				rowPeers = append(rowPeers, info)
 			}
 		}
 	}

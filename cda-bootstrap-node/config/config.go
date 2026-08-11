@@ -10,6 +10,7 @@ type Config struct {
 	ColumnID      int    `json:"column_id"`
 	StoreNodeAddr string `json:"store_node_addr"`
 	PublisherAddr string `json:"publisher_addr"`
+	SeedAddr      string `json:"seed_addr"`
 	K             int    `json:"k"`
 	KPiece        int    `json:"k_piece"`
 	PruneEnable   bool   `json:"prune_enable"`
