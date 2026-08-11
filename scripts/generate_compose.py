@@ -144,7 +144,8 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
 def generate_prometheus_config(active_cols, stores_per_col, lights):
     os.makedirs('data', exist_ok=True)
     prometheus_yml = """global:
-  scrape_interval: 2s
+  scrape_interval: 1s
+  evaluation_interval: 1s
 
 scrape_configs:
   - job_name: 'publisher'
@@ -211,21 +212,38 @@ providers:
     with open('data/grafana/provisioning/dashboards/dashboard.yml', 'w') as f:
         f.write(dashboard_yml)
 
-    # 3. Premium Dashboard JSON
+    # Common graph styling for connected line plots with visible points
+    def line_graph_opts():
+        return {
+            "lines": True,
+            "linewidth": 2,
+            "points": True,
+            "pointradius": 3,
+            "nullPointMode": "connected",
+            "steppedLine": False,
+            "fill": 1,
+            "tooltip": {
+                "shared": True,
+                "sort": 2,
+                "value_type": "individual"
+            }
+        }
+
+    # 3. Premium High-Resolution Dashboard JSON
     dashboard_json = {
         "id": None,
         "title": "CDA Network Performance Dashboard",
-        "tags": ["cda", "production"],
+        "tags": ["cda", "production", "high-resolution"],
         "timezone": "browser",
         "schemaVersion": 26,
-        "refresh": "5s",
+        "refresh": "1s",
         "time": {
-            "from": "now-5m",
+            "from": "now-2m",
             "to": "now"
         },
         "timepicker": {
-            "refresh_intervals": ["1s", "5s", "10s", "30s", "1m"],
-            "time_options": ["5m", "15m", "1h", "6h", "12h", "24h"]
+            "refresh_intervals": ["1s", "2s", "5s", "10s", "30s", "1m"],
+            "time_options": ["1m", "2m", "5m", "15m", "1h", "6h", "12h", "24h"]
         },
         "panels": [
             {
@@ -295,7 +313,7 @@ providers:
                 "title": "Publisher Throughput",
                 "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
                 "targets": [
-                    {"expr": "sum(rate(cda_publisher_throughput_bytes_total[10s]))", "legendFormat": "Bytes/sec"}
+                    {"expr": "sum(rate(cda_publisher_throughput_bytes_total[5s]))", "legendFormat": "Bytes/sec"}
                 ],
                 "fieldConfig": {
                     "defaults": {
@@ -307,13 +325,14 @@ providers:
                 "type": "graph",
                 "title": "DAS Sampling Latency (95th vs Average)",
                 "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+                **line_graph_opts(),
                 "targets": [
                     {
-                        "expr": "histogram_quantile(0.95, sum(rate(cda_light_das_sample_latency_seconds_bucket[10s])) by (le))",
+                        "expr": "histogram_quantile(0.95, sum(rate(cda_light_das_sample_latency_seconds_bucket[5s])) by (le))",
                         "legendFormat": "95th Percentile Latency"
                     },
                     {
-                        "expr": "sum(rate(cda_light_das_sample_latency_seconds_sum[10s])) / sum(rate(cda_light_das_sample_latency_seconds_count[10s]))",
+                        "expr": "sum(rate(cda_light_das_sample_latency_seconds_sum[5s])) / sum(rate(cda_light_das_sample_latency_seconds_count[5s]))",
                         "legendFormat": "Average Latency"
                     }
                 ],
@@ -326,17 +345,18 @@ providers:
                 "type": "graph",
                 "title": "Node Encoding & Proof Durations",
                 "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+                **line_graph_opts(),
                 "targets": [
                     {
-                        "expr": "sum(rate(cda_publisher_rs_encode_duration_seconds_sum[10s])) / sum(rate(cda_publisher_rs_encode_duration_seconds_count[10s]))",
+                        "expr": "sum(rate(cda_publisher_rs_encode_duration_seconds_sum[5s])) / sum(rate(cda_publisher_rs_encode_duration_seconds_count[5s]))",
                         "legendFormat": "Publisher RS Encode (Avg)"
                     },
                     {
-                        "expr": "sum(rate(cda_bootstrap_kzg_proof_duration_seconds_sum[10s])) / sum(rate(cda_bootstrap_kzg_proof_duration_seconds_count[10s]))",
+                        "expr": "sum(rate(cda_bootstrap_kzg_proof_duration_seconds_sum[5s])) / sum(rate(cda_bootstrap_kzg_proof_duration_seconds_count[5s]))",
                         "legendFormat": "Bootstrap KZG Proof (Avg)"
                     },
                     {
-                        "expr": "sum(rate(cda_store_reconstruct_duration_seconds_sum[10s])) / sum(rate(cda_store_reconstruct_duration_seconds_count[10s]))",
+                        "expr": "sum(rate(cda_store_reconstruct_duration_seconds_sum[5s])) / sum(rate(cda_store_reconstruct_duration_seconds_count[5s]))",
                         "legendFormat": "Store Reconstruction (Avg)"
                     }
                 ],
@@ -349,6 +369,7 @@ providers:
                 "type": "graph",
                 "title": "Total Stored Pieces per Store Node (Custody + Recoded Non-Custody)",
                 "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+                **line_graph_opts(),
                 "targets": [
                     {
                         "expr": "cda_store_linear_independent_pieces_count",
@@ -364,6 +385,7 @@ providers:
                 "type": "graph",
                 "title": "Store Node Database Size on Disk (BadgerDB)",
                 "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+                **line_graph_opts(),
                 "targets": [
                     {
                         "expr": "cda_store_db_size_bytes",
@@ -411,6 +433,7 @@ providers:
                 "type": "graph",
                 "title": "Store Node Network Rates (P2P Queries & GossipSub Propagation)",
                 "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
+                **line_graph_opts(),
                 "targets": [
                     {
                         "expr": "sum(cda_store_p2p_request_rate)",
@@ -426,9 +449,10 @@ providers:
                 "type": "graph",
                 "title": "System CPU Usage (%)",
                 "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30},
+                **line_graph_opts(),
                 "targets": [
                     {
-                        "expr": "rate(process_cpu_seconds_total[10s]) * 100",
+                        "expr": "rate(process_cpu_seconds_total[5s]) * 100",
                         "legendFormat": "{{job}} ({{instance}})"
                     }
                 ]
@@ -437,6 +461,7 @@ providers:
                 "type": "graph",
                 "title": "System Memory Usage (MB)",
                 "gridPos": {"h": 8, "w": 12, "x": 12, "y": 30},
+                **line_graph_opts(),
                 "targets": [
                     {
                         "expr": "process_resident_memory_bytes / 1024 / 1024",

@@ -21,10 +21,10 @@ Tạo cấu hình Docker Compose giả lập với 8 cột mạng, 8 store node 
 bash scripts/cleanup.sh
 
 # Cách 1: Khởi động ĐẦY ĐỦ 8 Cột Mạng (Khuyến nghị để DAS toàn bộ ma trận ?all=true)
-python3 scripts/generate_compose.py --cols 8 --stores-per-col 8 --lights 1 --k 16 --k-piece 4 --prune-enable --prune-ttl 15s
+# python3 scripts/generate_compose.py --cols 8 --stores-per-col 8 --lights 1 --k 16 --k-piece 4 --prune-enable --prune-ttl 15s
 
 # Cách 2: Khởi động Rút Gọn 1 Cột Mạng (Tiết kiệm tài nguyên máy, chỉ test riêng Cột 0)
-# python3 scripts/generate_compose.py --cols 8 --active-cols 1 --stores-per-col 8 --lights 1 --k 16 --k-piece 4 --prune-enable --prune-ttl 15s
+python3 scripts/generate_compose.py --cols 8 --active-cols 1 --stores-per-col 8 --lights 1 --k 16 --k-piece 4 --prune-enable --prune-ttl 15s
 
 # Build và chạy mạng lưới trong nền
 docker compose -f docker-compose.json up -d --build
