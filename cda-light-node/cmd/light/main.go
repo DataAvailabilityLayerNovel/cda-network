@@ -138,7 +138,12 @@ func main() {
 	// 5. Initialize HTTP API Service
 	apiService := service.NewAPIService(cfg.PublisherAddr, cfg.BootstrapsMap, dasVerifier, cfg.CrashOnFail, p2pHost, ps, cfg.Port, cfg.NumCols)
 
-	// 6. Subscribe to Header GossipSub topic
+	// Start sequential DAS worker
+	if cfg.AutoDAS {
+		apiService.StartDASWorker(ctx, cfg.AutoDASSamples)
+	}
+
+	// 6. Subscribe to Header GossipSub topic (cache only — DAS is triggered by BlockReady signal)
 	topic, err := ps.Join(p2pcommon.TopicHeader)
 	if err != nil {
 		log.Fatalf("Failed to join header GossipSub topic: %v", err)
@@ -158,12 +163,35 @@ func main() {
 			var header service.BlockHeader
 			if err := json.Unmarshal(msg.Data, &header); err == nil {
 				apiService.CacheHeader(&header)
-				if cfg.AutoDAS {
-					go apiService.TriggerAutoDAS(&header, cfg.AutoDASSamples)
-				}
+				// NOTE: DAS is no longer triggered immediately on header.
+				// It will be triggered when a BlockReady signal arrives from store nodes.
 			}
 		}
 	}()
+
+	// 6b. Subscribe to BlockReady GossipSub topic — triggers sequential DAS
+	if cfg.AutoDAS {
+		blockReadyTopic, err := ps.Join(p2pcommon.TopicBlockReady)
+		if err != nil {
+			log.Fatalf("Failed to join block-ready GossipSub topic: %v", err)
+		}
+		blockReadySub, err := blockReadyTopic.Subscribe()
+		if err != nil {
+			log.Fatalf("Failed to subscribe to block-ready GossipSub topic: %v", err)
+		}
+		go func() {
+			for {
+				msg, err := blockReadySub.Next(ctx)
+				if err != nil {
+					return
+				}
+				var payload p2pcommon.GossipBlockReadyPayload
+				if err := json.Unmarshal(msg.Data, &payload); err == nil && payload.BlockID != "" {
+					apiService.EnqueueBlockReady(payload.BlockID)
+				}
+			}
+		}()
+	}
 
 	mux := http.NewServeMux()
 	apiService.RegisterHandlers(mux)

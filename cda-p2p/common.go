@@ -102,7 +102,8 @@ const (
 
 // GossipSub Topics
 const (
-	TopicHeader = "/cda/1.0.0/header"
+	TopicHeader     = "/cda/1.0.0/header"
+	TopicBlockReady = "/cda/1.0.0/block-ready"
 )
 
 // TopicCol returns GossipSub column topic name
@@ -198,4 +199,10 @@ type GossipAnchorPayload struct {
 	ColIdx       int                     `json:"col_idx"`
 	PieceCommits []string                `json:"piece_commits"`
 	MerkleProofs []SerializedMerkleProof `json:"merkle_proofs"`
+}
+
+// GossipBlockReadyPayload signals that a store node has finished seeding all its custody cells for a block
+type GossipBlockReadyPayload struct {
+	BlockID string `json:"block_id"`
+	Height  int    `json:"height"`
 }

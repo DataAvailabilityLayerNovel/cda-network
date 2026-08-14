@@ -1,11 +1,15 @@
 {
   "api_port": 8080,
-  "k": 16,
-  "k_piece": 4,
+  "k": 32,
+  "k_piece": 8,
   "bootstrap_peers": {
     "0": "/dns4/bootstrap-0/tcp/19200",
     "1": "/dns4/bootstrap-0/tcp/19200",
     "2": "/dns4/bootstrap-0/tcp/19200",
-    "3": "/dns4/bootstrap-0/tcp/19200"
+    "3": "/dns4/bootstrap-0/tcp/19200",
+    "4": "/dns4/bootstrap-0/tcp/19200",
+    "5": "/dns4/bootstrap-0/tcp/19200",
+    "6": "/dns4/bootstrap-0/tcp/19200",
+    "7": "/dns4/bootstrap-0/tcp/19200"
   }
 }

@@ -161,6 +161,29 @@ func main() {
 		}
 	}()
 
+	// Subscribe to TopicBlockReady so this bootstrap node participates in the mesh,
+	// acting as a relay between store nodes (publishers) and light nodes (subscribers).
+	blockReadyTopic, err := ps.Join(p2pcommon.TopicBlockReady)
+	if err != nil {
+		log.Fatalf("Failed to join block-ready topic: %v", err)
+	}
+	blockReadySub, err := blockReadyTopic.Subscribe()
+	if err != nil {
+		log.Fatalf("Failed to subscribe to block-ready topic: %v", err)
+	}
+	go func() {
+		for {
+			msg, err := blockReadySub.Next(ctx)
+			if err != nil {
+				return
+			}
+			var payload p2pcommon.GossipBlockReadyPayload
+			if err := json.Unmarshal(msg.Data, &payload); err == nil {
+				log.Printf("[GossipSub] Bootstrap relayed BlockReady for block %s (height %d) from %s", payload.BlockID, payload.Height, msg.ReceivedFrom)
+			}
+		}
+	}()
+
 	// Start P2P Receiver Stream Listeners
 	receiver.Start(ctx)
 

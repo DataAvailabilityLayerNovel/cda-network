@@ -67,6 +67,9 @@ type Receiver struct {
 	// Block completion file logging
 	completedMu     sync.Mutex
 	completedBlocks map[string]bool
+
+	// Sequential block processing queue
+	taskChan chan func()
 }
 
 func NewReceiver(
@@ -108,6 +111,7 @@ func NewReceiver(
 		cellLastActivity:  make(map[string]time.Time),
 		prunedCells:       make(map[string]bool),
 		completedBlocks:   make(map[string]bool),
+		taskChan:          make(chan func(), 20000),
 	}
 }
 
@@ -128,6 +132,8 @@ func (rcv *Receiver) SetPeers(rowPeers, colPeers []p2pcommon.PeerInfo) {
 }
 
 func (rcv *Receiver) Start(ctx context.Context) {
+	// Start sequential task worker
+	go rcv.workerLoop(ctx)
 	StartMetricsTicker(ctx)
 	LinearIndependentPiecesCount.Set(float64(rcv.totalStoredPieces))
 
@@ -200,9 +206,29 @@ func (rcv *Receiver) Start(ctx context.Context) {
 				if msg.ReceivedFrom == rcv.host.ID() {
 					continue // skip self
 				}
-				rcv.processGossipMessage(msg.Data)
+				data := msg.Data
+				select {
+				case rcv.taskChan <- func() { rcv.processGossipMessage(data) }:
+				default:
+					log.Printf("[StoreNode] taskChan full, dropping gossip message")
+				}
 			}
 		}(sub)
+	}
+}
+
+// workerLoop drains taskChan sequentially — one task at a time.
+func (rcv *Receiver) workerLoop(ctx context.Context) {
+	for {
+		select {
+		case task, ok := <-rcv.taskChan:
+			if !ok {
+				return
+			}
+			task()
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -854,8 +880,16 @@ func (rcv *Receiver) CheckAndLogCompletion(blockID string) {
 				log.Printf("[Height: %d] [StoreNode] Warning: failed to write completion log: %v", height, err)
 			}
 		}
+
+		// Broadcast BlockReady so light nodes can start DAS immediately
+		if rcv.broadcaster != nil {
+			if err := rcv.broadcaster.BroadcastBlockReady(blockID, height); err != nil {
+				log.Printf("[Height: %d] [StoreNode] Warning: failed to broadcast block-ready signal: %v", height, err)
+			}
+		}
 	}
 }
+
 
 func (rcv *Receiver) respondWithError(stream network.Stream, errMsg string) {
 	json.NewEncoder(stream).Encode(struct {

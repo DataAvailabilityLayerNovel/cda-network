@@ -52,6 +52,11 @@ type APIService struct {
 
 	waitingHeadersMu sync.Mutex
 	waitingHeaders   map[string]chan struct{}
+
+	// Sequential DAS queue: block IDs are enqueued when BlockReady signal is received
+	dasQueue       chan string
+	dasTriggeredMu sync.Mutex
+	dasTriggered   map[string]bool
 }
 
 type BlockHeader struct {
@@ -88,7 +93,7 @@ func NewAPIService(
 	if numCols <= 0 {
 		numCols = 8
 	}
-	return &APIService{
+	svc := &APIService{
 		publisherAddr:  publisherAddr,
 		bootstrapsMap:  bootstrapsMap,
 		numCols:        numCols,
@@ -100,7 +105,10 @@ func NewAPIService(
 		routingCache:   make(map[int]cachedRoutingInfo),
 		port:           port,
 		waitingHeaders: make(map[string]chan struct{}),
+		dasQueue:       make(chan string, 1024),
+		dasTriggered:   make(map[string]bool),
 	}
+	return svc
 }
 
 func (s *APIService) CacheHeader(header *BlockHeader) {
@@ -118,6 +126,65 @@ func (s *APIService) CacheHeader(header *BlockHeader) {
 		delete(s.waitingHeaders, header.BlockID)
 	}
 	s.waitingHeadersMu.Unlock()
+}
+
+// StartDASWorker starts the sequential DAS queue worker. Call once after construction.
+func (s *APIService) StartDASWorker(ctx context.Context, numRandomSamples int) {
+	go s.dasWorkerLoop(ctx, numRandomSamples)
+}
+
+// dasWorkerLoop processes DAS tasks sequentially, one block at a time.
+func (s *APIService) dasWorkerLoop(ctx context.Context, numRandomSamples int) {
+	for {
+		select {
+		case blockID, ok := <-s.dasQueue:
+			if !ok {
+				return
+			}
+			// Wait for header availability with a bounded timeout
+			header := s.waitForHeader(blockID, 30*time.Second)
+			if header == nil {
+				log.Printf("[Auto-DAS] [LightNode] Header not available for block %s after timeout, skipping DAS", blockID)
+				continue
+			}
+			s.TriggerAutoDAS(header, numRandomSamples)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// waitForHeader waits until the header for blockID is cached or the deadline is reached.
+func (s *APIService) waitForHeader(blockID string, timeout time.Duration) *BlockHeader {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		s.headersMu.RLock()
+		h := s.headers[blockID]
+		s.headersMu.RUnlock()
+		if h != nil {
+			return h
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return nil
+}
+
+// EnqueueBlockReady is called when a BlockReady GossipSub signal is received.
+// It enqueues the block ID for sequential DAS, deduplicating by block ID.
+func (s *APIService) EnqueueBlockReady(blockID string) {
+	s.dasTriggeredMu.Lock()
+	defer s.dasTriggeredMu.Unlock()
+	if s.dasTriggered[blockID] {
+		return
+	}
+	s.dasTriggered[blockID] = true
+	height := p2pcommon.ParseHeightFromBlockID(blockID)
+	log.Printf("[Auto-DAS] [Height: %d] [LightNode] BlockReady signal received for %s — enqueuing for DAS", height, blockID)
+	select {
+	case s.dasQueue <- blockID:
+	default:
+		log.Printf("[Auto-DAS] [LightNode] DAS queue full, dropping block %s", blockID)
+	}
 }
 
 // TriggerAutoDAS executes Data Availability Sampling automatically when a BlockHeader is received via GossipSub.

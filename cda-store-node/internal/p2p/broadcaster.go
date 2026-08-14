@@ -101,3 +101,30 @@ func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece 
 	log.Printf("[GossipSub] Successfully gossiped recoded piece for cell [%d, %d] to topic %s", row, col, topicName)
 	return nil
 }
+
+// BroadcastBlockReady publishes a BlockReady signal so light nodes can start DAS
+func (b *Broadcaster) BroadcastBlockReady(blockID string, height int) error {
+	payload := p2pcommon.GossipBlockReadyPayload{
+		BlockID: blockID,
+		Height:  height,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal block-ready payload: %w", err)
+	}
+
+	topic, err := b.JoinTopic(p2pcommon.TopicBlockReady)
+	if err != nil {
+		return fmt.Errorf("failed to join topic %s: %w", p2pcommon.TopicBlockReady, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := topic.Publish(ctx, data); err != nil {
+		return fmt.Errorf("failed to publish block-ready: %w", err)
+	}
+
+	log.Printf("[GossipSub] BlockReady signal broadcasted for block %s (height %d)", blockID, height)
+	return nil
+}
