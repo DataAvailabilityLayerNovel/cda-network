@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +30,46 @@ import (
 	"github.com/multiformats/go-multiaddr"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// blockReadyHub fans out BlockReady events to SSE subscribers.
+type blockReadyHub struct {
+	mu          sync.Mutex
+	subscribers map[chan p2pcommon.GossipBlockReadyPayload]struct{}
+	latest      *p2pcommon.GossipBlockReadyPayload
+}
+
+func newBlockReadyHub() *blockReadyHub {
+	return &blockReadyHub{
+		subscribers: make(map[chan p2pcommon.GossipBlockReadyPayload]struct{}),
+	}
+}
+
+func (h *blockReadyHub) subscribe() chan p2pcommon.GossipBlockReadyPayload {
+	ch := make(chan p2pcommon.GossipBlockReadyPayload, 8)
+	h.mu.Lock()
+	h.subscribers[ch] = struct{}{}
+	h.mu.Unlock()
+	return ch
+}
+
+func (h *blockReadyHub) unsubscribe(ch chan p2pcommon.GossipBlockReadyPayload) {
+	h.mu.Lock()
+	delete(h.subscribers, ch)
+	h.mu.Unlock()
+}
+
+func (h *blockReadyHub) broadcast(payload p2pcommon.GossipBlockReadyPayload) {
+	h.mu.Lock()
+	copy := payload
+	h.latest = &copy
+	for ch := range h.subscribers {
+		select {
+		case ch <- payload:
+		default: // slow subscriber: skip
+		}
+	}
+	h.mu.Unlock()
+}
 
 func main() {
 	configPath := flag.String("config", "", "path to json config file")
@@ -141,6 +182,9 @@ func main() {
 	}
 	receiver := p2p.NewReceiver(p2pHost, kzg, cfg.PublisherAddr, cfg.KPiece, cache, proofGen, encoder, broadcaster, *crashOnFail, cfg.ColumnID, cfg.PruneEnable, parsedTTL)
 
+	// Hub fans BlockReady GossipSub events out to HTTP SSE subscribers
+	hub := newBlockReadyHub()
+
 	// Subscribe to TopicHeader so this bootstrap node acts as a GossipSub relay
 	// for block headers between the publisher and light/store nodes.
 	headerTopic, err := ps.Join(p2pcommon.TopicHeader)
@@ -180,6 +224,7 @@ func main() {
 			var payload p2pcommon.GossipBlockReadyPayload
 			if err := json.Unmarshal(msg.Data, &payload); err == nil {
 				log.Printf("[GossipSub] Bootstrap relayed BlockReady for block %s (height %d) from %s", payload.BlockID, payload.Height, msg.ReceivedFrom)
+				hub.broadcast(payload)
 			}
 		}
 	}()
@@ -267,6 +312,60 @@ func main() {
 		w.Write([]byte("healthy"))
 	})
 	mux.Handle("/metrics", promhttp.Handler())
+
+	// GET /block-ready/latest — returns the most recent BlockReady payload (JSON)
+	mux.HandleFunc("/block-ready/latest", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		hub.mu.Lock()
+		latest := hub.latest
+		hub.mu.Unlock()
+		if latest == nil {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		json.NewEncoder(w).Encode(latest)
+	})
+
+	// GET /events/block-ready — SSE stream, one event per BlockReady signal
+	mux.HandleFunc("/events/block-ready", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "SSE not supported", http.StatusInternalServerError)
+			return
+		}
+
+		ch := hub.subscribe()
+		defer hub.unsubscribe(ch)
+
+		// Send any already-received latest event immediately
+		hub.mu.Lock()
+		latest := hub.latest
+		hub.mu.Unlock()
+		if latest != nil {
+			data, _ := json.Marshal(latest)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+
+		for {
+			select {
+			case payload, ok := <-ch:
+				if !ok {
+					return
+				}
+				data, _ := json.Marshal(payload)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			case <-r.Context().Done():
+				return
+			}
+		}
+	})
 
 	go func() {
 		log.Printf("HTTP Registry Service listening on :%d...", cfg.APIPort)

@@ -881,11 +881,17 @@ func (rcv *Receiver) CheckAndLogCompletion(blockID string) {
 			}
 		}
 
-		// Broadcast BlockReady so light nodes can start DAS immediately
+		// Broadcast BlockReady so light nodes can start DAS.
+		// Retry for up to 30 seconds in case the GossipSub mesh hasn't formed yet.
 		if rcv.broadcaster != nil {
-			if err := rcv.broadcaster.BroadcastBlockReady(blockID, height); err != nil {
-				log.Printf("[Height: %d] [StoreNode] Warning: failed to broadcast block-ready signal: %v", height, err)
-			}
+			go func(bID string, h int) {
+				for attempt := 1; attempt <= 10; attempt++ {
+					if err := rcv.broadcaster.BroadcastBlockReady(bID, h); err != nil {
+						log.Printf("[Height: %d] [StoreNode] Warning: failed to broadcast block-ready (attempt %d): %v", h, attempt, err)
+					}
+					time.Sleep(3 * time.Second)
+				}
+			}(blockID, height)
 		}
 	}
 }

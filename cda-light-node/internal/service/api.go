@@ -205,42 +205,46 @@ func (s *APIService) TriggerAutoDAS(header *BlockHeader, numRandomSamples int) {
 		colsPerNetCol = 1
 	}
 
-	var targetCells [][2]int
-	if numRandomSamples <= 0 {
-		// Sample ALL active cells across configured columns
-		for rIdx := 0; rIdx < n; rIdx++ {
-			for cIdx := 0; cIdx < n; cIdx++ {
-				netColIdx := cIdx / colsPerNetCol
-				if _, active := s.bootstrapsMap[netColIdx]; active {
-					targetCells = append(targetCells, [2]int{rIdx, cIdx})
-				}
-			}
-		}
-	} else {
-		// Sample N random cells across active columns
-		var activeCols []int
+	// Build the complete pool of cells belonging to active columns
+	var allActiveCells [][2]int
+	for rIdx := 0; rIdx < n; rIdx++ {
 		for cIdx := 0; cIdx < n; cIdx++ {
 			netColIdx := cIdx / colsPerNetCol
 			if _, active := s.bootstrapsMap[netColIdx]; active {
-				activeCols = append(activeCols, cIdx)
+				allActiveCells = append(allActiveCells, [2]int{rIdx, cIdx})
 			}
 		}
-		if len(activeCols) == 0 {
-			return
-		}
-		for i := 0; i < numRandomSamples; i++ {
-			row := rand.Intn(n)
-			col := activeCols[rand.Intn(len(activeCols))]
-			targetCells = append(targetCells, [2]int{row, col})
-		}
 	}
-
-	if len(targetCells) == 0 {
+	if len(allActiveCells) == 0 {
 		return
 	}
 
-	log.Printf("[Auto-DAS] [Height: %d] 🚀 Reactive Event: Received Header for %s via GossipSub. Automatically sampling %d cells...",
-		height, blockID, len(targetCells))
+	totalCells := len(allActiveCells)
+
+	// Determine how many cells to sample
+	sampleCount := numRandomSamples
+	if sampleCount <= 0 {
+		// Default: sample 25% of all active cells
+		sampleCount = totalCells / 4
+		if sampleCount < 1 {
+			sampleCount = 1
+		}
+	}
+	if sampleCount > totalCells {
+		sampleCount = totalCells
+	}
+
+	// Fisher-Yates partial shuffle to pick sampleCount unique cells
+	pool := make([][2]int, totalCells)
+	copy(pool, allActiveCells)
+	for i := 0; i < sampleCount; i++ {
+		j := i + rand.Intn(totalCells-i)
+		pool[i], pool[j] = pool[j], pool[i]
+	}
+	targetCells := pool[:sampleCount]
+
+	log.Printf("[Auto-DAS] [Height: %d] 🚀 BlockReady triggered DAS for %s — sampling %d/%d active cells (%.0f%%)...",
+		height, blockID, sampleCount, totalCells, float64(sampleCount)/float64(totalCells)*100)
 	startTime := time.Now()
 
 	results := make([]SampleResult, len(targetCells))
@@ -267,13 +271,20 @@ func (s *APIService) TriggerAutoDAS(header *BlockHeader, numRandomSamples int) {
 
 	duration := time.Since(startTime)
 	if verifiedCount == len(results) {
-		log.Printf("[Auto-DAS] [Height: %d] ✅ 100%% DAS VERIFIED for %s (%d/%d cells verified in %v)",
+		log.Printf("[Auto-DAS] [Height: %d] ✅ DAS VERIFIED for %s (%d/%d sampled cells verified in %v)",
 			height, blockID, verifiedCount, len(results), duration)
 	} else {
-		log.Printf("[Auto-DAS] [Height: %d] ⚠️ DAS Completed with partial verification for %s (%d/%d verified in %v)",
-			height, blockID, verifiedCount, len(results), duration)
+		failedCells := []string{}
+		for _, res := range results {
+			if !res.Verified && len(failedCells) < 5 {
+				failedCells = append(failedCells, res.Error)
+			}
+		}
+		log.Printf("[Auto-DAS] [Height: %d] ⚠️ DAS Partial for %s (%d/%d verified in %v). First failures: %v",
+			height, blockID, verifiedCount, len(results), duration, failedCells)
 	}
 }
+
 
 func (s *APIService) RegisterHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/das/sample/", s.handleDASSample)
