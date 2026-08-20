@@ -27,7 +27,6 @@ type APIService struct {
 	ps                    *pubsub.PubSub
 	headerTopic           *pubsub.Topic
 	storeReadyTopic       *pubsub.Topic
-	columnReadyTopic      *pubsub.Topic
 	blockReadyTopic       *pubsub.Topic
 	db                    *badger.DB
 	sequencerPubKey       string
@@ -96,18 +95,6 @@ func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.Pub
 				go svc.listenStoreReady(storeSub)
 			} else {
 				log.Printf("[Publisher] Warning: Failed to subscribe to store-ready topic: %v", errSub)
-			}
-		}
-
-		svc.columnReadyTopic, err = ps.Join(p2pcommon.TopicColumnReady)
-		if err != nil {
-			log.Printf("[Publisher] Warning: Failed to join GossipSub column-ready topic: %v", err)
-		} else {
-			colSub, errSub := svc.columnReadyTopic.Subscribe()
-			if errSub == nil {
-				go svc.listenColumnReady(colSub)
-			} else {
-				log.Printf("[Publisher] Warning: Failed to subscribe to column-ready topic: %v", errSub)
 			}
 		}
 
@@ -224,67 +211,6 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 	s.colReadyMu.Unlock()
 }
 
-func (s *APIService) listenColumnReady(sub *pubsub.Subscription) {
-	ctx := context.Background()
-	for {
-		msg, err := sub.Next(ctx)
-		if err != nil {
-			return
-		}
-		var payload p2pcommon.GossipColumnReadyPayload
-		if err := json.Unmarshal(msg.Data, &payload); err == nil && payload.BlockID != "" {
-			s.handleColumnReady(payload)
-		}
-	}
-}
-
-func (s *APIService) handleColumnReady(payload p2pcommon.GossipColumnReadyPayload) {
-	s.colReadyMu.Lock()
-	if s.columnReadyMap == nil {
-		s.columnReadyMap = make(map[string]map[int]bool)
-	}
-	if s.blockReadyEmitted == nil {
-		s.blockReadyEmitted = make(map[string]bool)
-	}
-
-	blockID := payload.BlockID
-	if s.blockReadyEmitted[blockID] {
-		s.colReadyMu.Unlock()
-		return
-	}
-
-	colIdx := payload.ColIdx
-	if !s.isNetColActive(colIdx) {
-		s.colReadyMu.Unlock()
-		return
-	}
-	height := payload.Height
-	if height <= 0 {
-		height = p2pcommon.ParseHeightFromBlockID(blockID)
-	}
-
-	if s.columnReadyMap[blockID] == nil {
-		s.columnReadyMap[blockID] = make(map[int]bool)
-	}
-	// Note: StoreReady handles multi-store aggregation. ColumnReady marks network column ready.
-	s.columnReadyMap[blockID][colIdx] = true
-	readyCount := len(s.columnReadyMap[blockID])
-
-	expectedCols := s.activeCols
-	if expectedCols <= 0 {
-		expectedCols = 8
-	}
-
-	if readyCount >= expectedCols && !s.blockReadyEmitted[blockID] {
-		s.blockReadyEmitted[blockID] = true
-		s.colReadyMu.Unlock()
-
-		s.broadcastBlockReady(blockID, height, expectedCols)
-		return
-	}
-	s.colReadyMu.Unlock()
-}
-
 func (s *APIService) broadcastBlockReady(blockID string, height int, activeCols int) {
 	s.colReadyMu.Lock()
 	if height > s.latestCompletedHeight {
@@ -314,7 +240,7 @@ func (s *APIService) broadcastBlockReady(blockID string, height int, activeCols 
 	if err := s.blockReadyTopic.Publish(ctx, data); err != nil {
 		log.Printf("[Publisher] Warning: Failed to publish block-ready for %s: %v", blockID, err)
 	} else {
-		log.Printf("[Height: %d] [Publisher] 🎉 ALL %d active columns report ColumnReady for block %s — Broadcasted BlockReady signal to Light Nodes!",
+		log.Printf("[Height: %d] [Publisher] 🎉 ALL %d active columns (100%% store nodes) complete for block %s — Broadcasted BlockReady signal to Light Nodes!",
 			height, activeCols, blockID)
 	}
 }

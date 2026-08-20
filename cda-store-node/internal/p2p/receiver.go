@@ -881,12 +881,11 @@ func (rcv *Receiver) CheckAndLogCompletion(blockID string) {
 			}
 		}
 
-		// Broadcast StoreReady (and ColumnReady) so the Publisher node can aggregate custody completion across all store nodes.
+		// Broadcast StoreReady so the Publisher node can aggregate custody completion across all store nodes.
 		if rcv.broadcaster != nil {
 			go func(bID string, h int, col int, row int, stores int) {
 				for attempt := 1; attempt <= 5; attempt++ {
 					_ = rcv.broadcaster.BroadcastStoreReady(bID, h, col, row, stores)
-					_ = rcv.broadcaster.BroadcastColumnReady(bID, h, col)
 					time.Sleep(2 * time.Second)
 				}
 			}(blockID, height, rcv.colIdx, rcv.rowIdx, rcv.storesPerCol)

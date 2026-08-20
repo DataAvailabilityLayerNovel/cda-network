@@ -102,10 +102,9 @@ const (
 
 // GossipSub Topics
 const (
-	TopicHeader      = "/cda/1.0.0/header"
-	TopicStoreReady  = "/cda/1.0.0/store-ready"
-	TopicColumnReady = "/cda/1.0.0/column-ready"
-	TopicBlockReady  = "/cda/1.0.0/block-ready"
+	TopicHeader     = "/cda/1.0.0/header"
+	TopicStoreReady = "/cda/1.0.0/store-ready"
+	TopicBlockReady = "/cda/1.0.0/block-ready"
 )
 
 // TopicCol returns GossipSub column topic name
@@ -211,13 +210,6 @@ type GossipStoreReadyPayload struct {
 	ColIdx       int    `json:"col_idx"`
 	RowIdx       int    `json:"row_idx"`
 	StoresPerCol int    `json:"stores_per_col"`
-}
-
-// GossipColumnReadyPayload signals that a column network has completed storing its custody cells for a block
-type GossipColumnReadyPayload struct {
-	BlockID string `json:"block_id"`
-	Height  int    `json:"height"`
-	ColIdx  int    `json:"col_idx"`
 }
 
 // GossipBlockReadyPayload signals that all active columns are ready and light nodes can start DAS

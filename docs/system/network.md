@@ -172,9 +172,59 @@ Khi một Node mới $P_{\text{new}}$ khởi chạy:
 | Giao thức / Topic | Dạng giao tiếp | Bên gửi $\rightarrow$ Bên nhận | Dữ liệu luân chuyển |
 | --- | --- | --- | --- |
 | `/cda/1.0.0/header` | **PubSub** | Publisher $\rightarrow$ Toàn mạng | `BlockHeader` Protobuf ($\approx 13\text{ KB}$) |
+| `/cda/1.0.0/store-ready` | **PubSub** | Store Node $\rightarrow$ Bootstrap Relay $\rightarrow$ Publisher | `GossipStoreReadyPayload` (Hoàn thành Custody Node $Row$) |
+| `/cda/1.0.0/block-ready` | **PubSub** | Publisher $\rightarrow$ Bootstrap Relay $\rightarrow$ Light Nodes | `GossipBlockReadyPayload` (Xác nhận 100% Block sẵn sàng cho DAS) |
 | `/cda/1.0.0/col/{c}` | **PubSub** | Bootstrap / Store $\rightarrow$ Store Nodes Cột $c$ | Tập $C_j$ + Merkle Proof (Phase 1), Mảnh RLNC Recoded (Phase 2) |
 | `/cda/1.0.0/row/{r}` | **PubSub** | Nodes Hàng $r \leftrightarrow$ Nodes Hàng $r$ | Discovery, Heartbeat, Đồng bộ trạng thái Hàng |
 | `/cda/publisher/push-chunk/1.0.0` | **P2P Stream** | Publisher $\rightarrow$ Bootstrap Node | Chunk dữ liệu thô Cột $c$, $C_j$, Merkle Proof |
 | `/cda/bootstrap/seed-cell/1.0.0` | **P2P Stream** | Bootstrap Node $\rightarrow$ Store Node | $m_{\text{min}} = 3$ Mảnh RLNC hạt giống $(d_i, g_i, P_i)$ |
 | `/cda/store/fetch-pieces/1.0.0` | **P2P Stream** | Store Node $\leftrightarrow$ Store Node | Request/Response kéo mảnh độc lập (chứa cờ `is_remote_hop`) |
 | `/cda/store/get-cell-pieces/1.0.0` | **P2P Stream** | Light Node $\rightarrow$ Store Node | Truy vấn DAS rút mẫu ô $[r_1, c_1]$ |
+
+---
+
+## VI. KIẾN TRÚC TỔNG HỢP TÍN HIỆU HOÀN THÀNH & CỔNG KIỂM SOÁT TUẦN TỰ (PUBLISHER GATE)
+
+```text
+========================================================================================================================
+                      LUỒNG TÍN HIỆU XÁC NHẬN HOÀN THÀNH VÀ ĐỒNG BỘ TUẦN TỰ KHỐI (BLOCK SEQUENTIALITY)
+========================================================================================================================
+
+ [ STORE NODES (Custody Rows r) ]
+        │
+        ├── (1) Custody Complete (IsComplete) ──► Broadcast `/cda/1.0.0/store-ready`
+        │                                         Payload: {BlockID, NetColIdx, RowIdx, StoresPerCol}
+        │
+ [ BOOTSTRAP RELAY LAYER ] 
+        │
+        ├── (2) Relay GossipSub Mesh ───────────► [ PUBLISHER NODE (Aggregator & Gate) ]
+        │                                         ├── 1. Filter: Bỏ qua cột non-active (netColNumber >= activeCols)
+        │                                         ├── 2. Multi-Store Aggregator:
+        │                                         │      Cột NetColIdx hoàn thành 100% ⇔ len(rows) == StoresPerCol
+        │                                         ├── 3. Block Complete Check:
+        │                                         │      Block Complete ⇔ len(completedNetCols) == activeCols
+        │                                         └── 4. Broadcast `/cda/1.0.0/block-ready`
+        │                                                                │
+        ├── (3) Relay BlockReady Broadcast ──────────────────────────────┼──────────────────────────┐
+        │                                                                ▼                          ▼
+ [ LIGHT NODES (Verifier) ] ◄────────────────────────────────────────────┘                [ PUBLISHER QUEUE ]
+ └── Nhận BlockReady ──► Kích hoạt Auto-DAS Sampling                                      └── Giải phóng Block H+1!
+========================================================================================================================
+```
+
+### 1. Bộ lọc Cột Active (Active Column Filter) tại Publisher
+* Publisher tính chỉ số cột mạng: $\text{netColNumber} = \text{netColIdx} / \text{colsPerNetCol}$.
+* Tín hiệu từ các cột non-active ($\text{netColNumber} \ge \text{activeCols}$) bị hủy bỏ hoàn toàn, đảm bảo Publisher chỉ chờ đúng $A = \text{activeCols}$ cột active cần thiết.
+
+### 2. Tổng hợp Đa Node Custody (Multi-Store Aggregation)
+* Cột mạng $\text{netColIdx}$ được coi là hoàn thành 100% khi và chỉ khi **tất cả $S = \text{storesPerCol}$ Store Nodes** (đủ mọi `RowIdx` từ $0 \dots S-1$) báo hoàn thành:
+$$\text{len}(\text{storeReadyMap}[\text{BlockID}][\text{NetColIdx}]) == \text{storesPerCol}$$
+* Khối `BlockID` được coi là hoàn thành 100% khi tất cả $A$ cột mạng active đạt trạng thái hoàn thành:
+$$\text{len}(\text{columnReadyMap}[\text{BlockID}]) == \text{activeCols}$$
+
+### 3. Cổng Kiểm soát Tuần tự Khối (Sequential Completion Gate)
+* Trực tiếp kiểm soát tại API `/publish` của Publisher Node:
+  * Khi yêu cầu gửi Block $H$ tới: Nếu Block $H-1$ chưa hoàn thành (`latestCompletedHeight < H - 1`), hàm `handlePublish` cho Block $H$ đi vào trạng thái **CHỜ (BLOCK)** trên `publishCond.Wait()`.
+  * Ngay khi Block $H-1$ đạt 100% active columns ready và phát `BlockReady`, Publisher cập nhật `latestCompletedHeight = H - 1` và giải phóng `publishCond.Broadcast()`.
+  * Block $H$ được tháo khóa và mới bắt đầu được mã hóa và đẩy vào mạng.
+* **Đảm bảo tuyệt đối**: Không xảy ra hiện tượng chồng chéo xử lý khối (block overlap) ở bất kỳ quy mô ma trận nào ($K=16, 32, 64$).

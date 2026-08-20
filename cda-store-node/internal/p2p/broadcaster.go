@@ -132,31 +132,3 @@ func (b *Broadcaster) BroadcastStoreReady(blockID string, height int, colIdx int
 	log.Printf("[GossipSub] StoreReady signal broadcasted for Col %d, Row %d (StoresPerCol=%d), block %s (height %d)", colIdx, rowIdx, storesPerCol, blockID, height)
 	return nil
 }
-
-// BroadcastColumnReady publishes a ColumnReady signal so the publisher can aggregate column readiness
-func (b *Broadcaster) BroadcastColumnReady(blockID string, height int, colIdx int) error {
-	payload := p2pcommon.GossipColumnReadyPayload{
-		BlockID: blockID,
-		Height:  height,
-		ColIdx:  colIdx,
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal column-ready payload: %w", err)
-	}
-
-	topic, err := b.JoinTopic(p2pcommon.TopicColumnReady)
-	if err != nil {
-		return fmt.Errorf("failed to join topic %s: %w", p2pcommon.TopicColumnReady, err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := topic.Publish(ctx, data); err != nil {
-		return fmt.Errorf("failed to publish column-ready: %w", err)
-	}
-
-	log.Printf("[GossipSub] ColumnReady signal broadcasted for Column %d, block %s (height %d)", colIdx, blockID, height)
-	return nil
-}

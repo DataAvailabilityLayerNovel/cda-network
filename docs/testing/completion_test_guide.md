@@ -30,16 +30,17 @@ python3 scripts/generate_compose.py --cols 8 --active-cols 1 --stores-per-col 8 
 docker compose -f docker-compose.json up -d --build
 ```
 
-### Bước 2: Chạy Bot đẩy dữ liệu liên tục
-Chạy bot đẩy dữ liệu để xuất bản 3 block với thời gian dãn cách là 10 giây:
+### Bước 2: Chạy Bot đẩy dữ liệu Event-Driven
+Chạy bot đẩy dữ liệu event-driven để xuất bản 3 block (bot tự động chờ tín hiệu `BlockReady` từ Publisher/Bootstrap trước khi đẩy block tiếp theo):
 
 ```bash
-python3 scripts/block_publisher_bot.py --interval 10 --k 16 --count 3 --start-height 1
+python3 scripts/block_publisher_bot.py --interval 0 --k 16 --count 3 --start-height 1
 ```
 
-### Bước 2.5: Cơ Chế Reactive Auto-DAS (Tự Động Kích Hoạt Ngay Khi Nhận Header)
-Light Node hiện đã được tích hợp cơ chế **Reactive Auto-DAS theo sự kiện**:
-- Ngay khi Publisher phát sóng `BlockHeader` mới qua kênh GossipSub `/cda/1.0.0/header`, Light Node **tự động kích hoạt luồng lấy mẫu DAS ngay lập tức** cho toàn bộ các cột active mà không cần chạy bất kỳ bot thăm dò tuần tự bên ngoài nào.
+### Bước 2.5: Cơ Chế Reactive Auto-DAS dựa trên Tín hiệu BlockReady
+Light Node hiện được tích hợp cơ chế **Auto-DAS theo sự kiện `BlockReady`**:
+- Khi tất cả $S = \text{storesPerCol}$ Store Node trong toàn bộ các cột active hoàn thành 100% custody, Publisher phát tín hiệu **`BlockReady`** trên kênh GossipSub `/cda/1.0.0/block-ready` (Bootstrap Node làm relay).
+- Light Node nhận tín hiệu `BlockReady` và **tự động kích hoạt luồng lấy mẫu DAS ngay lập tức** cho block đó.
 - Toàn bộ kết quả xác thực đại số được tự động ghi nhận trực tiếp theo thời gian thực vào:
   ```bash
   cat data/light_9401/das_success.log
@@ -50,8 +51,8 @@ Light Node hiện đã được tích hợp cơ chế **Reactive Auto-DAS theo s
   ```
   *Log mẫu thời gian thực khi có block mới:*
   ```text
-  [Auto-DAS] [Height: 1] 🚀 Reactive Event: Received Header for block-1 via GossipSub. Automatically sampling 128 cells...
-  [Auto-DAS] [Height: 1] ✅ 100% DAS VERIFIED for block-1 (128/128 cells verified in 4.2s)
+  [Auto-DAS] [Height: 1] [LightNode] BlockReady signal received for block-1 — enqueuing for DAS
+  [Auto-DAS] [Height: 1] 🚀 BlockReady triggered DAS for block-1 — sampling 256/1024 active cells (25%)...
   ```
 
 
