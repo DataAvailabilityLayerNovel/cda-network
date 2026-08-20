@@ -102,29 +102,61 @@ func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece 
 	return nil
 }
 
-// BroadcastBlockReady publishes a BlockReady signal so light nodes can start DAS
-func (b *Broadcaster) BroadcastBlockReady(blockID string, height int) error {
-	payload := p2pcommon.GossipBlockReadyPayload{
-		BlockID: blockID,
-		Height:  height,
+// BroadcastStoreReady publishes a StoreReady signal so the publisher can aggregate store custody completion
+func (b *Broadcaster) BroadcastStoreReady(blockID string, height int, colIdx int, rowIdx int, storesPerCol int) error {
+	payload := p2pcommon.GossipStoreReadyPayload{
+		BlockID:      blockID,
+		Height:       height,
+		NetColIdx:    colIdx,
+		ColIdx:       colIdx,
+		RowIdx:       rowIdx,
+		StoresPerCol: storesPerCol,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("failed to marshal block-ready payload: %w", err)
+		return fmt.Errorf("failed to marshal store-ready payload: %w", err)
 	}
 
-	topic, err := b.JoinTopic(p2pcommon.TopicBlockReady)
+	topic, err := b.JoinTopic(p2pcommon.TopicStoreReady)
 	if err != nil {
-		return fmt.Errorf("failed to join topic %s: %w", p2pcommon.TopicBlockReady, err)
+		return fmt.Errorf("failed to join topic %s: %w", p2pcommon.TopicStoreReady, err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := topic.Publish(ctx, data); err != nil {
-		return fmt.Errorf("failed to publish block-ready: %w", err)
+		return fmt.Errorf("failed to publish store-ready: %w", err)
 	}
 
-	log.Printf("[GossipSub] BlockReady signal broadcasted for block %s (height %d)", blockID, height)
+	log.Printf("[GossipSub] StoreReady signal broadcasted for Col %d, Row %d (StoresPerCol=%d), block %s (height %d)", colIdx, rowIdx, storesPerCol, blockID, height)
+	return nil
+}
+
+// BroadcastColumnReady publishes a ColumnReady signal so the publisher can aggregate column readiness
+func (b *Broadcaster) BroadcastColumnReady(blockID string, height int, colIdx int) error {
+	payload := p2pcommon.GossipColumnReadyPayload{
+		BlockID: blockID,
+		Height:  height,
+		ColIdx:  colIdx,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal column-ready payload: %w", err)
+	}
+
+	topic, err := b.JoinTopic(p2pcommon.TopicColumnReady)
+	if err != nil {
+		return fmt.Errorf("failed to join topic %s: %w", p2pcommon.TopicColumnReady, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := topic.Publish(ctx, data); err != nil {
+		return fmt.Errorf("failed to publish column-ready: %w", err)
+	}
+
+	log.Printf("[GossipSub] ColumnReady signal broadcasted for Column %d, block %s (height %d)", colIdx, blockID, height)
 	return nil
 }

@@ -489,6 +489,7 @@ def generate_publisher_config(k, k_piece, cols, cols_per_net_col, active_cols=No
         "api_port": 8080,
         "k": k,
         "k_piece": k_piece,
+        "active_cols": active_cols,
         "bootstrap_peers": peers
     }
     with open('publisher_config_docker.json', 'w') as f:

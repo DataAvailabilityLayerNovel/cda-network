@@ -155,7 +155,7 @@ def main():
         if args.interval > 0:
             # Fixed interval mode (legacy)
             print(f"[*] Waiting {args.interval}s before next block...")
-            time.sleep(args.interval * 3)
+            time.sleep(args.interval)
         else:
             # Event-driven: wait for BlockReady from bootstrap SSE
             print(f"[*] Waiting for BlockReady signal for {block_id} (max {args.ready_timeout}s)...")

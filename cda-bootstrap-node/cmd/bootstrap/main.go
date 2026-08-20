@@ -205,6 +205,54 @@ func main() {
 		}
 	}()
 
+	// Subscribe to TopicStoreReady so this bootstrap node acts as a GossipSub relay
+	// for store custody completion signals between store nodes and publisher node.
+	storeReadyTopic, err := ps.Join(p2pcommon.TopicStoreReady)
+	if err != nil {
+		log.Fatalf("Failed to join store-ready topic: %v", err)
+	}
+	storeReadySub, err := storeReadyTopic.Subscribe()
+	if err != nil {
+		log.Fatalf("Failed to subscribe to store-ready topic: %v", err)
+	}
+	go func() {
+		for {
+			msg, err := storeReadySub.Next(ctx)
+			if err != nil {
+				return
+			}
+			var payload p2pcommon.GossipStoreReadyPayload
+			if err := json.Unmarshal(msg.Data, &payload); err == nil {
+				log.Printf("[GossipSub] Bootstrap relayed StoreReady for Col %d Row %d, block %s (height %d) from %s",
+					payload.ColIdx, payload.RowIdx, payload.BlockID, payload.Height, msg.ReceivedFrom)
+			}
+		}
+	}()
+
+	// Subscribe to TopicColumnReady so this bootstrap node acts as a GossipSub relay
+	// for column completion signals between store nodes and publisher node.
+	columnReadyTopic, err := ps.Join(p2pcommon.TopicColumnReady)
+	if err != nil {
+		log.Fatalf("Failed to join column-ready topic: %v", err)
+	}
+	columnReadySub, err := columnReadyTopic.Subscribe()
+	if err != nil {
+		log.Fatalf("Failed to subscribe to column-ready topic: %v", err)
+	}
+	go func() {
+		for {
+			msg, err := columnReadySub.Next(ctx)
+			if err != nil {
+				return
+			}
+			var payload p2pcommon.GossipColumnReadyPayload
+			if err := json.Unmarshal(msg.Data, &payload); err == nil {
+				log.Printf("[GossipSub] Bootstrap relayed ColumnReady for Column %d, block %s (height %d) from %s",
+					payload.ColIdx, payload.BlockID, payload.Height, msg.ReceivedFrom)
+			}
+		}
+	}()
+
 	// Subscribe to TopicBlockReady so this bootstrap node participates in the mesh,
 	// acting as a relay between store nodes (publishers) and light nodes (subscribers).
 	blockReadyTopic, err := ps.Join(p2pcommon.TopicBlockReady)

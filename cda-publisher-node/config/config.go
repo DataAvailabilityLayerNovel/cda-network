@@ -9,6 +9,7 @@ type Config struct {
 	APIPort            int            `json:"api_port"`
 	K                  int            `json:"k"`
 	KPiece             int            `json:"k_piece"`
+	ActiveCols         int            `json:"active_cols,omitempty"`
 	BootstrapPeers     map[int]string `json:"bootstrap_peers"` // maps colIdx to bootstrap node address (HTTP/P2P address)
 	SequencerPublicKey string         `json:"sequencer_public_key"`
 }

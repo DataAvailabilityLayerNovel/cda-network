@@ -881,17 +881,15 @@ func (rcv *Receiver) CheckAndLogCompletion(blockID string) {
 			}
 		}
 
-		// Broadcast BlockReady so light nodes can start DAS.
-		// Retry for up to 30 seconds in case the GossipSub mesh hasn't formed yet.
+		// Broadcast StoreReady (and ColumnReady) so the Publisher node can aggregate custody completion across all store nodes.
 		if rcv.broadcaster != nil {
-			go func(bID string, h int) {
-				for attempt := 1; attempt <= 10; attempt++ {
-					if err := rcv.broadcaster.BroadcastBlockReady(bID, h); err != nil {
-						log.Printf("[Height: %d] [StoreNode] Warning: failed to broadcast block-ready (attempt %d): %v", h, attempt, err)
-					}
-					time.Sleep(3 * time.Second)
+			go func(bID string, h int, col int, row int, stores int) {
+				for attempt := 1; attempt <= 5; attempt++ {
+					_ = rcv.broadcaster.BroadcastStoreReady(bID, h, col, row, stores)
+					_ = rcv.broadcaster.BroadcastColumnReady(bID, h, col)
+					time.Sleep(2 * time.Second)
 				}
-			}(blockID, height)
+			}(blockID, height, rcv.colIdx, rcv.rowIdx, rcv.storesPerCol)
 		}
 	}
 }

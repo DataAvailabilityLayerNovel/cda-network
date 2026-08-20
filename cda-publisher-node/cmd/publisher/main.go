@@ -32,6 +32,7 @@ func main() {
 	bootstrap := flag.String("bootstrap", "", "override bootstrap address")
 	kVal := flag.Int("k", 0, "override K chunks parameter")
 	kPieceVal := flag.Int("k-piece", 0, "override K-piece parameter")
+	activeColsVal := flag.Int("active-cols", 0, "override active columns parameter")
 	flag.Parse()
 
 	var cfg *config.Config
@@ -62,8 +63,22 @@ func main() {
 	if cfg.KPiece == 0 {
 		cfg.KPiece = cfg.K
 	}
+	if *activeColsVal != 0 {
+		cfg.ActiveCols = *activeColsVal
+	}
+	if cfg.ActiveCols <= 0 {
+		if len(cfg.BootstrapPeers) > 0 {
+			uniqueBootstraps := make(map[string]bool)
+			for _, addr := range cfg.BootstrapPeers {
+				uniqueBootstraps[addr] = true
+			}
+			cfg.ActiveCols = len(uniqueBootstraps)
+		} else {
+			cfg.ActiveCols = 8
+		}
+	}
 
-	log.Printf("Starting Publisher Node with configuration: APIPort=%d, K=%d, KPiece=%d", cfg.APIPort, cfg.K, cfg.KPiece)
+	log.Printf("Starting Publisher Node with configuration: APIPort=%d, K=%d, KPiece=%d, ActiveCols=%d", cfg.APIPort, cfg.K, cfg.KPiece, cfg.ActiveCols)
 
 	// 1. Initialize P2P Host with deterministic PeerID
 	privKey, pid, err := p2pcommon.GenerateDeterministicKeypair("cda-publisher")
@@ -151,7 +166,7 @@ func main() {
 
 	// 5. Initialize API Service
 	dbPath := "data/publisher/badger"
-	apiService := service.NewAPIService(pipeline, sender, ps, dbPath, cfg.SequencerPublicKey)
+	apiService := service.NewAPIService(pipeline, sender, ps, dbPath, cfg.SequencerPublicKey, cfg.ActiveCols, cfg.K)
 	mux := http.NewServeMux()
 	apiService.RegisterHandlers(mux)
 	mux.Handle("/metrics", promhttp.Handler())
