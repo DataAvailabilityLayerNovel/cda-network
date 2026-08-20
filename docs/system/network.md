@@ -216,11 +216,13 @@ Khi một Node mới $P_{\text{new}}$ khởi chạy:
 * Publisher tính chỉ số cột mạng: $\text{netColNumber} = \text{netColIdx} / \text{colsPerNetCol}$.
 * Tín hiệu từ các cột non-active ($\text{netColNumber} \ge \text{activeCols}$) bị hủy bỏ hoàn toàn, đảm bảo Publisher chỉ chờ đúng $A = \text{activeCols}$ cột active cần thiết.
 
-### 2. Tổng hợp Đa Node Custody (Multi-Store Aggregation)
-* Cột mạng $\text{netColIdx}$ được coi là hoàn thành 100% khi và chỉ khi **tất cả $S = \text{storesPerCol}$ Store Nodes** (đủ mọi `RowIdx` từ $0 \dots S-1$) báo hoàn thành:
+### 2. Điều kiện Phát StoreReady & Tổng hợp Đa Node Custody (StoreReady & Multi-Store Aggregation)
+* **Điều kiện phát StoreReady tại Store Node (`IsComplete`)**:
+  - Đạt $\ge kPiece$ mảnh đối với 100% các ô **Custody** thuộc quyền quản lý của node ($r \pmod{S} == \text{RowIdx}$). Điều này đảm bảo node có 100% năng lực giải mã, recode và phục hồi chính xác các ô custody nhiệm vụ của nó.
+* **Tổng hợp tại Publisher**: Cột mạng $\text{NetColIdx}$ hoàn thành khi và chỉ khi **tất cả $S = \text{storesPerCol}$ Store Nodes** (đủ mọi `RowIdx` từ $0 \dots S-1$) báo `StoreReady`:
 $$\text{len}(\text{storeReadyMap}[\text{BlockID}][\text{NetColIdx}]) == \text{storesPerCol}$$
-* Khối `BlockID` được coi là hoàn thành 100% khi tất cả $A$ cột mạng active đạt trạng thái hoàn thành:
-$$\text{len}(\text{columnReadyMap}[\text{BlockID}]) == \text{activeCols}$$
+* Khối `BlockID` hoàn thành khi tất cả $A$ cột mạng active đạt trạng thái hoàn thành:
+$$\text{len}(\text{completedNetCols}[\text{BlockID}]) == \text{activeCols}$$
 
 ### 3. Cổng Kiểm soát Tuần tự Khối (Sequential Completion Gate)
 * Trực tiếp kiểm soát tại API `/publish` của Publisher Node:

@@ -441,34 +441,45 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 
 	go rcv.CheckAndLogCompletion(blockID)
 
-	// 6. P2P Recoding & GossipSub forwarding
+	// 6. P2P Recoding & GossipSub forwarding for Primary and Backup Custody Nodes
 	updatedPieces := rcv.cache.GetPieces(blockID, row, col)
 	rcv.cellMu.Unlock()
 
 	if !isGossip && len(updatedPieces) >= 2 {
-		log.Printf("[GossipSub] Local rank for cell [%d, %d] is %d/%d (>=2). Triggering local recoding of all available pieces...", row, col, len(updatedPieces), rcv.kPiece)
-		recodedPiece, err := rcv.rm.RecodePieces(updatedPieces)
-		if err != nil {
-			log.Printf("[GossipSub] Failed to recode pieces for cell [%d, %d]: %v", row, col, err)
-		} else {
-			rcv.cellMu.Lock()
-			rcv.cache.StoreRecodedPiece(blockID, row, col, *recodedPiece)
-			rcv.cellMu.Unlock()
+		isPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
+		isBackup := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
 
-			if rcv.pruneEnable {
-				rcv.pruneMu.Lock()
-				key := fmt.Sprintf("%s_%d_%d", blockID, row, col)
-				if !rcv.prunedCells[key] {
-					rcv.cellLastActivity[key] = time.Now()
+		if isPrimary || isBackup {
+			go func(bID string, r, c int, pieces []cda.ReceivedPiece, primary bool) {
+				if !primary {
+					// Backup Node: apply a staggered interleave delay (250ms) to ensure maximum recoded piece diversity
+					time.Sleep(25 * time.Millisecond)
 				}
-				rcv.pruneMu.Unlock()
-			}
-			log.Printf("[GossipSub] Recoding success for cell [%d, %d]. Gossiping recoded piece with coeffs %x to column neighbor peers...", row, col, recodedPiece.Data.Coeffs)
-			if err := rcv.broadcaster.BroadcastRecodedPiece(blockID, row, col, recodedPiece, pieceCommits); err != nil {
-				log.Printf("[GossipSub] Failed to gossip recoded piece for cell [%d, %d]: %v", row, col, err)
-			} else {
-				log.Printf("[GossipSub] Successfully gossiped recoded piece for cell [%d, %d] to peers.", row, col)
-			}
+				log.Printf("[GossipSub] Local rank for cell [%d, %d] is %d/%d (>=2, Primary=%v). Triggering local recoding of all available pieces...", r, c, len(pieces), rcv.kPiece, primary)
+				recodedPiece, err := rcv.rm.RecodePieces(pieces)
+				if err != nil {
+					log.Printf("[GossipSub] Failed to recode pieces for cell [%d, %d]: %v", r, c, err)
+					return
+				}
+				rcv.cellMu.Lock()
+				rcv.cache.StoreRecodedPiece(bID, r, c, *recodedPiece)
+				rcv.cellMu.Unlock()
+
+				if rcv.pruneEnable {
+					rcv.pruneMu.Lock()
+					key := fmt.Sprintf("%s_%d_%d", bID, r, c)
+					if !rcv.prunedCells[key] {
+						rcv.cellLastActivity[key] = time.Now()
+					}
+					rcv.pruneMu.Unlock()
+				}
+				log.Printf("[GossipSub] Recoding success for cell [%d, %d] (Primary=%v). Gossiping recoded piece with coeffs %x to column neighbor peers...", r, c, primary, recodedPiece.Data.Coeffs)
+				if err := rcv.broadcaster.BroadcastRecodedPiece(bID, r, c, recodedPiece, pieceCommits); err != nil {
+					log.Printf("[GossipSub] Failed to gossip recoded piece for cell [%d, %d]: %v", r, c, err)
+				} else {
+					log.Printf("[GossipSub] Successfully gossiped recoded piece for cell [%d, %d] to peers (Primary=%v).", r, c, primary)
+				}
+			}(blockID, row, col, updatedPieces, isPrimary)
 		}
 	}
 
@@ -833,6 +844,7 @@ func (rcv *Receiver) IsComplete(blockID string) bool {
 	for c := startCol; c < endCol; c++ {
 		for r := 0; r < n; r++ {
 			if r%storesPerCol == rcv.rowIdx {
+				// Custody cell: MUST have >= kPiece pieces for 100% custody completion
 				if rcv.cache.GetPieceCount(blockID, r, c) < rcv.kPiece {
 					return false
 				}
@@ -991,8 +1003,20 @@ func (rcv *Receiver) startPruner(ctx context.Context) {
 							rcv.prunedCells[key] = true
 							rcv.pruneMu.Unlock()
 
-							log.Printf("[Pruning] Cell [%d, %d] of block %s is non-custody. Pruning raw pieces from BadgerDB...", row, col, blockID)
-							rcv.cache.PruneRawPieces(blockID, row, col)
+							log.Printf("[Pruning] Cell [%d, %d] of block %s is non-custody. Compressing raw pieces into 1 recoded piece and pruning raw pieces...", row, col, blockID)
+							deleted := rcv.cache.PruneRawPieces(blockID, row, col, rcv.rm)
+							if deleted > 1 {
+								rcv.totalStoredPiecesMu.Lock()
+								subVal := int64(deleted - 1)
+								if rcv.totalStoredPieces >= subVal {
+									rcv.totalStoredPieces -= subVal
+								} else {
+									rcv.totalStoredPieces = 0
+								}
+								currCount := rcv.totalStoredPieces
+								rcv.totalStoredPiecesMu.Unlock()
+								LinearIndependentPiecesCount.Set(float64(currCount))
+							}
 						}
 					}
 				}

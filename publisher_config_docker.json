@@ -2,7 +2,7 @@
   "api_port": 8080,
   "k": 32,
   "k_piece": 8,
-  "active_cols": 2,
+  "active_cols": 1,
   "bootstrap_peers": {
     "0": "/dns4/bootstrap-0/tcp/19200",
     "1": "/dns4/bootstrap-0/tcp/19200",
@@ -11,14 +11,6 @@
     "4": "/dns4/bootstrap-0/tcp/19200",
     "5": "/dns4/bootstrap-0/tcp/19200",
     "6": "/dns4/bootstrap-0/tcp/19200",
-    "7": "/dns4/bootstrap-0/tcp/19200",
-    "8": "/dns4/bootstrap-1/tcp/19201",
-    "9": "/dns4/bootstrap-1/tcp/19201",
-    "10": "/dns4/bootstrap-1/tcp/19201",
-    "11": "/dns4/bootstrap-1/tcp/19201",
-    "12": "/dns4/bootstrap-1/tcp/19201",
-    "13": "/dns4/bootstrap-1/tcp/19201",
-    "14": "/dns4/bootstrap-1/tcp/19201",
-    "15": "/dns4/bootstrap-1/tcp/19201"
+    "7": "/dns4/bootstrap-0/tcp/19200"
   }
 }

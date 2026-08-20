@@ -330,7 +330,7 @@ func (s *CustodyStore) IsComplete(blockID string, colIdx, k int) bool {
 	return complete
 }
 
-func (s *CustodyStore) PruneRawPieces(blockID string, row, col int) int {
+func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.RecipientManager) int {
 	if s.db == nil {
 		return 0
 	}
@@ -348,10 +348,20 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int) int {
 			deletedCount = len(rawPieces)
 		}
 
-		// If no recoded piece exists yet for this non-custody cell, retain 1 raw piece in recoded_
-		_, recodedErr := txn.Get(recodedKey)
-		if recodedErr == badger.ErrKeyNotFound && len(rawPieces) > 0 {
-			retained := []cda.ReceivedPiece{rawPieces[0]}
+		if len(rawPieces) > 0 {
+			var compressedPiece cda.ReceivedPiece
+			if len(rawPieces) >= 2 && rm != nil {
+				recoded, err := rm.RecodePieces(rawPieces)
+				if err == nil && recoded != nil {
+					compressedPiece = *recoded
+				} else {
+					compressedPiece = rawPieces[0]
+				}
+			} else {
+				compressedPiece = rawPieces[0]
+			}
+
+			retained := []cda.ReceivedPiece{compressedPiece}
 			if valData, err := json.Marshal(retained); err == nil {
 				_ = txn.Set(recodedKey, valData)
 			}
