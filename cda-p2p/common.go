@@ -93,12 +93,17 @@ func NewP2PHost(listenPort int, privKey crypto.PrivKey) (host.Host, error) {
 
 // Protocol Names
 const (
-	ProtoPublisherPush   = "/cda/publisher/push-chunk/1.0.0"
+	ProtoPublisherPush    = "/cda/publisher/push-chunk/1.0.0"
 	ProtoBootstrapRouting = "/cda/bootstrap/routing/1.0.0"
-	ProtoBootstrapSeed    = "/cda/bootstrap/seed-cell/1.0.0"
 	ProtoStoreFetch       = "/cda/store/fetch-pieces/1.0.0"
 	ProtoStoreGetPieces   = "/cda/store/get-cell-pieces/1.0.0"
 )
+
+// ProtoNodeSeed returns the per-node libp2p stream protocol for seeding pieces.
+// Bootstrap node opens a stream to this protocol when delivering RLNC pieces to a store node.
+func ProtoNodeSeed(peerID string) string {
+	return fmt.Sprintf("/cda/store/%s/seed/1.0.0", peerID)
+}
 
 // GossipSub Topics
 const (
@@ -107,7 +112,7 @@ const (
 	TopicBlockReady = "/cda/1.0.0/block-ready"
 )
 
-// TopicCol returns GossipSub column topic name
+// TopicCol returns GossipSub column topic name (used for anchor commitment broadcast)
 func TopicCol(col int) string {
 	return fmt.Sprintf("/cda/1.0.0/col/%d", col)
 }
@@ -115,6 +120,12 @@ func TopicCol(col int) string {
 // TopicRow returns GossipSub row topic name
 func TopicRow(row int) string {
 	return fmt.Sprintf("/cda/1.0.0/row/%d", row)
+}
+
+// TopicNode returns the per-node GossipSub topic for a store node identified by its PeerID.
+// Custody nodes publish their RLNC pieces here; non-custody nodes subscribe to get pieces.
+func TopicNode(peerID string) string {
+	return fmt.Sprintf("/cda/1.0.0/node/%s", peerID)
 }
 
 // PeerInfo wraps Peer ID and Multiaddrs
@@ -163,6 +174,7 @@ type SeedCellRequest struct {
 	Coeffs       string   `json:"coeffs"`        // Hex coefficients g_i
 	Proof        string   `json:"proof"`         // Hex combined proof P_i
 	PieceCommits []string `json:"piece_commits"` // Hex piece commitments C_0..C_k-1
+	SenderPeerID string   `json:"sender_peer_id,omitempty"` // PeerID of the custody node sending this piece
 }
 
 // StoreFetchRequest is the request to retrieve pieces from a Store node

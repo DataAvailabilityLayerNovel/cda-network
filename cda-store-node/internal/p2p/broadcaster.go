@@ -17,18 +17,20 @@ import (
 )
 
 type Broadcaster struct {
-	host   host.Host
-	ps     *pubsub.PubSub
-	peers  []peer.ID
-	mu     sync.RWMutex
-	topics map[string]*pubsub.Topic
+	host       host.Host
+	ps         *pubsub.PubSub
+	selfPeerID string // This node's own PeerID string — used as the dedicated topic/protocol identifier
+	peers      []peer.ID
+	mu         sync.RWMutex
+	topics     map[string]*pubsub.Topic
 }
 
-func NewBroadcaster(h host.Host, ps *pubsub.PubSub) *Broadcaster {
+func NewBroadcaster(h host.Host, ps *pubsub.PubSub, selfPeerID string) *Broadcaster {
 	return &Broadcaster{
-		host:   h,
-		ps:     ps,
-		topics: make(map[string]*pubsub.Topic),
+		host:       h,
+		ps:         ps,
+		selfPeerID: selfPeerID,
+		topics:     make(map[string]*pubsub.Topic),
 	}
 }
 
@@ -59,10 +61,12 @@ func (b *Broadcaster) UpdatePeers(peers []peer.ID) {
 	b.peers = peers
 }
 
-// BroadcastRecodedPiece broadcasts a recoded piece to GossipSub column topic
+// BroadcastRecodedPiece broadcasts a recoded piece to this node's dedicated GossipSub topic.
+// Using TopicNode(selfPeerID) instead of the shared column topic ensures that only nodes
+// which explicitly subscribed to this custody node's topic receive the recoded piece.
 func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece *cda.ReceivedPiece, pieceCommits [][]byte) error {
-	log.Printf("[GossipSub] Broadcasting recoded piece (coeffs: %x, data len: %d) for cell [%d, %d] to GossipSub Column topic",
-		piece.Data.Coeffs, len(piece.Data.Data), row, col)
+	log.Printf("[GossipSub] Broadcasting recoded piece (coeffs: %x, data len: %d) for cell [%d, %d] to node topic %s",
+		piece.Data.Coeffs, len(piece.Data.Data), row, col, p2pcommon.TopicNode(b.selfPeerID))
 
 	commitsStr := make([]string, len(pieceCommits))
 	for i, c := range pieceCommits {
@@ -77,6 +81,7 @@ func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece 
 		Coeffs:       hex.EncodeToString(piece.Data.Coeffs),
 		Proof:        hex.EncodeToString(piece.Proof),
 		PieceCommits: commitsStr,
+		SenderPeerID: b.selfPeerID,
 	}
 
 	payloadBytes, err := json.Marshal(payload)
@@ -84,7 +89,8 @@ func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece 
 		return fmt.Errorf("failed to marshal store payload: %w", err)
 	}
 
-	topicName := p2pcommon.TopicCol(col)
+	// Publish on this node's own dedicated topic (per-node channel)
+	topicName := p2pcommon.TopicNode(b.selfPeerID)
 	topic, err := b.JoinTopic(topicName)
 	if err != nil {
 		return fmt.Errorf("failed to join GossipSub topic %s: %w", topicName, err)

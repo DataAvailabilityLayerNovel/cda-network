@@ -13,9 +13,11 @@ import (
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/multiformats/go-multiaddr"
 )
+
 
 type Registry interface {
 	GetPeersForCell(row, col int, pieceIdx int) []p2pcommon.PeerInfo
@@ -100,7 +102,9 @@ func (b *Broadcaster) BroadcastAnchor(blockID string, colIdx int, pieceCommits [
 	return nil
 }
 
-// BroadcastPiece unicasts the RLNC piece to the Store Node assigned for cell [row, col] and pieceIdx
+// BroadcastPiece delivers an RLNC piece to the Store Node assigned for cell [row, col] and pieceIdx.
+// Uses the per-node stream protocol ProtoNodeSeed(peerID) instead of a shared protocol,
+// so each store node has its own dedicated channel for receiving seed pieces.
 func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, pieceIdx int, piece *cda.ReceivedPiece, pieceCommits [][]byte) error {
 	if b.reg == nil {
 		return fmt.Errorf("peer registry not set on broadcaster")
@@ -119,21 +123,22 @@ func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, pieceIdx int,
 		hexPieceCommits[i] = hex.EncodeToString(c)
 	}
 
-	payload := p2pcommon.SeedCellRequest{
-		BlockID:      blockID,
-		Row:          row,
-		Col:          col,
-		Data:         hex.EncodeToString(piece.Data.Data),
-		Coeffs:       hex.EncodeToString(piece.Data.Coeffs),
-		Proof:        hex.EncodeToString(piece.Proof),
-		PieceCommits: hexPieceCommits,
-	}
-
 	for _, pInfo := range peers {
 		pid, err := peer.Decode(pInfo.PeerID)
 		if err != nil {
 			log.Printf("[P2P Seeder] Invalid Peer ID %s: %v", pInfo.PeerID, err)
 			continue
+		}
+
+		payload := p2pcommon.SeedCellRequest{
+			BlockID:      blockID,
+			Row:          row,
+			Col:          col,
+			Data:         hex.EncodeToString(piece.Data.Data),
+			Coeffs:       hex.EncodeToString(piece.Data.Coeffs),
+			Proof:        hex.EncodeToString(piece.Proof),
+			PieceCommits: hexPieceCommits,
+			SenderPeerID: b.host.ID().String(),
 		}
 
 		// Add addresses to Peerstore
@@ -144,6 +149,9 @@ func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, pieceIdx int,
 			}
 			b.host.Peerstore().AddAddr(pid, maddr, peerstoreAddressTTL())
 		}
+
+		// Use per-node stream protocol: each store node listens on its own dedicated protocol
+		nodeProto := p2pcommon.ProtoNodeSeed(pInfo.PeerID)
 
 		// Retry up to 3 times in case of transient stream resets or dial failures
 		success := false
@@ -159,7 +167,7 @@ func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, pieceIdx int,
 			}
 
 			streamCtx, streamCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			stream, err := b.host.NewStream(streamCtx, pid, p2pcommon.ProtoBootstrapSeed)
+			stream, err := b.host.NewStream(streamCtx, pid, protocol.ID(nodeProto))
 			cancelDial()
 			if err != nil {
 				lastErr = err
@@ -195,7 +203,7 @@ func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, pieceIdx int,
 				break // Validation failure is a hard error, do not retry
 			}
 
-			log.Printf("[P2P Seeder] Successfully seeded piece for cell [%d, %d] to Store Node %s (attempt %d)", row, col, pid, attempt)
+			log.Printf("[P2P Seeder] Successfully seeded piece for cell [%d, %d] to Store Node %s via %s (attempt %d)", row, col, pid, nodeProto, attempt)
 			success = true
 			break
 		}

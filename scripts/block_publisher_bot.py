@@ -47,29 +47,23 @@ def wait_for_block_ready_sse(sse_url, expected_block_id, timeout=120):
     deadline = time.time() + timeout
     try:
         req = urllib.request.Request(sse_url, headers={'Accept': 'text/event-stream'})
-        with urllib.request.urlopen(req, timeout=int(timeout) + 5) as resp:
-            buf = b""
+        with urllib.request.urlopen(req, timeout=5) as resp:
             while time.time() < deadline:
-                chunk = resp.read(512)
-                if not chunk:
+                line = resp.readline()
+                if not line:
                     break
-                buf += chunk
-                # SSE events are separated by double newlines
-                while b"\n\n" in buf:
-                    event, buf = buf.split(b"\n\n", 1)
-                    for line in event.split(b"\n"):
-                        line = line.strip()
-                        if line.startswith(b"data:"):
-                            raw = line[5:].strip()
-                            try:
-                                pl = json.loads(raw)
-                                bid = pl.get("block_id", "")
-                                h   = pl.get("height", 0)
-                                print(f"  [SSE] BlockReady received: {bid} (height {h})")
-                                if bid == expected_block_id:
-                                    return True
-                            except Exception:
-                                pass
+                line = line.strip()
+                if line.startswith(b"data:"):
+                    raw = line[5:].strip()
+                    try:
+                        pl = json.loads(raw)
+                        bid = pl.get("block_id", "")
+                        h   = pl.get("height", 0)
+                        print(f"  [SSE] BlockReady received: {bid} (height {h})")
+                        if bid == expected_block_id:
+                            return True
+                    except Exception:
+                        pass
     except Exception as e:
         print(f"  [SSE] Connection error: {e}")
     return False
@@ -157,14 +151,16 @@ def main():
             print(f"[*] Waiting {args.interval}s before next block...")
             time.sleep(args.interval)
         else:
-            # Event-driven: wait for BlockReady from bootstrap SSE
+            # Event-driven: wait for BlockReady from bootstrap SSE or poll
             print(f"[*] Waiting for BlockReady signal for {block_id} (max {args.ready_timeout}s)...")
-            ready = wait_for_block_ready_sse(sse_url, block_id, timeout=args.ready_timeout)
+            ready = wait_for_block_ready_poll(latest_url, block_id, poll_interval=0.1, timeout=0.5)
             if not ready:
-                print(f"  [!] SSE timeout/error — falling back to polling /block-ready/latest")
-                ready = wait_for_block_ready_poll(
-                    latest_url, block_id,
-                    timeout=max(10, args.ready_timeout / 3))
+                ready = wait_for_block_ready_sse(sse_url, block_id, timeout=args.ready_timeout)
+                if not ready:
+                    print(f"  [!] SSE timeout/error — falling back to polling /block-ready/latest")
+                    ready = wait_for_block_ready_poll(
+                        latest_url, block_id,
+                        timeout=max(10, args.ready_timeout / 3))
             if ready:
                 print(f"[+] BlockReady confirmed for {block_id} — pushing next block.")
             else:

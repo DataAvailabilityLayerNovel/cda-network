@@ -126,8 +126,8 @@ func main() {
 	}
 
 	// 5. Initialize P2P subcomponents
-	broadcaster := p2p.NewBroadcaster(p2pHost, ps)
-	receiver := p2p.NewReceiver(p2pHost, ps, kzg, cfg.PublisherAddr, cfg.K, cfg.KPiece, cfg.NumCols, cfg.StoresPerCol, cfg.RowIdx, cfg.ColIdx, cache, broadcaster, cfg.CrashOnFail, cfg.PruneEnable, cfg.PruneTTL)
+	broadcaster := p2p.NewBroadcaster(p2pHost, ps, pid.String())
+	receiver := p2p.NewReceiver(p2pHost, ps, kzg, cfg.PublisherAddr, cfg.K, cfg.KPiece, cfg.NumCols, cfg.StoresPerCol, cfg.RowIdx, cfg.ColIdx, cache, broadcaster, cfg.CrashOnFail, cfg.PruneEnable, cfg.PruneTTL, pid.String())
 
 	// Expose HTTP server for local status check and health endpoint
 	mux := http.NewServeMux()

@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -23,9 +25,14 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/multiformats/go-multiaddr"
 )
+
+// mathRandIntn wraps rand.Intn for use in shuffle (avoids import collision)
+func mathRandIntn(n int) int { return rand.Intn(n) }
+
 
 type Receiver struct {
 	host          host.Host
@@ -33,6 +40,7 @@ type Receiver struct {
 	kzg           cda.KZGProvider
 	rm            *cda.RecipientManager
 	publisherAddr string
+	selfPeerID    string // This node's own PeerID string
 	kBlock        int
 	kPiece        int
 	numCols       int
@@ -47,6 +55,11 @@ type Receiver struct {
 	peersMu   sync.RWMutex
 	rowPeers  []p2pcommon.PeerInfo
 	colPeers  []p2pcommon.PeerInfo
+
+	// Per-cell peer contribution tracking: cellKey -> senderPeerID -> count
+	// Used to enforce "pull from ≥2 different custody nodes" before recoding
+	contribMu        sync.Mutex
+	peerContributions map[string]map[string]int
 
 	// Rate limiting
 	rateLimitersMu sync.Mutex
@@ -68,8 +81,19 @@ type Receiver struct {
 	completedMu     sync.Mutex
 	completedBlocks map[string]bool
 
+	// Broadcast dissemination tracking for StoreReady condition
+	broadcastMu        sync.Mutex
+	cellBroadcastCount map[string]int
+
+	// Track globally subscribed non-custody topics to prevent duplicate subscriptions across SetPeers calls
+	subscribedTopicsMu sync.Mutex
+	subscribedTopics   map[string]bool
+
 	// Sequential block processing queue
 	taskChan chan func()
+
+	// Context for subscribeToNonCustodyCells goroutines lifetime
+	ctx context.Context
 }
 
 func NewReceiver(
@@ -88,6 +112,7 @@ func NewReceiver(
 	crashOnFail bool,
 	pruneEnable bool,
 	pruneTTL time.Duration,
+	selfPeerID string,
 ) *Receiver {
 	return &Receiver{
 		host:              h,
@@ -95,6 +120,7 @@ func NewReceiver(
 		kzg:               kzg,
 		rm:                cda.NewRecipientManager(kPiece, kzg),
 		publisherAddr:     pubAddr,
+		selfPeerID:        selfPeerID,
 		kBlock:            kBlock,
 		kPiece:            kPiece,
 		numCols:           numCols,
@@ -111,6 +137,9 @@ func NewReceiver(
 		cellLastActivity:  make(map[string]time.Time),
 		prunedCells:       make(map[string]bool),
 		completedBlocks:   make(map[string]bool),
+		cellBroadcastCount: make(map[string]int),
+		subscribedTopics:   make(map[string]bool),
+		peerContributions: make(map[string]map[string]int),
 		taskChan:          make(chan func(), 20000),
 	}
 }
@@ -121,7 +150,7 @@ func (rcv *Receiver) SetPeers(rowPeers, colPeers []p2pcommon.PeerInfo) {
 	rcv.colPeers = colPeers
 	rcv.peersMu.Unlock()
 
-	// Update broadcaster with column peers for direct gossip fallback
+	// Update broadcaster with column peers
 	var pIDs []peer.ID
 	for _, p := range colPeers {
 		if pid, err := peer.Decode(p.PeerID); err == nil {
@@ -129,9 +158,17 @@ func (rcv *Receiver) SetPeers(rowPeers, colPeers []p2pcommon.PeerInfo) {
 		}
 	}
 	rcv.broadcaster.UpdatePeers(pIDs)
+
+	// Subscribe to non-custody cells via custody node per-node topics (if context is ready)
+	if rcv.ctx != nil {
+		go rcv.subscribeToNonCustodyCells(rcv.ctx, colPeers)
+	}
 }
 
 func (rcv *Receiver) Start(ctx context.Context) {
+	// Store context for use in SetPeers (which may be called after Start)
+	rcv.ctx = ctx
+
 	// Start sequential task worker
 	go rcv.workerLoop(ctx)
 	StartMetricsTicker(ctx)
@@ -161,16 +198,53 @@ func (rcv *Receiver) Start(ctx context.Context) {
 		}
 	}()
 
-	// 1. Set stream handlers
-	rcv.host.SetStreamHandler(p2pcommon.ProtoBootstrapSeed, rcv.handleSeedStream)
-	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreFetch, rcv.handleFetchStream)
-	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreGetPieces, rcv.handleFetchStream)
-
 	if rcv.pruneEnable {
 		go rcv.startPruner(ctx)
 	}
 
-	// 2. Subscribe to Column GossipSub topics
+	// 1. Register per-node stream handler (replaces shared ProtoBootstrapSeed).
+	//    Each store node listens on its own dedicated protocol so bootstrap can
+	//    dial the right node without contention on a shared protocol name.
+	nodeProto := p2pcommon.ProtoNodeSeed(rcv.selfPeerID)
+	rcv.host.SetStreamHandler(protocol.ID(nodeProto), rcv.handleSeedStream)
+	log.Printf("[StoreNode] Registered per-node seed handler on protocol %s", nodeProto)
+
+	// Keep generic fetch handlers (used by light nodes and active-pull)
+	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreFetch, rcv.handleFetchStream)
+	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreGetPieces, rcv.handleFetchStream)
+
+	// 2. Subscribe to this node's own dedicated GossipSub topic.
+	//    Bootstrap / other custody nodes will publish to this topic when they want to
+	//    send anchor payloads or recoded pieces intended for our custody cells.
+	self := p2pcommon.TopicNode(rcv.selfPeerID)
+	selfTopic, err := rcv.broadcaster.JoinTopic(self)
+	if err != nil {
+		log.Fatalf("[StoreNode] Failed to join own node topic %s: %v", self, err)
+	}
+	selfSub, err := selfTopic.Subscribe()
+	if err != nil {
+		log.Fatalf("[StoreNode] Failed to subscribe to own node topic %s: %v", self, err)
+	}
+	log.Printf("[StoreNode] Subscribed to own node topic %s", self)
+	go func(sub *pubsub.Subscription) {
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return
+			}
+			if msg.ReceivedFrom == rcv.host.ID() {
+				continue // skip self
+			}
+			data := msg.Data
+			select {
+			case rcv.taskChan <- func() { rcv.processGossipMessage(data) }:
+			default:
+				log.Printf("[StoreNode] taskChan full, dropping gossip message on node topic")
+			}
+		}
+	}(selfSub)
+
+	// 3. Subscribe to column anchor topics (kept as-is — per-column, not per-node)
 	n := 2 * rcv.kBlock
 	numCols := rcv.numCols
 	if numCols <= 0 {
@@ -180,7 +254,6 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	if colsPerNetCol == 0 {
 		colsPerNetCol = 1
 	}
-
 	netColIdx := rcv.colIdx / colsPerNetCol
 	startCol := netColIdx * colsPerNetCol
 	endCol := startCol + colsPerNetCol
@@ -189,14 +262,12 @@ func (rcv *Receiver) Start(ctx context.Context) {
 		colTopicName := p2pcommon.TopicCol(c)
 		topic, err := rcv.broadcaster.JoinTopic(colTopicName)
 		if err != nil {
-			log.Fatalf("Failed to join column GossipSub topic %s: %v", colTopicName, err)
+			log.Fatalf("Failed to join column anchor GossipSub topic %s: %v", colTopicName, err)
 		}
-
 		sub, err := topic.Subscribe()
 		if err != nil {
-			log.Fatalf("Failed to subscribe to column GossipSub topic %s: %v", colTopicName, err)
+			log.Fatalf("Failed to subscribe to column anchor GossipSub topic %s: %v", colTopicName, err)
 		}
-
 		go func(sub *pubsub.Subscription) {
 			for {
 				msg, err := sub.Next(ctx)
@@ -204,13 +275,13 @@ func (rcv *Receiver) Start(ctx context.Context) {
 					return
 				}
 				if msg.ReceivedFrom == rcv.host.ID() {
-					continue // skip self
+					continue
 				}
 				data := msg.Data
 				select {
-				case rcv.taskChan <- func() { rcv.processGossipMessage(data) }:
+				case rcv.taskChan <- func() { rcv.processAnchorMessage(data) }:
 				default:
-					log.Printf("[StoreNode] taskChan full, dropping gossip message")
+					log.Printf("[StoreNode] taskChan full, dropping anchor gossip message")
 				}
 			}
 		}(sub)
@@ -232,29 +303,30 @@ func (rcv *Receiver) workerLoop(ctx context.Context) {
 	}
 }
 
+// processGossipMessage handles incoming messages on this node's own TopicNode topic.
+// Messages here are recoded RLNC pieces published by other custody nodes.
 func (rcv *Receiver) processGossipMessage(data []byte) {
-	// The message can be either GossipAnchorPayload or SeedCellRequest (pieces gossip)
-	// Inspect dynamic json fields to determine type
+	var payload p2pcommon.SeedCellRequest
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return
+	}
+	recordGossipMessage()
+	rcv.processPiece(payload.BlockID, payload.Row, payload.Col, payload.Data, payload.Coeffs, payload.Proof, payload.PieceCommits, payload.SenderPeerID, true)
+}
+
+// processAnchorMessage handles incoming messages on the column's TopicCol topic.
+// Messages here are GossipAnchorPayload from bootstrap node.
+func (rcv *Receiver) processAnchorMessage(data []byte) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return
 	}
-
 	if _, isAnchor := raw["merkle_proofs"]; isAnchor {
-		// Process Anchor Commitments
 		var payload p2pcommon.GossipAnchorPayload
 		if err := json.Unmarshal(data, &payload); err != nil {
 			return
 		}
 		rcv.processAnchor(payload.BlockID, payload.ColIdx, payload.PieceCommits, payload.MerkleProofs)
-	} else {
-		// Process Recoded Piece Gossip
-		var payload p2pcommon.SeedCellRequest
-		if err := json.Unmarshal(data, &payload); err != nil {
-			return
-		}
-		recordGossipMessage()
-		rcv.processPiece(payload.BlockID, payload.Row, payload.Col, payload.Data, payload.Coeffs, payload.Proof, payload.PieceCommits, true)
 	}
 }
 
@@ -318,7 +390,7 @@ func (rcv *Receiver) handleSeedStream(stream network.Stream) {
 		return
 	}
 
-	err := rcv.processPiece(payload.BlockID, payload.Row, payload.Col, payload.Data, payload.Coeffs, payload.Proof, payload.PieceCommits, false)
+	err := rcv.processPiece(payload.BlockID, payload.Row, payload.Col, payload.Data, payload.Coeffs, payload.Proof, payload.PieceCommits, payload.SenderPeerID, false)
 	if err != nil {
 		rcv.respondWithError(stream, err.Error())
 		return
@@ -329,7 +401,7 @@ func (rcv *Receiver) handleSeedStream(stream network.Stream) {
 	}{Success: true})
 }
 
-func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsStr, proofStr string, pieceCommitsStr []string, isGossip bool) error {
+func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsStr, proofStr string, pieceCommitsStr []string, senderPeerID string, isGossip bool) error {
 	// 1. Decode payload fields from hex
 	decodedData, err := hex.DecodeString(dataStr)
 	if err != nil {
@@ -439,23 +511,36 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 		rcv.pruneMu.Unlock()
 	}
 
+	// 5b. Track peer contributions for this cell (used by non-custody recode decision)
+	if senderPeerID != "" {
+		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+		rcv.contribMu.Lock()
+		if rcv.peerContributions[cellKey] == nil {
+			rcv.peerContributions[cellKey] = make(map[string]int)
+		}
+		rcv.peerContributions[cellKey][senderPeerID]++
+		rcv.contribMu.Unlock()
+	}
+
 	go rcv.CheckAndLogCompletion(blockID)
 
-	// 6. P2P Recoding & GossipSub forwarding for Primary and Backup Custody Nodes
+	// 6. P2P Recoding & GossipSub forwarding
 	updatedPieces := rcv.cache.GetPieces(blockID, row, col)
 	rcv.cellMu.Unlock()
 
-	if !isGossip && len(updatedPieces) >= 2 {
-		isPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
-		isBackup := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+	isPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
+	isBackup := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+	isCustody := isPrimary || isBackup
 
-		if isPrimary || isBackup {
+	if isCustody {
+		// Custody nodes (primary + backup): recode as soon as rank >= 2 and broadcast k_piece pieces
+		if !isGossip && len(updatedPieces) >= 2 {
 			go func(bID string, r, c int, pieces []cda.ReceivedPiece, primary bool) {
 				if !primary {
-					// Backup Node: apply a staggered interleave delay (250ms) to ensure maximum recoded piece diversity
+					// Backup Node: stagger 25ms to ensure piece diversity
 					time.Sleep(25 * time.Millisecond)
 				}
-				log.Printf("[GossipSub] Local rank for cell [%d, %d] is %d/%d (>=2, Primary=%v). Triggering local recoding of all available pieces...", r, c, len(pieces), rcv.kPiece, primary)
+				log.Printf("[GossipSub] Local rank for cell [%d, %d] is %d/%d (>=2, Primary=%v). Recoding and publishing to node topic...", r, c, len(pieces), rcv.kPiece, primary)
 				recodedPiece, err := rcv.rm.RecodePieces(pieces)
 				if err != nil {
 					log.Printf("[GossipSub] Failed to recode pieces for cell [%d, %d]: %v", r, c, err)
@@ -473,22 +558,166 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 					}
 					rcv.pruneMu.Unlock()
 				}
-				log.Printf("[GossipSub] Recoding success for cell [%d, %d] (Primary=%v). Gossiping recoded piece with coeffs %x to column neighbor peers...", r, c, primary, recodedPiece.Data.Coeffs)
+				log.Printf("[GossipSub] Publishing recoded piece for cell [%d, %d] (Primary=%v) to node topic...", r, c, primary)
 				if err := rcv.broadcaster.BroadcastRecodedPiece(bID, r, c, recodedPiece, pieceCommits); err != nil {
-					log.Printf("[GossipSub] Failed to gossip recoded piece for cell [%d, %d]: %v", r, c, err)
+					log.Printf("[GossipSub] Failed to publish recoded piece for cell [%d, %d]: %v", r, c, err)
 				} else {
-					log.Printf("[GossipSub] Successfully gossiped recoded piece for cell [%d, %d] to peers (Primary=%v).", r, c, primary)
+					log.Printf("[GossipSub] Successfully published recoded piece for cell [%d, %d] (Primary=%v).", r, c, primary)
+					cellKey := fmt.Sprintf("%s_%d_%d", bID, r, c)
+					rcv.broadcastMu.Lock()
+					rcv.cellBroadcastCount[cellKey]++
+					rcv.broadcastMu.Unlock()
+					go rcv.CheckAndLogCompletion(bID)
+
+					if !primary {
+						// Backup custody node: prune raw pieces after successful dissemination to release backup storage
+						rcv.cellMu.Lock()
+						rcv.cache.PruneRawPieces(bID, r, c, rcv.rm)
+						rcv.cellMu.Unlock()
+						log.Printf("[StoreNode] Backup: cell [%d, %d] dissemination completed; raw pieces pruned.", r, c)
+					}
 				}
 			}(blockID, row, col, updatedPieces, isPrimary)
 		}
+	} else {
+		// Non-custody nodes: recode only when we have k_piece pieces from >=2 different custody sources.
+		// Then keep exactly 1 recoded piece and discard raw pieces to save space.
+		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+		rcv.contribMu.Lock()
+		numSources := len(rcv.peerContributions[cellKey])
+		rcv.contribMu.Unlock()
+
+		if len(updatedPieces) >= rcv.kPiece && numSources >= 2 {
+			go func(bID string, r, c int, pieces []cda.ReceivedPiece) {
+				log.Printf("[StoreNode] Non-custody: cell [%d, %d] has %d pieces from %d sources. Recoding and keeping 1 piece.", r, c, len(pieces), numSources)
+				recodedPiece, err := rcv.rm.RecodePieces(pieces[:rcv.kPiece])
+				if err != nil {
+					log.Printf("[StoreNode] Non-custody recode failed for cell [%d, %d]: %v", r, c, err)
+					return
+				}
+				rcv.cellMu.Lock()
+				rcv.cache.StoreRecodedPiece(bID, r, c, *recodedPiece)
+				// Prune raw pieces — non-custody node keeps only the 1 recoded piece
+				rcv.cache.PruneRawPieces(bID, r, c, rcv.rm)
+				rcv.cellMu.Unlock()
+				log.Printf("[StoreNode] Non-custody: cell [%d, %d] recoded and raw pieces pruned.", r, c)
+			}(blockID, row, col, updatedPieces)
+		}
 	}
 
-	// 7. Active Pull: if local piece count is still less than kPiece, actively pull from column peers
-	if len(updatedPieces) < rcv.kPiece {
+	// 7. Active Pull: if custody node still lacks pieces, pull from column peers
+	if isCustody && len(updatedPieces) < rcv.kPiece {
 		go rcv.pullMissingPiecesFromPeers(blockID, row, col)
 	}
 
 	return nil
+}
+
+// subscribeToNonCustodyCells subscribes to the per-node GossipSub topics of custody nodes
+// that manage cells this node does NOT have primary/backup custody of.
+// It picks >=2 custody nodes per needed cell (shuffled for randomness) and subscribes to
+// each custody node's TopicNode. ceil(kPiece/2) pieces from each source yields k_piece total.
+//
+// NOTE: This is called lazily from SetPeers after bootstrap routing delivers colPeers.
+func (rcv *Receiver) subscribeToNonCustodyCells(ctx context.Context, colPeers []p2pcommon.PeerInfo) {
+	if len(colPeers) == 0 {
+		return
+	}
+
+	// Sort colPeers by Row for deterministic primary/backup calculation
+	sortedPeers := make([]p2pcommon.PeerInfo, len(colPeers))
+	copy(sortedPeers, colPeers)
+	sort.Slice(sortedPeers, func(i, j int) bool {
+		return sortedPeers[i].Row < sortedPeers[j].Row
+	})
+
+	n := 2 * rcv.kBlock
+	// Track which topics we've already subscribed to (avoid duplicate subscriptions)
+	subscribed := make(map[string]bool)
+
+	for row := 0; row < n; row++ {
+		// Skip cells for which this node is primary or backup custody
+		isPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
+		isBackup := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+		if isPrimary || isBackup {
+			continue
+		}
+
+		// Find primary and backup custody peers for this row
+		var custodyPeers []p2pcommon.PeerInfo
+		for _, p := range sortedPeers {
+			if p.Row == row%rcv.storesPerCol || p.Row == (row+1)%rcv.storesPerCol {
+				custodyPeers = append(custodyPeers, p)
+			}
+		}
+
+		// Shuffle custody peers for randomness (different non-custody nodes favour different sources)
+		for i := len(custodyPeers) - 1; i > 0; i-- {
+			j := mathRandIntn(i + 1)
+			custodyPeers[i], custodyPeers[j] = custodyPeers[j], custodyPeers[i]
+		}
+
+		// Subscribe to up to 2 custody node topics (skip self)
+		subscribed2 := 0
+		for _, custodyPeer := range custodyPeers {
+			if subscribed2 >= 2 {
+				break
+			}
+			if custodyPeer.PeerID == rcv.selfPeerID {
+				continue
+			}
+			topicName := p2pcommon.TopicNode(custodyPeer.PeerID)
+			if subscribed[topicName] {
+				subscribed2++
+				continue // already subscribed from a previous row's custody overlap
+			}
+
+			rcv.subscribedTopicsMu.Lock()
+			if rcv.subscribedTopics == nil {
+				rcv.subscribedTopics = make(map[string]bool)
+			}
+			if rcv.subscribedTopics[topicName] {
+				rcv.subscribedTopicsMu.Unlock()
+				subscribed[topicName] = true
+				subscribed2++
+				continue // already subscribed globally from a previous SetPeers invocation
+			}
+			rcv.subscribedTopics[topicName] = true
+			rcv.subscribedTopicsMu.Unlock()
+
+			topic, err := rcv.broadcaster.JoinTopic(topicName)
+			if err != nil {
+				log.Printf("[StoreNode] Failed to join non-custody topic %s: %v", topicName, err)
+				continue
+			}
+			sub, err := topic.Subscribe()
+			if err != nil {
+				log.Printf("[StoreNode] Failed to subscribe to non-custody topic %s: %v", topicName, err)
+				continue
+			}
+			subscribed[topicName] = true
+			subscribed2++
+			log.Printf("[StoreNode] Subscribed to custody node topic %s (for non-custody row %d)", topicName, row)
+
+			go func(sub *pubsub.Subscription) {
+				for {
+					msg, err := sub.Next(ctx)
+					if err != nil {
+						return
+					}
+					if msg.ReceivedFrom == rcv.host.ID() {
+						continue
+					}
+					data := msg.Data
+					select {
+					case rcv.taskChan <- func() { rcv.processGossipMessage(data) }:
+					default:
+						log.Printf("[StoreNode] taskChan full, dropping non-custody gossip message")
+					}
+				}
+			}(sub)
+		}
+	}
 }
 
 func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
@@ -508,89 +737,116 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 		return
 	}
 
-	allPieces := append([]cda.ReceivedPiece(nil), localPieces...)
+	// Prioritize Backup Node for this row (Row == (row + 1) % storesPerCol)
+	backupRow := (row + 1) % rcv.storesPerCol
+	sort.SliceStable(peersCopy, func(i, j int) bool {
+		if peersCopy[i].Row == backupRow {
+			return true
+		}
+		if peersCopy[j].Row == backupRow {
+			return false
+		}
+		return peersCopy[i].Row < peersCopy[j].Row
+	})
 
-	for _, pInfo := range peersCopy {
-		pid, err := peer.Decode(pInfo.PeerID)
-		if err != nil || pid == rcv.host.ID() {
-			continue
+	var allPieces []cda.ReceivedPiece
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		rcv.cellMu.Lock()
+		localPieces = rcv.cache.GetPieces(blockID, row, col)
+		rcv.cellMu.Unlock()
+		if len(localPieces) >= rcv.kPiece {
+			return
 		}
 
-		for _, addrStr := range pInfo.Multiaddrs {
-			maddr, err := multiaddr.NewMultiaddr(addrStr)
-			if err == nil {
-				rcv.host.Peerstore().AddAddr(pid, maddr, 10*time.Minute)
-			}
-		}
+		allPieces = append([]cda.ReceivedPiece(nil), localPieces...)
 
-		ctxDial, cancelDial := context.WithTimeout(context.Background(), 2*time.Second)
-		err = rcv.host.Connect(ctxDial, peer.AddrInfo{ID: pid})
-		if err != nil {
-			cancelDial()
-			continue
-		}
-
-		pStream, err := rcv.host.NewStream(ctxDial, pid, p2pcommon.ProtoStoreFetch)
-		if err != nil {
-			cancelDial()
-			continue
-		}
-
-		fetchReq := p2pcommon.StoreFetchRequest{
-			BlockID:     blockID,
-			Row:         row,
-			Col:         col,
-			IsRemoteHop: true,
-		}
-
-		if err := json.NewEncoder(pStream).Encode(fetchReq); err != nil {
-			pStream.Close()
-			cancelDial()
-			continue
-		}
-
-		var peerResp p2pcommon.StoreFetchResponse
-		if err := json.NewDecoder(pStream).Decode(&peerResp); err != nil {
-			pStream.Close()
-			cancelDial()
-			continue
-		}
-		pStream.Close()
-		cancelDial()
-
-		for _, pPayload := range peerResp.Pieces {
-			decData, err1 := hex.DecodeString(pPayload.Data)
-			decCoeffs, err2 := hex.DecodeString(pPayload.Coeffs)
-			decProof, err3 := hex.DecodeString(pPayload.Proof)
-			if err1 != nil || err2 != nil || err3 != nil {
+		for _, pInfo := range peersCopy {
+			pid, err := peer.Decode(pInfo.PeerID)
+			if err != nil || pid == rcv.host.ID() {
 				continue
 			}
 
-			p := cda.ReceivedPiece{
-				Row: pPayload.Row,
-				Col: pPayload.Col,
-				Data: rlnc.PieceData{
-					Data:   decData,
-					Coeffs: decCoeffs,
-				},
-				Proof: cda.OpeningProof(decProof),
+			for _, addrStr := range pInfo.Multiaddrs {
+				maddr, err := multiaddr.NewMultiaddr(addrStr)
+				if err == nil {
+					rcv.host.Peerstore().AddAddr(pid, maddr, 10*time.Minute)
+				}
 			}
 
-			rcv.cellMu.Lock()
-			latestPieces := rcv.cache.GetPieces(blockID, row, col)
-			existingCoeffs := make([][]byte, len(latestPieces))
-			for idx, val := range latestPieces {
-				existingCoeffs[idx] = val.Data.Coeffs
+			ctxDial, cancelDial := context.WithTimeout(context.Background(), 2*time.Second)
+			err = rcv.host.Connect(ctxDial, peer.AddrInfo{ID: pid})
+			if err != nil {
+				cancelDial()
+				continue
 			}
 
-			if engine.IsLinearlyIndependent(existingCoeffs, decCoeffs, rcv.kPiece) {
-				rcv.cache.StorePiece(blockID, row, col, p)
-				latestPieces = append(latestPieces, p)
-				log.Printf("[StoreNode] Active pull: stored independent piece for cell [%d, %d] from peer %s (count: %d/%d)", row, col, pid, len(latestPieces), rcv.kPiece)
-				allPieces = latestPieces
-				go rcv.CheckAndLogCompletion(blockID)
+			pStream, err := rcv.host.NewStream(ctxDial, pid, p2pcommon.ProtoStoreFetch)
+			if err != nil {
+				cancelDial()
+				continue
 			}
-			rcv.cellMu.Unlock()
+
+			fetchReq := p2pcommon.StoreFetchRequest{
+				BlockID:     blockID,
+				Row:         row,
+				Col:         col,
+				IsRemoteHop: true,
+			}
+
+			if err := json.NewEncoder(pStream).Encode(fetchReq); err != nil {
+				pStream.Close()
+				cancelDial()
+				continue
+			}
+
+			var peerResp p2pcommon.StoreFetchResponse
+			if err := json.NewDecoder(pStream).Decode(&peerResp); err != nil {
+				pStream.Close()
+				cancelDial()
+				continue
+			}
+			pStream.Close()
+			cancelDial()
+
+			for _, pPayload := range peerResp.Pieces {
+				decData, err1 := hex.DecodeString(pPayload.Data)
+				decCoeffs, err2 := hex.DecodeString(pPayload.Coeffs)
+				decProof, err3 := hex.DecodeString(pPayload.Proof)
+				if err1 != nil || err2 != nil || err3 != nil {
+					continue
+				}
+
+				p := cda.ReceivedPiece{
+					Row: pPayload.Row,
+					Col: pPayload.Col,
+					Data: rlnc.PieceData{
+						Data:   decData,
+						Coeffs: decCoeffs,
+					},
+					Proof: cda.OpeningProof(decProof),
+				}
+
+				rcv.cellMu.Lock()
+				latestPieces := rcv.cache.GetPieces(blockID, row, col)
+				existingCoeffs := make([][]byte, len(latestPieces))
+				for idx, val := range latestPieces {
+					existingCoeffs[idx] = val.Data.Coeffs
+				}
+
+				if engine.IsLinearlyIndependent(existingCoeffs, decCoeffs, rcv.kPiece) {
+					rcv.cache.StorePiece(blockID, row, col, p)
+					latestPieces = append(latestPieces, p)
+					log.Printf("[StoreNode] Active pull (attempt %d): stored independent piece for cell [%d, %d] from peer %s (Row %d) (count: %d/%d)", attempt, row, col, pid, pInfo.Row, len(latestPieces), rcv.kPiece)
+					allPieces = latestPieces
+					go rcv.CheckAndLogCompletion(blockID)
+				}
+				rcv.cellMu.Unlock()
+
+				if len(allPieces) >= rcv.kPiece {
+					break
+				}
+			}
 
 			if len(allPieces) >= rcv.kPiece {
 				break
@@ -600,6 +856,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 		if len(allPieces) >= rcv.kPiece {
 			break
 		}
+		time.Sleep(150 * time.Millisecond)
 	}
 
 	if len(allPieces) >= rcv.kPiece {
@@ -619,6 +876,11 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 					log.Printf("[GossipSub] Failed to gossip recoded piece for cell [%d, %d]: %v", row, col, err)
 				} else {
 					log.Printf("[GossipSub] Successfully gossiped recoded piece for cell [%d, %d] to peers.", row, col)
+					cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+					rcv.broadcastMu.Lock()
+					rcv.cellBroadcastCount[cellKey]++
+					rcv.broadcastMu.Unlock()
+					go rcv.CheckAndLogCompletion(blockID)
 				}
 			}
 		} else {
@@ -841,11 +1103,19 @@ func (rcv *Receiver) IsComplete(blockID string) bool {
 		storesPerCol = 8
 	}
 
+	rcv.broadcastMu.Lock()
+	defer rcv.broadcastMu.Unlock()
+
 	for c := startCol; c < endCol; c++ {
 		for r := 0; r < n; r++ {
 			if r%storesPerCol == rcv.rowIdx {
-				// Custody cell: MUST have >= kPiece pieces for 100% custody completion
+				// 1. Storage completion check: MUST have >= kPiece pieces stored
 				if rcv.cache.GetPieceCount(blockID, r, c) < rcv.kPiece {
+					return false
+				}
+				// 2. Channel dissemination completion check: MUST have published recoded pieces to dedicated node topic
+				cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
+				if rcv.cellBroadcastCount[cellKey] < 1 {
 					return false
 				}
 			}

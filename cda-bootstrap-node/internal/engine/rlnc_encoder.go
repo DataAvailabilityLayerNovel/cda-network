@@ -81,7 +81,7 @@ func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pie
 				if _, err := rand.Read(b); err != nil {
 					coeffs[i] = byte(i + 1)
 				} else {
-					coeffs[i] = (b[0] % 10) + 1 // [1, 10]
+					coeffs[i] = (b[0] % 30) + 1 // [1, 30]
 				}
 			}
 			if isLinearlyIndependent(generatedCoeffs, coeffs, e.k) {
