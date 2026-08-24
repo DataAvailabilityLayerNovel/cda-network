@@ -1,25 +1,26 @@
 # CDA Network Documentation Hub
 
-Welcome to the technical documentation and testing portal for **CDA Network**.
+## 1. Tài Liệu Hệ Thống (System Documentation - [docs/system](file:///home/ubuntu/cda-network/docs/system/README.md))
 
-This documentation is divided into two main categories: **System Documentation** and **Testing & Measurement Documentation**.
+Tài liệu mô tả kiến trúc, giao thức truyền thông, thuật toán toán học, đặc tả kỹ thuật và các giao diện CLI/curl API, được chia thành 3 đầu mục:
 
----
-
-## 1. Tài Liệu Hệ Thống (System Documentation)
-
-Các tài liệu mô tả kiến trúc, giao thức truyền thông, thuật toán toán học và lộ trình phát triển:
-
-- **[Kiến Trúc Tổng Thể (System Architecture)](file:///home/ubuntu/cda-network/docs/system/arch.md)**: 
+### 1.1. 🏗️ Kiến Trúc Hệ Thống (System Architecture)
+- **[Kiến Trúc Tổng Thể (System Architecture)](file:///home/ubuntu/cda-network/docs/system/system_architecture/arch.md)**: 
   Mô hình phân tầng hệ thống (Layer L2, Routing Bootstrap, Storage Custody, Light Clients), cấu trúc ma trận ODS/EDS và quy trình luân chuyển dữ liệu.
-- **[Giao Thức Mạng P2P & Định Tuyến (Networking & P2P Topology)](file:///home/ubuntu/cda-network/docs/system/network.md)**: 
-  Cơ chế GossipSub Subnets theo cột, thuật toán Verifiable Custody Address Mapping và giao thức đồng bộ Active Pull.
-- **[Mô Tả & Đặc Tả Kỹ Thuật Hệ Thống Thực Tế (Detailed System & Implementation Spec)](file:///home/ubuntu/cda-network/docs/system/technical_spec.md)**: 
-  Tài liệu mô tả chi tiết kiến trúc hiện thực thực tế của toàn bộ codebase: vị trí file mã nguồn, pipeline xử lý dữ liệu, giao thức stream P2P, cơ chế quản lý custody/pruning, các tính năng đã hoàn thiện và hạn chế kỹ thuật của từng loại node (Publisher, Bootstrap, Store, Light).
-- **[Đánh Giá Hệ Thống & Lộ Trình Triển Khai Thực Tế (Evaluation & Production Roadmap)](file:///home/ubuntu/cda-network/docs/system/evaluation_and_production_roadmap.md)**: 
-  Phân tích chuyên sâu về ưu điểm, điểm nghẽn kỹ thuật và lộ trình 4 giai đoạn (Phase 1 → Phase 4) để đưa CDA Network lên môi trường Production quy mô lớn.
-- **[Kế Hoạch & Lộ Trình Phát Triển (Architecture & Engineering Plan)](file:///home/ubuntu/cda-network/docs/system/plan.md)**: 
+- **[Kế Hoạch & Lộ Trình Phát Triển (Architecture & Engineering Plan)](file:///home/ubuntu/cda-network/docs/system/system_architecture/plan.md)**: 
   Mục tiêu thiết kế, phân rã các module mã nguồn và kế hoạch tích hợp sản phẩm.
+- **[Tài Liệu Chuyển Đổi Kênh P2P (Per-Node Channels Migration)](file:///home/ubuntu/cda-network/docs/system/system_architecture/per_node_channels_migration.md)**: 
+  Tài liệu mô tả kiến trúc chuyển đổi nâng cấp kênh giao tiếp P2P stream tách biệt theo từng node.
+
+### 1.2. 🌐 Kiến Trúc Mạng (Network Architecture)
+- **[Giao Thức Mạng P2P & Định Tuyến Topology (Networking & P2P Topology)](file:///home/ubuntu/cda-network/docs/system/network_architecture/network.md)**: 
+  Cơ chế GossipSub Subnets theo cột, thuật toán Verifiable Custody Address Mapping và giao thức đồng bộ Active Pull.
+
+### 1.3. 🛠️ Tài Liệu Kỹ Thuật (Technical Documentation)
+- **[Đặc Tả Kỹ Thuật Hệ Thống Thực Tế (Detailed System & Implementation Spec)](file:///home/ubuntu/cda-network/docs/system/technical_docs/technical_spec.md)**: 
+  Tài liệu mô tả chi tiết kiến trúc hiện thực thực tế của toàn bộ codebase: vị trí file mã nguồn, pipeline xử lý dữ liệu, giao thức stream P2P, cơ chế quản lý custody/pruning.
+- **[Hướng Dẫn CLI & Lệnh Curl REST API (CLI & Curl API Guide)](file:///home/ubuntu/cda-network/docs/system/technical_docs/cli_and_curl_guide.md)**: 
+  Tài liệu mô tả chi tiết các lệnh `curl` HTTP REST API (Publisher, Light Node DAS, Bootstrap SSE) và các công cụ dòng lệnh CLI (`publish.sh`, `das.sh`, `bot_das.sh`, `block_publisher_bot.py`).
 
 ---
 
@@ -27,10 +28,6 @@ Các tài liệu mô tả kiến trúc, giao thức truyền thông, thuật to�
 
 Các kịch bản kiểm thử tích hợp (E2E), khả năng phục hồi lỗi, bảo mật và hướng dẫn đo lường hiệu năng:
 
-- **[Kế Hoạch & Hướng Dẫn Thực Thi Kiểm Thử Toàn Diện (Deployment & Test Master Plan)](file:///home/ubuntu/cda-network/docs/testing/deployment_and_test_plan.md)**: 
-  Đặc tả các kịch bản kiểm thử cốt lõi (Single-Seed Discovery, Join/Leave Lifecycle, Docker Compose Matrix, Byzantine Defending, Distributed Reconstruction) và hệ thống chỉ số Prometheus & Grafana.
-- **[Hướng Dẫn Kịch Bản 3: Phục Hồi Dữ Liệu Khối Phân Tán (Distributed Reconstruction Test Guide)](file:///home/ubuntu/cda-network/docs/testing/scenario_3_reconstruction_test_guide.md)**: 
-  Hướng dẫn chi tiết chạy kịch bản kiểm thử mất toàn bộ cột mạng và tự động tái tạo 100% dữ liệu gốc ODS bằng giải mã ngang Reed-Solomon.
 - **[Hướng Dẫn Kiểm Thử Ghi Nhận Hoàn Thành & DAS (Completion & DAS Test Guide)](file:///home/ubuntu/cda-network/docs/testing/completion_test_guide.md)**: 
   Quy trình kiểm thử trạng thái `IsComplete` lưu trữ custody tại Store Node và ghi nhận log lấy mẫu thành công tại Light Node.
 
