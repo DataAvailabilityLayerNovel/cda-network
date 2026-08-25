@@ -276,11 +276,11 @@ func (s *APIService) TriggerAutoDAS(header *BlockHeader, numRandomSamples int) {
 	} else {
 		failedCells := []string{}
 		for _, res := range results {
-			if !res.Verified && len(failedCells) < 5 {
-				failedCells = append(failedCells, res.Error)
+			if !res.Verified && len(failedCells) < 10 {
+				failedCells = append(failedCells, fmt.Sprintf("[%d,%d]:%s", res.Row, res.Col, res.Error))
 			}
 		}
-		log.Printf("[Auto-DAS] [Height: %d] ⚠️ DAS Partial for %s (%d/%d verified in %v). First failures: %v",
+		log.Printf("[Auto-DAS] [Height: %d] ⚠️ DAS Partial for %s (%d/%d verified in %v). Failed cells: %v",
 			height, blockID, verifiedCount, len(results), duration, failedCells)
 	}
 }
