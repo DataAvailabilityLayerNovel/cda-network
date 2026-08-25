@@ -85,6 +85,10 @@ type Receiver struct {
 	broadcastMu        sync.Mutex
 	cellBroadcastCount map[string]int
 
+	// Non-custody cell lock: once recoded with >=2 pieces from >=2 sources, ignore further pieces for this cell
+	nonCustodyLockedMu sync.Mutex
+	nonCustodyLocked   map[string]bool
+
 	// Track globally subscribed non-custody topics to prevent duplicate subscriptions across SetPeers calls
 	subscribedTopicsMu sync.Mutex
 	subscribedTopics   map[string]bool
@@ -136,8 +140,9 @@ func NewReceiver(
 		pruneTTL:          pruneTTL,
 		cellLastActivity:  make(map[string]time.Time),
 		prunedCells:       make(map[string]bool),
-		completedBlocks:   make(map[string]bool),
+		completedBlocks:    make(map[string]bool),
 		cellBroadcastCount: make(map[string]int),
+		nonCustodyLocked:   make(map[string]bool),
 		subscribedTopics:   make(map[string]bool),
 		peerContributions: make(map[string]map[string]int),
 		taskChan:          make(chan func(), 20000),
@@ -479,6 +484,22 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 		return fmt.Errorf("piece verification failed")
 	}
 
+	// Early exit for non-custody cells that are already locked (recoded and done)
+	{
+		isPrimaryEarly := (row % rcv.storesPerCol) == rcv.rowIdx
+		isBackupEarly := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+		if !isPrimaryEarly && !isBackupEarly {
+			cellKeyEarly := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+			rcv.nonCustodyLockedMu.Lock()
+			locked := rcv.nonCustodyLocked[cellKeyEarly]
+			rcv.nonCustodyLockedMu.Unlock()
+			if locked {
+				log.Printf("[StoreNode] Non-custody cell [%d, %d] already locked. Dropping piece.", row, col)
+				return nil
+			}
+		}
+	}
+
 	rcv.cellMu.Lock()
 	// 4. Rank Filtering (Gaussian Elimination)
 	existingPieces := rcv.cache.GetPieces(blockID, row, col)
@@ -533,75 +554,106 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 	isCustody := isPrimary || isBackup
 
 	if isCustody {
-		// Custody nodes (primary + backup): recode as soon as rank >= 2 and broadcast k_piece pieces
-		if !isGossip && len(updatedPieces) >= 2 {
+		// Custody nodes (primary + backup): recode only when rank >= kPiece (full rank).
+		// Broadcast kPiece/2 independently recoded pieces to give subscribers enough diversity.
+		if !isGossip && len(updatedPieces) >= rcv.kPiece {
 			go func(bID string, r, c int, pieces []cda.ReceivedPiece, primary bool) {
 				if !primary {
 					// Backup Node: stagger 25ms to ensure piece diversity
 					time.Sleep(25 * time.Millisecond)
 				}
-				log.Printf("[GossipSub] Local rank for cell [%d, %d] is %d/%d (>=2, Primary=%v). Recoding and publishing to node topic...", r, c, len(pieces), rcv.kPiece, primary)
-				recodedPiece, err := rcv.rm.RecodePieces(pieces)
-				if err != nil {
-					log.Printf("[GossipSub] Failed to recode pieces for cell [%d, %d]: %v", r, c, err)
-					return
+				numBroadcast := rcv.kPiece / 2
+				if numBroadcast < 1 {
+					numBroadcast = 1
 				}
-				rcv.cellMu.Lock()
-				rcv.cache.StoreRecodedPiece(bID, r, c, *recodedPiece)
-				rcv.cellMu.Unlock()
+				log.Printf("[GossipSub] Cell [%d, %d] reached full rank %d/%d (Primary=%v). Broadcasting %d recoded pieces...", r, c, len(pieces), rcv.kPiece, primary, numBroadcast)
 
-				if rcv.pruneEnable {
-					rcv.pruneMu.Lock()
-					key := fmt.Sprintf("%s_%d_%d", bID, r, c)
-					if !rcv.prunedCells[key] {
-						rcv.cellLastActivity[key] = time.Now()
-					}
-					rcv.pruneMu.Unlock()
+				targetPieces := pieces
+				if len(targetPieces) > rcv.kPiece {
+					targetPieces = targetPieces[:rcv.kPiece]
 				}
-				log.Printf("[GossipSub] Publishing recoded piece for cell [%d, %d] (Primary=%v) to node topic...", r, c, primary)
-				if err := rcv.broadcaster.BroadcastRecodedPiece(bID, r, c, recodedPiece, pieceCommits); err != nil {
-					log.Printf("[GossipSub] Failed to publish recoded piece for cell [%d, %d]: %v", r, c, err)
-				} else {
-					log.Printf("[GossipSub] Successfully published recoded piece for cell [%d, %d] (Primary=%v).", r, c, primary)
-					cellKey := fmt.Sprintf("%s_%d_%d", bID, r, c)
-					rcv.broadcastMu.Lock()
-					rcv.cellBroadcastCount[cellKey]++
-					rcv.broadcastMu.Unlock()
-					go rcv.CheckAndLogCompletion(bID)
-
-					if !primary {
-						// Backup custody node: prune raw pieces after successful dissemination to release backup storage
-						rcv.cellMu.Lock()
-						rcv.cache.PruneRawPieces(bID, r, c, rcv.rm)
-						rcv.cellMu.Unlock()
-						log.Printf("[StoreNode] Backup: cell [%d, %d] dissemination completed; raw pieces pruned.", r, c)
+				broadcastSucceeded := 0
+				for i := 0; i < numBroadcast; i++ {
+					recodedPiece, err := rcv.rm.RecodePieces(targetPieces)
+					if err != nil {
+						log.Printf("[GossipSub] Failed to recode pieces for cell [%d, %d] (round %d/%d): %v", r, c, i+1, numBroadcast, err)
+						continue
 					}
+					rcv.cellMu.Lock()
+					rcv.cache.StoreRecodedPiece(bID, r, c, *recodedPiece)
+					rcv.cellMu.Unlock()
+
+					if rcv.pruneEnable {
+						rcv.pruneMu.Lock()
+						key := fmt.Sprintf("%s_%d_%d", bID, r, c)
+						if !rcv.prunedCells[key] {
+							rcv.cellLastActivity[key] = time.Now()
+						}
+						rcv.pruneMu.Unlock()
+					}
+					if err := rcv.broadcaster.BroadcastRecodedPiece(bID, r, c, recodedPiece, pieceCommits); err != nil {
+						log.Printf("[GossipSub] Failed to publish recoded piece for cell [%d, %d] (round %d/%d): %v", r, c, i+1, numBroadcast, err)
+					} else {
+						broadcastSucceeded++
+						log.Printf("[GossipSub] Successfully published recoded piece for cell [%d, %d] (Primary=%v, round %d/%d).", r, c, primary, i+1, numBroadcast)
+						cellKey := fmt.Sprintf("%s_%d_%d", bID, r, c)
+						rcv.broadcastMu.Lock()
+						rcv.cellBroadcastCount[cellKey]++
+						rcv.broadcastMu.Unlock()
+						go rcv.CheckAndLogCompletion(bID)
+					}
+				}
+
+				if !primary && broadcastSucceeded > 0 {
+					// Backup custody node: prune raw pieces after full dissemination round completes
+					rcv.cellMu.Lock()
+					rcv.cache.PruneRawPieces(bID, r, c, rcv.rm)
+					rcv.cellMu.Unlock()
+					log.Printf("[StoreNode] Backup: cell [%d, %d] dissemination completed (%d/%d rounds); raw pieces pruned.", r, c, broadcastSucceeded, numBroadcast)
 				}
 			}(blockID, row, col, updatedPieces, isPrimary)
 		}
 	} else {
-		// Non-custody nodes: recode only when we have k_piece pieces from >=2 different custody sources.
-		// Then keep exactly 1 recoded piece and discard raw pieces to save space.
+		// Non-custody nodes: recode as soon as >=2 independent pieces from >=2 different sources are available.
+		// Then keep exactly 1 recoded piece, discard raw pieces, and lock the cell to ignore further pieces.
 		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
 		rcv.contribMu.Lock()
 		numSources := len(rcv.peerContributions[cellKey])
 		rcv.contribMu.Unlock()
 
-		if len(updatedPieces) >= rcv.kPiece && numSources >= 2 {
-			go func(bID string, r, c int, pieces []cda.ReceivedPiece) {
-				log.Printf("[StoreNode] Non-custody: cell [%d, %d] has %d pieces from %d sources. Recoding and keeping 1 piece.", r, c, len(pieces), numSources)
-				recodedPiece, err := rcv.rm.RecodePieces(pieces[:rcv.kPiece])
-				if err != nil {
-					log.Printf("[StoreNode] Non-custody recode failed for cell [%d, %d]: %v", r, c, err)
-					return
-				}
-				rcv.cellMu.Lock()
-				rcv.cache.StoreRecodedPiece(bID, r, c, *recodedPiece)
-				// Prune raw pieces — non-custody node keeps only the 1 recoded piece
-				rcv.cache.PruneRawPieces(bID, r, c, rcv.rm)
-				rcv.cellMu.Unlock()
-				log.Printf("[StoreNode] Non-custody: cell [%d, %d] recoded and raw pieces pruned.", r, c)
-			}(blockID, row, col, updatedPieces)
+		if len(updatedPieces) >= 2 && numSources >= 2 {
+			// Atomically acquire the lock before launching goroutine to prevent parallel recode attempts
+			rcv.nonCustodyLockedMu.Lock()
+			alreadyLocked := rcv.nonCustodyLocked[cellKey]
+			if !alreadyLocked {
+				rcv.nonCustodyLocked[cellKey] = true
+			}
+			rcv.nonCustodyLockedMu.Unlock()
+
+			if !alreadyLocked {
+				go func(bID string, r, c int, pieces []cda.ReceivedPiece, ck string) {
+					targetPieces := pieces
+					if len(targetPieces) > 2 {
+						targetPieces = targetPieces[:2]
+					}
+					log.Printf("[StoreNode] Non-custody: cell [%d, %d] has %d pieces from %d sources (recoding 2 pieces). Recoding and locking cell.", r, c, len(pieces), numSources)
+					recodedPiece, err := rcv.rm.RecodePieces(targetPieces)
+					if err != nil {
+						log.Printf("[StoreNode] Non-custody recode failed for cell [%d, %d]: %v", r, c, err)
+						// Unlock on failure to allow retry
+						rcv.nonCustodyLockedMu.Lock()
+						rcv.nonCustodyLocked[ck] = false
+						rcv.nonCustodyLockedMu.Unlock()
+						return
+					}
+					rcv.cellMu.Lock()
+					rcv.cache.StoreRecodedPiece(bID, r, c, *recodedPiece)
+					// Prune raw pieces — non-custody node keeps only the 1 recoded piece
+					rcv.cache.PruneRawPieces(bID, r, c, rcv.rm)
+					rcv.cellMu.Unlock()
+					log.Printf("[StoreNode] Non-custody: cell [%d, %d] recoded, raw pieces pruned, cell locked permanently.", r, c)
+				}(blockID, row, col, updatedPieces, cellKey)
+			}
 		}
 	}
 
@@ -861,26 +913,55 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 
 	if len(allPieces) >= rcv.kPiece {
 		pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
-		recodedPiece, err := rcv.rm.RecodePieces(allPieces)
+		// Active pull: broadcast kPiece/2 independently recoded pieces for primary or backup custody nodes
+		isPullPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
+		isPullBackup := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+
+		targetPieces := allPieces
+		if len(targetPieces) > rcv.kPiece {
+			targetPieces = targetPieces[:rcv.kPiece]
+		}
+
+		// Always recode+store once first (for local availability)
+		firstRecoded, err := rcv.rm.RecodePieces(targetPieces)
 		if err == nil {
 			rcv.cellMu.Lock()
-			rcv.cache.StoreRecodedPiece(blockID, row, col, *recodedPiece)
+			rcv.cache.StoreRecodedPiece(blockID, row, col, *firstRecoded)
 			rcv.cellMu.Unlock()
 			log.Printf("[StoreNode] Successfully recoded cell [%d, %d] in active pull.", row, col)
 			go rcv.CheckAndLogCompletion(blockID)
 
-			// Try to gossip it
-			isCustody := (row % rcv.storesPerCol) == rcv.rowIdx
-			if isCustody {
-				if err := rcv.broadcaster.BroadcastRecodedPiece(blockID, row, col, recodedPiece, pieceCommits); err != nil {
-					log.Printf("[GossipSub] Failed to gossip recoded piece for cell [%d, %d]: %v", row, col, err)
-				} else {
-					log.Printf("[GossipSub] Successfully gossiped recoded piece for cell [%d, %d] to peers.", row, col)
-					cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
-					rcv.broadcastMu.Lock()
-					rcv.cellBroadcastCount[cellKey]++
-					rcv.broadcastMu.Unlock()
-					go rcv.CheckAndLogCompletion(blockID)
+			if isPullPrimary || isPullBackup {
+				numBroadcast := rcv.kPiece / 2
+				if numBroadcast < 1 {
+					numBroadcast = 1
+				}
+				broadcastSucceeded := 0
+				for i := 0; i < numBroadcast; i++ {
+					recodedPiece, rerr := rcv.rm.RecodePieces(targetPieces)
+					if rerr != nil {
+						log.Printf("[GossipSub] Active pull: recode round %d/%d failed for cell [%d, %d]: %v", i+1, numBroadcast, row, col, rerr)
+						continue
+					}
+					if berr := rcv.broadcaster.BroadcastRecodedPiece(blockID, row, col, recodedPiece, pieceCommits); berr != nil {
+						log.Printf("[GossipSub] Active pull: broadcast round %d/%d failed for cell [%d, %d] (Primary=%v): %v", i+1, numBroadcast, row, col, isPullPrimary, berr)
+					} else {
+						broadcastSucceeded++
+						log.Printf("[GossipSub] Active pull: broadcast round %d/%d succeeded for cell [%d, %d] (Primary=%v).", i+1, numBroadcast, row, col, isPullPrimary)
+						cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+						rcv.broadcastMu.Lock()
+						rcv.cellBroadcastCount[cellKey]++
+						rcv.broadcastMu.Unlock()
+						go rcv.CheckAndLogCompletion(blockID)
+					}
+				}
+
+				if !isPullPrimary && broadcastSucceeded > 0 {
+					// Backup: prune raw pieces after successful active-pull broadcast round
+					rcv.cellMu.Lock()
+					rcv.cache.PruneRawPieces(blockID, row, col, rcv.rm)
+					rcv.cellMu.Unlock()
+					log.Printf("[StoreNode] Backup: active pull cell [%d, %d] dissemination completed (%d/%d rounds); raw pieces pruned.", row, col, broadcastSucceeded, numBroadcast)
 				}
 			}
 		} else {
@@ -1103,19 +1184,33 @@ func (rcv *Receiver) IsComplete(blockID string) bool {
 		storesPerCol = 8
 	}
 
+	// Minimum number of broadcast rounds required per cell
+	minBroadcast := rcv.kPiece / 2
+	if minBroadcast < 1 {
+		minBroadcast = 1
+	}
+
 	rcv.broadcastMu.Lock()
 	defer rcv.broadcastMu.Unlock()
 
 	for c := startCol; c < endCol; c++ {
 		for r := 0; r < n; r++ {
-			if r%storesPerCol == rcv.rowIdx {
-				// 1. Storage completion check: MUST have >= kPiece pieces stored
+			isPrimary := (r % storesPerCol) == rcv.rowIdx
+			isBackup := ((r + 1) % storesPerCol) == rcv.rowIdx
+			cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
+			if isPrimary {
+				// Primary: must retain >= kPiece raw pieces for long-term storage
+				// AND must have disseminated >= kPiece/2 recoded pieces to the network
 				if rcv.cache.GetPieceCount(blockID, r, c) < rcv.kPiece {
 					return false
 				}
-				// 2. Channel dissemination completion check: MUST have published recoded pieces to dedicated node topic
-				cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
-				if rcv.cellBroadcastCount[cellKey] < 1 {
+				if rcv.cellBroadcastCount[cellKey] < minBroadcast {
+					return false
+				}
+			} else if isBackup {
+				// Backup: raw pieces are pruned after broadcast; storage check is not applicable.
+				// Only verify that dissemination was completed (>= kPiece/2 broadcasts).
+				if rcv.cellBroadcastCount[cellKey] < minBroadcast {
 					return false
 				}
 			}
