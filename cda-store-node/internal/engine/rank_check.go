@@ -23,8 +23,14 @@ func IsLinearlyIndependent(existingCoeffs [][]byte, newCoeff []byte, k int) bool
 	// Pad the remaining rows with standard basis vectors: [0..0, 1, 0..0]
 	// where 1 is at index i.
 	for i := m + 1; i < k; i++ {
-		row := make([]byte, k)
-		row[i] = 1 // 1 in Fr is represented as 1 at index i (SetUint64(1) works)
+		var row []byte
+		if len(newCoeff) == 2*k {
+			row = make([]byte, 2*k)
+			row[2*i+1] = 1 // 1 in BigEndian uint16 at index i
+		} else {
+			row = make([]byte, k)
+			row[i] = 1
+		}
 		A[i] = row
 	}
 

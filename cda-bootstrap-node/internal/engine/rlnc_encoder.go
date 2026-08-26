@@ -2,6 +2,7 @@ package engine
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"math/big"
 
@@ -75,13 +76,14 @@ func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pie
 		// 2. Generate random coefficients in Fr and check linear independence
 		var coeffs []byte
 		for {
-			coeffs = make([]byte, e.k)
+			coeffs = make([]byte, 2*e.k)
 			for i := 0; i < e.k; i++ {
-				b := make([]byte, 1)
+				b := make([]byte, 2)
 				if _, err := rand.Read(b); err != nil {
-					coeffs[i] = byte(i + 1)
+					binary.BigEndian.PutUint16(coeffs[i*2:], uint16(i+1))
 				} else {
-					coeffs[i] = (b[0] % 30) + 1 // [1, 30]
+					val := (binary.BigEndian.Uint16(b) % 1000) + 1
+					binary.BigEndian.PutUint16(coeffs[i*2:], val)
 				}
 			}
 			if isLinearlyIndependent(generatedCoeffs, coeffs, e.k) {
@@ -97,7 +99,8 @@ func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pie
 		shareSize := len(fragments[0])
 		codedData := make([]byte, shareSize)
 		for j := 0; j < e.k; j++ {
-			vectorMulAddFrLocal(codedData, fragments[j], coeffs[j])
+			cVal := binary.BigEndian.Uint16(coeffs[j*2 : (j+1)*2])
+			vectorMulAddFrLocal(codedData, fragments[j], cVal)
 		}
 
 		// 4. Compute combined proof: P_i = sum(g_{i,j} * Pi_j)
@@ -137,8 +140,8 @@ func isLinearlyIndependent(existingCoeffs [][]byte, newCoeff []byte, k int) bool
 	A[m] = append([]byte(nil), newCoeff...)
 
 	for i := m + 1; i < k; i++ {
-		row := make([]byte, k)
-		row[i] = 1
+		row := make([]byte, 2*k)
+		row[2*i+1] = 1
 		A[i] = row
 	}
 
@@ -151,7 +154,7 @@ func isLinearlyIndependent(existingCoeffs [][]byte, newCoeff []byte, k int) bool
 	return err == nil
 }
 
-func vectorMulAddFrLocal(dst, src []byte, coeff byte) {
+func vectorMulAddFrLocal(dst, src []byte, coeff uint16) {
 	if coeff == 0 {
 		return
 	}

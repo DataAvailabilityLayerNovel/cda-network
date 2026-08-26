@@ -1,3 +1,6 @@
 [submodule "rlnc-rsmt2d"]
 	path = rlnc-rsmt2d
 	url = https://github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d.git
+[submodule "cometbft"]
+	path = cometbft
+	url = https://github.com/atuan10/cometbft.git
