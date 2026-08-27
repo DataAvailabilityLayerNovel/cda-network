@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -332,7 +331,7 @@ func (s *CustodyStore) IsComplete(blockID string, colIdx, k int) bool {
 	return complete
 }
 
-func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.RecipientManager, kzg cda.KZGProvider) int {
+func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.RecipientManager) int {
 	if s.db == nil {
 		return 0
 	}
@@ -340,22 +339,7 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 	rawKey := []byte(fmt.Sprintf("received_%s_%d_%d", blockID, row, col))
 	recodedKey := []byte(fmt.Sprintf("recoded_%s_%d_%d", blockID, row, col))
 
-	var pubComm cda.ColumnCommitment
-	pieceCommits, hasCommits := s.GetAnchoredCommitments(blockID, col)
-	if hasCommits && len(pieceCommits) > 0 && kzg != nil {
-		pieceCommitsTyped := make([]cda.PieceCommitment, len(pieceCommits))
-		for i, c := range pieceCommits {
-			pieceCommitsTyped[i] = cda.PieceCommitment(c)
-		}
-		// Try combining anchored piece commitments with standard 1-byte basis if available
-		coeffs := make([]byte, len(pieceCommits)*2)
-		for i := 0; i < len(pieceCommits); i++ {
-			binary.BigEndian.PutUint16(coeffs[i*2:], 1)
-		}
-		if combined, err := kzg.Combine(pieceCommitsTyped, coeffs); err == nil {
-			pubComm = combined
-		}
-	}
+	pieceCommits, _ := s.GetAnchoredCommitments(blockID, col)
 
 	_ = s.db.Update(func(txn *badger.Txn) error {
 		var rawPieces []cda.ReceivedPiece
@@ -370,27 +354,12 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 		if len(rawPieces) > 0 {
 			var compressedPiece cda.ReceivedPiece
 			if len(rawPieces) >= 2 && rm != nil {
-				recoded, err := rm.RecodePiecesWithVerify(rawPieces, pubComm, 5)
+				recoded, err := rm.RecodePiecesWithVerify(rawPieces, pieceCommits, 5)
 				if err == nil && recoded != nil {
 					compressedPiece = *recoded
 				} else {
-					// Fallback: nếu sau N lần attempt không tìm thấy bộ hệ số recode hợp lệ,
-					// chọn DUY NHẤT 1 mảnh hợp lệ đã verify trong rawPieces để giữ lại
-					foundValid := false
-					if pubComm != nil {
-						for _, p := range rawPieces {
-							if rm.VerifyPiece(p, pubComm) {
-								compressedPiece = p
-								foundValid = true
-								log.Printf("[CustodyStore] RecodeWithVerify failed for cell [%d, %d]: %v. Selected 1 verified raw piece.", row, col, err)
-								break
-							}
-						}
-					}
-					if !foundValid {
-						compressedPiece = rawPieces[0]
-						log.Printf("[CustodyStore] RecodeWithVerify fallback for cell [%d, %d]: %v. Retaining raw piece 0.", row, col, err)
-					}
+					compressedPiece = rawPieces[0]
+					log.Printf("[CustodyStore] RecodeWithVerify fallback for cell [%d, %d]: %v. Retaining raw piece 0.", row, col, err)
 				}
 			} else {
 				compressedPiece = rawPieces[0]
