@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	"github.com/dgraph-io/badger/v4"
@@ -18,12 +19,17 @@ type AnchoredData struct {
 }
 
 type CustodyStore struct {
-	db   *badger.DB
-	port int
+	db              *badger.DB
+	port            int
+	countMu         sync.RWMutex
+	pieceCountCache map[string]int
 }
 
 func NewCustodyStore(port int) *CustodyStore {
-	store := &CustodyStore{port: port}
+	store := &CustodyStore{
+		port:            port,
+		pieceCountCache: make(map[string]int),
+	}
 
 	if port > 0 {
 		baseDir := fmt.Sprintf("data/store_%d", port)
@@ -105,8 +111,10 @@ func (s *CustodyStore) StorePiece(blockID string, row, col int, piece cda.Receiv
 	if s.db == nil {
 		return
 	}
-	key := []byte(fmt.Sprintf("received_%s_%d_%d", blockID, row, col))
+	keyStr := fmt.Sprintf("received_%s_%d_%d", blockID, row, col)
+	key := []byte(keyStr)
 
+	var newCount int
 	_ = s.db.Update(func(txn *badger.Txn) error {
 		var pieces []cda.ReceivedPiece
 		item, err := txn.Get(key)
@@ -116,12 +124,17 @@ func (s *CustodyStore) StorePiece(blockID string, row, col int, piece cda.Receiv
 			})
 		}
 		pieces = append(pieces, piece)
+		newCount = len(pieces)
 		valData, err := json.Marshal(pieces)
 		if err != nil {
 			return err
 		}
 		return txn.Set(key, valData)
 	})
+
+	s.countMu.Lock()
+	s.pieceCountCache[keyStr] = newCount
+	s.countMu.Unlock()
 }
 
 func (s *CustodyStore) GetPieces(blockID string, row, col int) []cda.ReceivedPiece {
@@ -184,7 +197,16 @@ func (s *CustodyStore) GetPieceCount(blockID string, row, col int) int {
 	if s.db == nil {
 		return 0
 	}
-	key := []byte(fmt.Sprintf("received_%s_%d_%d", blockID, row, col))
+	keyStr := fmt.Sprintf("received_%s_%d_%d", blockID, row, col)
+
+	s.countMu.RLock()
+	c, found := s.pieceCountCache[keyStr]
+	s.countMu.RUnlock()
+	if found {
+		return c
+	}
+
+	key := []byte(keyStr)
 	count := 0
 
 	_ = s.db.View(func(txn *badger.Txn) error {
@@ -200,6 +222,10 @@ func (s *CustodyStore) GetPieceCount(blockID string, row, col int) int {
 			return nil
 		})
 	})
+
+	s.countMu.Lock()
+	s.pieceCountCache[keyStr] = count
+	s.countMu.Unlock()
 
 	return count
 }
@@ -374,16 +400,10 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 		return txn.Delete(rawKey)
 	})
 
-	if deletedCount > 0 {
-		go func() {
-			for {
-				err := s.db.RunValueLogGC(0.5)
-				if err != nil {
-					break
-				}
-			}
-		}()
-	}
+	rawKeyStr := fmt.Sprintf("received_%s_%d_%d", blockID, row, col)
+	s.countMu.Lock()
+	s.pieceCountCache[rawKeyStr] = 0
+	s.countMu.Unlock()
 
 	return deletedCount
 }

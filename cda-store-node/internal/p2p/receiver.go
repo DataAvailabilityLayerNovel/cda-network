@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -32,7 +33,6 @@ import (
 
 // mathRandIntn wraps rand.Intn for use in shuffle (avoids import collision)
 func mathRandIntn(n int) int { return rand.Intn(n) }
-
 
 type Receiver struct {
 	host          host.Host
@@ -58,7 +58,7 @@ type Receiver struct {
 
 	// Per-cell peer contribution tracking: cellKey -> senderPeerID -> count
 	// Used to enforce "pull from ≥2 different custody nodes" before recoding
-	contribMu        sync.Mutex
+	contribMu         sync.Mutex
 	peerContributions map[string]map[string]int
 
 	// Rate limiting
@@ -90,14 +90,38 @@ type Receiver struct {
 	nonCustodyLocked   map[string]bool
 
 	// Track globally subscribed non-custody topics to prevent duplicate subscriptions across SetPeers calls
+	// Track globally subscribed non-custody topics to prevent duplicate subscriptions across SetPeers calls
 	subscribedTopicsMu sync.Mutex
 	subscribedTopics   map[string]bool
 
-	// Sequential block processing queue
-	taskChan chan func()
+	// Sharded worker queues by cell hash to ensure cell-level ordering and eliminate race conditions
+	workerChans []chan func()
+	numWorkers  int
 
 	// Context for subscribeToNonCustodyCells goroutines lifetime
 	ctx context.Context
+}
+
+func hashCellKey(key string) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return h
+}
+
+func (rcv *Receiver) dispatchTask(cellKey string, task func()) {
+	if rcv.numWorkers <= 0 || len(rcv.workerChans) == 0 {
+		task()
+		return
+	}
+	idx := int(hashCellKey(cellKey) % uint32(rcv.numWorkers))
+	select {
+	case rcv.workerChans[idx] <- task:
+	default:
+		log.Printf("[StoreNode] workerChan %d full, dropping task for %s", idx, cellKey)
+	}
 }
 
 func NewReceiver(
@@ -118,6 +142,15 @@ func NewReceiver(
 	pruneTTL time.Duration,
 	selfPeerID string,
 ) *Receiver {
+	nWorkers := runtime.NumCPU() * 2
+	if nWorkers < 4 {
+		nWorkers = 4
+	}
+	chans := make([]chan func(), nWorkers)
+	for i := 0; i < nWorkers; i++ {
+		chans[i] = make(chan func(), 2000)
+	}
+
 	return &Receiver{
 		host:              h,
 		ps:                ps,
@@ -145,7 +178,8 @@ func NewReceiver(
 		nonCustodyLocked:   make(map[string]bool),
 		subscribedTopics:   make(map[string]bool),
 		peerContributions: make(map[string]map[string]int),
-		taskChan:          make(chan func(), 20000),
+		workerChans:       chans,
+		numWorkers:        nWorkers,
 	}
 }
 
@@ -174,8 +208,10 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	// Store context for use in SetPeers (which may be called after Start)
 	rcv.ctx = ctx
 
-	// Start sequential task worker
-	go rcv.workerLoop(ctx)
+	// Start sharded worker pool (1 goroutine per workerChan)
+	for i := 0; i < rcv.numWorkers; i++ {
+		go rcv.workerLoop(ctx, rcv.workerChans[i])
+	}
 	StartMetricsTicker(ctx)
 	LinearIndependentPiecesCount.Set(float64(rcv.totalStoredPieces))
 
@@ -241,10 +277,10 @@ func (rcv *Receiver) Start(ctx context.Context) {
 				continue // skip self
 			}
 			data := msg.Data
-			select {
-			case rcv.taskChan <- func() { rcv.processGossipMessage(data) }:
-			default:
-				log.Printf("[StoreNode] taskChan full, dropping gossip message on node topic")
+			var payload p2pcommon.SeedCellRequest
+			if err := json.Unmarshal(data, &payload); err == nil && payload.BlockID != "" {
+				cellKey := fmt.Sprintf("%s_%d_%d", payload.BlockID, payload.Row, payload.Col)
+				rcv.dispatchTask(cellKey, func() { rcv.processGossipMessage(data) })
 			}
 		}
 	}(selfSub)
@@ -283,21 +319,23 @@ func (rcv *Receiver) Start(ctx context.Context) {
 					continue
 				}
 				data := msg.Data
-				select {
-				case rcv.taskChan <- func() { rcv.processAnchorMessage(data) }:
-				default:
-					log.Printf("[StoreNode] taskChan full, dropping anchor gossip message")
+				var raw map[string]interface{}
+				if err := json.Unmarshal(data, &raw); err == nil {
+					bID, _ := raw["block_id"].(string)
+					cIdx := c
+					colKey := fmt.Sprintf("%s_col_%d", bID, cIdx)
+					rcv.dispatchTask(colKey, func() { rcv.processAnchorMessage(data) })
 				}
 			}
 		}(sub)
 	}
 }
 
-// workerLoop drains taskChan sequentially — one task at a time.
-func (rcv *Receiver) workerLoop(ctx context.Context) {
+// workerLoop drains workerChan sequentially — one task at a time for sharded cells.
+func (rcv *Receiver) workerLoop(ctx context.Context, ch chan func()) {
 	for {
 		select {
-		case task, ok := <-rcv.taskChan:
+		case task, ok := <-ch:
 			if !ok {
 				return
 			}
@@ -407,13 +445,36 @@ func (rcv *Receiver) handleSeedStream(stream network.Stream) {
 }
 
 func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsStr, proofStr string, pieceCommitsStr []string, senderPeerID string, isGossip bool) error {
-	// Early exit: drop incoming pieces if this block is already completed and locked
+	cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+
+	// Early exit 1: drop incoming pieces if this block is already completed and locked
 	rcv.completedMu.Lock()
 	if rcv.completedBlocks != nil && rcv.completedBlocks[blockID] {
 		rcv.completedMu.Unlock()
 		return nil
 	}
 	rcv.completedMu.Unlock()
+
+	// Early exit 2: non-custody cells that are already locked (recoded and done)
+	isPrimaryEarly := (row % rcv.storesPerCol) == rcv.rowIdx
+	isBackupEarly := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+	if !isPrimaryEarly && !isBackupEarly {
+		rcv.nonCustodyLockedMu.Lock()
+		locked := rcv.nonCustodyLocked[cellKey]
+		rcv.nonCustodyLockedMu.Unlock()
+		if locked {
+			log.Printf("[StoreNode] Non-custody cell [%d, %d] already locked. Dropping piece.", row, col)
+			return nil
+		}
+	}
+
+	// Early exit 3: cells that are already pruned
+	rcv.pruneMu.Lock()
+	pruned := rcv.prunedCells[cellKey]
+	rcv.pruneMu.Unlock()
+	if pruned {
+		return nil
+	}
 
 	// 1. Decode payload fields from hex
 	decodedData, err := hex.DecodeString(dataStr)
@@ -486,28 +547,6 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 		return fmt.Errorf("layer 3 verification failed")
 	}
 
-	if !rcv.rm.VerifyPiece(piece, combinedCommit) {
-		ByzantineDetectionsTotal.Inc()
-		log.Printf("[StoreNode] Piece verification failed (KZG pairing mismatch) for cell [%d, %d]", row, col)
-		return fmt.Errorf("piece verification failed")
-	}
-
-	// Early exit for non-custody cells that are already locked (recoded and done)
-	{
-		isPrimaryEarly := (row % rcv.storesPerCol) == rcv.rowIdx
-		isBackupEarly := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
-		if !isPrimaryEarly && !isBackupEarly {
-			cellKeyEarly := fmt.Sprintf("%s_%d_%d", blockID, row, col)
-			rcv.nonCustodyLockedMu.Lock()
-			locked := rcv.nonCustodyLocked[cellKeyEarly]
-			rcv.nonCustodyLockedMu.Unlock()
-			if locked {
-				log.Printf("[StoreNode] Non-custody cell [%d, %d] already locked. Dropping piece.", row, col)
-				return nil
-			}
-		}
-	}
-
 	rcv.cellMu.Lock()
 	// 4. Rank Filtering (Gaussian Elimination)
 	existingPieces := rcv.cache.GetPieces(blockID, row, col)
@@ -566,10 +605,6 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 		// Broadcast kPiece/2 independently recoded pieces to give subscribers enough diversity.
 		if len(updatedPieces) >= rcv.kPiece {
 			go func(bID string, r, c int, pieces []cda.ReceivedPiece, primary bool) {
-				if !primary {
-					// Backup Node: stagger 25ms to ensure piece diversity
-					time.Sleep(25 * time.Millisecond)
-				}
 				numBroadcast := rcv.kPiece / 2
 				if numBroadcast < 1 {
 					numBroadcast = 1
@@ -615,11 +650,16 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 				}
 
 				if !primary && broadcastSucceeded > 0 {
-					// Backup custody node: prune raw pieces after full dissemination round completes
+					// Backup custody node: prune raw pieces immediately after full dissemination round completes
 					rcv.cellMu.Lock()
 					rcv.cache.PruneRawPieces(bID, r, c, rcv.rm)
 					rcv.cellMu.Unlock()
+					cellKey := fmt.Sprintf("%s_%d_%d", bID, r, c)
+					rcv.pruneMu.Lock()
+					rcv.prunedCells[cellKey] = true
+					rcv.pruneMu.Unlock()
 					log.Printf("[StoreNode] Backup: cell [%d, %d] dissemination completed (%d/%d rounds); raw pieces pruned.", r, c, broadcastSucceeded, numBroadcast)
+					go rcv.CheckAndLogCompletion(bID)
 				}
 			}(blockID, row, col, updatedPieces, isPrimary)
 		}
@@ -658,6 +698,9 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 					// Prune raw pieces — non-custody node keeps only the 1 recoded piece
 					rcv.cache.PruneRawPieces(bID, r, c, rcv.rm)
 					rcv.cellMu.Unlock()
+					rcv.pruneMu.Lock()
+					rcv.prunedCells[ck] = true
+					rcv.pruneMu.Unlock()
 					log.Printf("[StoreNode] Non-custody: cell [%d, %d] recoded, raw pieces pruned, cell locked permanently.", r, c)
 					go rcv.CheckAndLogCompletion(bID)
 				}(blockID, row, col, updatedPieces, cellKey)
@@ -769,10 +812,10 @@ func (rcv *Receiver) subscribeToNonCustodyCells(ctx context.Context, colPeers []
 						continue
 					}
 					data := msg.Data
-					select {
-					case rcv.taskChan <- func() { rcv.processGossipMessage(data) }:
-					default:
-						log.Printf("[StoreNode] taskChan full, dropping non-custody gossip message")
+					var payload p2pcommon.SeedCellRequest
+					if err := json.Unmarshal(data, &payload); err == nil && payload.BlockID != "" {
+						cellKey := fmt.Sprintf("%s_%d_%d", payload.BlockID, payload.Row, payload.Col)
+						rcv.dispatchTask(cellKey, func() { rcv.processGossipMessage(data) })
 					}
 				}
 			}(sub)
@@ -1356,7 +1399,7 @@ func (tb *tokenBucket) allow() bool {
 }
 
 func (rcv *Receiver) startPruner(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"sync"
 
 	rsmt2d "github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
@@ -45,15 +46,31 @@ func (pg *ProofGenerator) GenerateColumnProofs(colIdx int, columnData [][]byte) 
 		}
 	}
 
-	// 3. Compute the open proofs for each cell in this column
+	// 3. Compute the open proofs for each cell in this column in parallel
 	rlncCodec := rlnc.NewRLNCCodec(pg.k)
 	proofs := make([][][]byte, n)
+	var errOnce sync.Once
+	var computeErr error
+	var wg sync.WaitGroup
+
 	for r := 0; r < n; r++ {
-		cellProofs, err := cda.ComputeOpenProofCell(rlncCodec, eds, pg.kzg, r, colIdx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to compute open proof cell at row %d: %w", r, err)
-		}
-		proofs[r] = cellProofs
+		wg.Add(1)
+		go func(rowIdx int) {
+			defer wg.Done()
+			cellProofs, err := cda.ComputeOpenProofCell(rlncCodec, eds, pg.kzg, rowIdx, colIdx)
+			if err != nil {
+				errOnce.Do(func() {
+					computeErr = fmt.Errorf("failed to compute open proof cell at row %d: %w", rowIdx, err)
+				})
+				return
+			}
+			proofs[rowIdx] = cellProofs
+		}(r)
+	}
+	wg.Wait()
+
+	if computeErr != nil {
+		return nil, computeErr
 	}
 
 	return proofs, nil
