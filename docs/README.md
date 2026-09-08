@@ -11,6 +11,8 @@ Tài liệu mô tả kiến trúc, giao thức truyền thông, thuật toán to
   Mục tiêu thiết kế, phân rã các module mã nguồn và kế hoạch tích hợp sản phẩm.
 - **[Tài Liệu Chuyển Đổi Kênh P2P (Per-Node Channels Migration)](file:///home/ubuntu/cda-network/docs/system/system_architecture/per_node_channels_migration.md)**: 
   Tài liệu mô tả kiến trúc chuyển đổi nâng cấp kênh giao tiếp P2P stream tách biệt theo từng node.
+- **[Tài Liệu Tích Hợp Đồng Thuận CometBFT (CometBFT Integration & Architecture Spec)](file:///home/ubuntu/cda-network/docs/system/system_architecture/cometbft_cda_integration.md)**: 
+  Tài liệu mô tả chi tiết hiện trạng tùy biến khối BFT trong CometBFT, sơ đồ luồng dữ liệu E2E và kế hoạch tích hợp thay thế bộ tạo khối giả lập.
 
 ### 1.2. 🌐 Kiến Trúc Mạng (Network Architecture)
 - **[Giao Thức Mạng P2P & Định Tuyến Topology (Networking & P2P Topology)](file:///home/ubuntu/cda-network/docs/system/network_architecture/network.md)**: 

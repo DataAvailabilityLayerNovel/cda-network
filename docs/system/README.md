@@ -14,6 +14,8 @@ Các tài liệu về mô hình phân tầng, cấu trúc ma trận dữ liệu 
   Mục tiêu thiết kế, phân rã các module mã nguồn và kế hoạch tích hợp sản phẩm.
 - **[Tài Liệu Chuyển Đổi Kênh P2P Theo Node (per_node_channels_migration.md)](file:///home/ubuntu/cda-network/docs/system/system_architecture/per_node_channels_migration.md)**:
   Đặc tả kiến trúc chuyển đổi nâng cấp kênh giao tiếp P2P stream tách biệt theo từng node.
+- **[Tài Liệu Tích Hợp Đồng Thuận CometBFT (cometbft_cda_integration.md)](file:///home/ubuntu/cda-network/docs/system/system_architecture/cometbft_cda_integration.md)**:
+  Đặc tả hiện trạng tùy biến khối BFT trong CometBFT, sơ đồ luồng dữ liệu E2E và kế hoạch lộ trình tích hợp thay thế bộ giả lập Publisher.
 
 ---
 

@@ -7,4 +7,5 @@ use (
 	./cda-publisher-node
 	./cda-store-node
 	./rlnc-rsmt2d
+	./cometbft
 )

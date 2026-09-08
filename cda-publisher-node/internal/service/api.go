@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,10 +44,17 @@ type APIService struct {
 	blockReadyEmitted     map[string]bool
 }
 
+type HeaderPayload struct {
+	CommitsRoot string   `json:"commits_root,omitempty"`
+	ColumnComm  []string `json:"column_comm,omitempty"`
+	Coeffs      string   `json:"coeffs,omitempty"`
+}
+
 type PublishRequest struct {
-	BlockID   string   `json:"block_id"`
-	Data      []string `json:"data"` // List of cells as hex strings
-	Signature string   `json:"signature,omitempty"`
+	BlockID   string         `json:"block_id"`
+	Data      []string       `json:"data"` // List of cells as hex strings
+	Header    *HeaderPayload `json:"header,omitempty"`
+	Signature string         `json:"signature,omitempty"`
 }
 
 func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.PubSub, dbPath string, sequencerPubKey string, activeCols int, kVal int) *APIService {
@@ -284,6 +292,47 @@ func VerifySignature(blockID string, data []string, sigHex, pubKeyHex string) er
 	return nil
 }
 
+// VerifyCDAHeader checks that the computed header commitments match the BFT Header commitments agreed by CometBFT consensus.
+func VerifyCDAHeader(computedHeader *engine.BlockHeader, bftHeader *HeaderPayload) error {
+	if bftHeader == nil {
+		return nil
+	}
+
+	if computedHeader == nil {
+		return fmt.Errorf("nil computed header")
+	}
+
+	// 1. Verify CommitsRoot
+	if bftHeader.CommitsRoot != "" {
+		if !strings.EqualFold(computedHeader.CommitsRoot, bftHeader.CommitsRoot) {
+			return fmt.Errorf("mismatched CommitsRoot: computed=%s, bft=%s", computedHeader.CommitsRoot, bftHeader.CommitsRoot)
+		}
+	}
+
+	// 2. Verify ColumnComm
+	if len(bftHeader.ColumnComm) > 0 {
+		if len(computedHeader.ColumnComm) != len(bftHeader.ColumnComm) {
+			return fmt.Errorf("mismatched ColumnComm count: computed=%d, bft=%d", len(computedHeader.ColumnComm), len(bftHeader.ColumnComm))
+		}
+		for i, expectedHex := range bftHeader.ColumnComm {
+			computedHex := hex.EncodeToString(computedHeader.ColumnComm[i])
+			if !strings.EqualFold(computedHex, expectedHex) {
+				return fmt.Errorf("mismatched ColumnComm at index %d: computed=%s, bft=%s", i, computedHex, expectedHex)
+			}
+		}
+	}
+
+	// 3. Verify Coeffs
+	if bftHeader.Coeffs != "" {
+		computedCoeffsHex := hex.EncodeToString(computedHeader.Coeffs)
+		if !strings.EqualFold(computedCoeffsHex, bftHeader.Coeffs) {
+			return fmt.Errorf("mismatched Coeffs: computed=%s, bft=%s", computedCoeffsHex, bftHeader.Coeffs)
+		}
+	}
+
+	return nil
+}
+
 func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -359,6 +408,18 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	height := p2pcommon.ParseHeightFromBlockID(header.BlockID)
+
+	// 2.5. Verify Header against BFT Consensus Commitments (Same as Validator Node Verification)
+	if req.Header != nil {
+		if err := VerifyCDAHeader(header, req.Header); err != nil {
+			log.Printf("[Height: %d] [Publisher] Header verification FAILED for BlockID %s: %v", height, req.BlockID, err)
+			http.Error(w, "Header verification failed: "+err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		log.Printf("[Height: %d] [Publisher] SUCCESS: Header verification passed for BlockID %s against BFT consensus!", height, req.BlockID)
+	}
+
 	// Record metrics
 	RSEncodeDuration.Observe(duration)
 	ThroughputBytesTotal.Add(float64(totalBytes))
@@ -374,7 +435,6 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	height := p2pcommon.ParseHeightFromBlockID(header.BlockID)
 	log.Printf("[Height: %d] Successfully generated Block Header for BlockID: %s", height, header.BlockID)
 
 	if s.headerTopic != nil {
