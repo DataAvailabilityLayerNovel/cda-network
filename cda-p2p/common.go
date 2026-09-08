@@ -16,11 +16,18 @@ import (
 )
 
 // ParseHeightFromBlockID extracts the numeric block height from a block ID string.
-// Supports formats like "block-123", "bot-block-456", "height_789", etc.
+// Supports formats like "block-123", "block-1-hash", "bot-block-456", "height_789", etc.
 func ParseHeightFromBlockID(blockID string) int {
 	parts := strings.FieldsFunc(blockID, func(r rune) bool {
 		return r == '-' || r == '_'
 	})
+	for i, p := range parts {
+		if (strings.EqualFold(p, "block") || strings.EqualFold(p, "height")) && i+1 < len(parts) {
+			if val, err := strconv.Atoi(parts[i+1]); err == nil {
+				return val
+			}
+		}
+	}
 	for i := len(parts) - 1; i >= 0; i-- {
 		val, err := strconv.Atoi(parts[i])
 		if err == nil {

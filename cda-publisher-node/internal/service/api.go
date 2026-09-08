@@ -52,6 +52,7 @@ type HeaderPayload struct {
 
 type PublishRequest struct {
 	BlockID   string         `json:"block_id"`
+	Height    int64          `json:"height,omitempty"`
 	Data      []string       `json:"data"` // List of cells as hex strings
 	Header    *HeaderPayload `json:"header,omitempty"`
 	Signature string         `json:"signature,omitempty"`
@@ -366,12 +367,23 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 0.5. Sequential Completion Gate (Multi-Block Queue Control)
-	reqHeight := p2pcommon.ParseHeightFromBlockID(req.BlockID)
+	reqHeight := int(req.Height)
+	if reqHeight <= 0 {
+		reqHeight = p2pcommon.ParseHeightFromBlockID(req.BlockID)
+	}
 	if reqHeight > 1 {
 		s.colReadyMu.Lock()
-		for s.latestCompletedHeight < reqHeight-1 {
+		if reqHeight > s.latestCompletedHeight+2 {
+			s.colReadyMu.Unlock()
+			http.Error(w, fmt.Sprintf("Block height %d is out of sequence (current completed height: %d)", reqHeight, s.latestCompletedHeight), http.StatusUnprocessableEntity)
+			return
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for s.latestCompletedHeight < reqHeight-1 && time.Now().Before(deadline) {
 			log.Printf("[Height: %d] [Publisher Queue] Waiting for block-%d to complete before publishing block-%d...", reqHeight, reqHeight-1, reqHeight)
-			s.publishCond.Wait()
+			s.colReadyMu.Unlock()
+			time.Sleep(500 * time.Millisecond)
+			s.colReadyMu.Lock()
 		}
 		s.colReadyMu.Unlock()
 	}
@@ -408,7 +420,11 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	height := p2pcommon.ParseHeightFromBlockID(header.BlockID)
+	height := int(req.Height)
+	if height <= 0 {
+		height = p2pcommon.ParseHeightFromBlockID(header.BlockID)
+	}
+	header.Height = height
 
 	// 2.5. Verify Header against BFT Consensus Commitments (Same as Validator Node Verification)
 	if req.Header != nil {
