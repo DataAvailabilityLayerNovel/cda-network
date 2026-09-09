@@ -10,6 +10,7 @@ type Config struct {
 	K                  int            `json:"k"`
 	KPiece             int            `json:"k_piece"`
 	ActiveCols         int            `json:"active_cols,omitempty"`
+	NumCols            int            `json:"num_cols,omitempty"`
 	BootstrapPeers     map[int]string `json:"bootstrap_peers"` // maps colIdx to bootstrap node address (HTTP/P2P address)
 	SequencerPublicKey string         `json:"sequencer_public_key"`
 }
@@ -19,6 +20,7 @@ func DefaultConfig() *Config {
 		APIPort: 8080,
 		K:       4,
 		KPiece:  4,
+		NumCols: 8,
 		BootstrapPeers: map[int]string{
 			0: "http://localhost:8081", // Default address for column 0 (for other columns, fallback or config map)
 		},

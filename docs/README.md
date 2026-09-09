@@ -30,6 +30,8 @@ Tài liệu mô tả kiến trúc, giao thức truyền thông, thuật toán to
 
 Các kịch bản kiểm thử tích hợp (E2E), khả năng phục hồi lỗi, bảo mật và hướng dẫn đo lường hiệu năng:
 
+- **[Hướng Dẫn Kiểm Thử Toàn Mạng E2E Đa Cột & Đa Tham Số (Full Network E2E Test Guide)](file:///home/ubuntu/cda-network/docs/testing/full_network_e2e_guide.md)**:
+  Hướng dẫn toàn diện chạy kịch bản kiểm thử tích hợp 4 tầng (CometBFT -> Publisher -> Store Nodes -> Light Node Auto-DAS) với tùy biến $K$, $K_{\text{piece}}$, $ActiveCols$, $Blocks$.
 - **[Hướng Dẫn Kiểm Thử Ghi Nhận Hoàn Thành & DAS (Completion & DAS Test Guide)](file:///home/ubuntu/cda-network/docs/testing/completion_test_guide.md)**: 
   Quy trình kiểm thử trạng thái `IsComplete` lưu trữ custody tại Store Node và ghi nhận log lấy mẫu thành công tại Light Node.
 
@@ -50,7 +52,14 @@ bash scripts/tests/run_docker_test.sh
 # 4. Kiểm thử Phục Hồi Dữ Liệu Khối Mất Toàn Bộ Cột Mạng (Kịch bản 3)
 bash scripts/tests/test_scenario_3.sh
 
-# 5. Tiện ích xuất bản và lấy mẫu thủ công:
+# 5. Kiểm thử E2E Toàn Mạng (CometBFT Consensus -> Publisher -> Store Custody -> Light Node Auto-DAS):
+# Chạy mặc định (K=8, K_piece=4, Blocks=3, Txs=16):
+./scripts/tests/test_full_network_e2e.sh
+# Hoặc truyền cờ tùy chỉnh:
+./scripts/tests/test_full_network_e2e.sh -k 16 -b 5
+./scripts/tests/test_full_network_e2e.sh --help
+
+# 6. Tiện ích xuất bản và lấy mẫu thủ công:
 # ./scripts/publish.sh manual-block-1 http://localhost:8080
 # ./scripts/das.sh manual-block-1 http://localhost:8499
 ```

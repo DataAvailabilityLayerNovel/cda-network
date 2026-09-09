@@ -33,6 +33,7 @@ func main() {
 	kVal := flag.Int("k", 0, "override K chunks parameter")
 	kPieceVal := flag.Int("k-piece", 0, "override K-piece parameter")
 	activeColsVal := flag.Int("active-cols", 0, "override active columns parameter")
+	numColsVal := flag.Int("num-cols", 0, "override number of network column groups")
 	flag.Parse()
 
 	var cfg *config.Config
@@ -52,7 +53,27 @@ func main() {
 		cfg.APIPort = *port
 	}
 	if *bootstrap != "" {
-		cfg.BootstrapPeers[0] = *bootstrap
+		if strings.Contains(*bootstrap, ":http") || strings.Contains(*bootstrap, ";") {
+			cfg.BootstrapPeers = make(map[int]string)
+			for _, part := range strings.Split(*bootstrap, ";") {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				if strings.Contains(part, ":http") {
+					sub := strings.SplitN(part, ":http", 2)
+					if len(sub) == 2 {
+						if c, err := strconv.Atoi(sub[0]); err == nil {
+							cfg.BootstrapPeers[c] = "http" + sub[1]
+							continue
+						}
+					}
+				}
+				cfg.BootstrapPeers[len(cfg.BootstrapPeers)] = part
+			}
+		} else {
+			cfg.BootstrapPeers[0] = *bootstrap
+		}
 	}
 	if *kVal != 0 {
 		cfg.K = *kVal
@@ -65,6 +86,12 @@ func main() {
 	}
 	if *activeColsVal != 0 {
 		cfg.ActiveCols = *activeColsVal
+	}
+	if *numColsVal != 0 {
+		cfg.NumCols = *numColsVal
+	}
+	if cfg.NumCols <= 0 {
+		cfg.NumCols = 8
 	}
 	if cfg.ActiveCols <= 0 {
 		if len(cfg.BootstrapPeers) > 0 {
@@ -100,6 +127,23 @@ func main() {
 		log.Fatalf("Failed to initialize GossipSub: %v", err)
 	}
 
+	n := 2 * cfg.K
+	colsPerNetCol := n / cfg.NumCols
+	if colsPerNetCol <= 0 {
+		colsPerNetCol = 1
+	}
+	expandedPeers := make(map[int]string)
+	for colKey, addr := range cfg.BootstrapPeers {
+		baseCol := colKey
+		if colKey < cfg.NumCols {
+			baseCol = colKey * colsPerNetCol
+		}
+		for offset := 0; offset < colsPerNetCol; offset++ {
+			expandedPeers[baseCol+offset] = addr
+		}
+	}
+	cfg.BootstrapPeers = expandedPeers
+
 	// 3. Initialize Discovery & Sender
 	disc := p2p.NewDiscovery(cfg.BootstrapPeers)
 	sender := p2p.NewSender(p2pHost, disc)
@@ -111,17 +155,17 @@ func main() {
 	}
 
 	// 4.5 Connect to Bootstraps to maintain GossipSub mesh connectivity
+	connectedBootstraps := make(map[string]bool)
 	for colIdx, addrStr := range cfg.BootstrapPeers {
-		n := 2 * cfg.K
-		colsPerNetCol := n / 8
-		if colsPerNetCol == 0 {
-			colsPerNetCol = 1
+		if connectedBootstraps[addrStr] {
+			continue
 		}
 		bootColID := (colIdx / colsPerNetCol) * colsPerNetCol
 		_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", bootColID))
 		if err != nil {
 			continue
 		}
+		connectedBootstraps[addrStr] = true
 
 		bootAddr := addrStr
 		if strings.HasPrefix(bootAddr, "http://") || strings.HasPrefix(bootAddr, "https://") {
@@ -166,7 +210,7 @@ func main() {
 
 	// 5. Initialize API Service
 	dbPath := "data/publisher/badger"
-	apiService := service.NewAPIService(pipeline, sender, ps, dbPath, cfg.SequencerPublicKey, cfg.ActiveCols, cfg.K)
+	apiService := service.NewAPIService(pipeline, sender, ps, dbPath, cfg.SequencerPublicKey, cfg.ActiveCols, cfg.K, cfg.NumCols)
 	mux := http.NewServeMux()
 	apiService.RegisterHandlers(mux)
 	mux.Handle("/metrics", promhttp.Handler())

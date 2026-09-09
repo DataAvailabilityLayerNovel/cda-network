@@ -32,6 +32,7 @@ type APIService struct {
 	db                    *badger.DB
 	sequencerPubKey       string
 	activeCols            int
+	numCols               int
 	kVal                  int
 	mu                    sync.Mutex
 	colReadyMu            sync.Mutex
@@ -58,7 +59,7 @@ type PublishRequest struct {
 	Signature string         `json:"signature,omitempty"`
 }
 
-func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.PubSub, dbPath string, sequencerPubKey string, activeCols int, kVal int) *APIService {
+func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.PubSub, dbPath string, sequencerPubKey string, activeCols int, kVal int, numCols ...int) *APIService {
 	var db *badger.DB
 	if dbPath != "" {
 		_ = os.MkdirAll(dbPath, 0755)
@@ -74,6 +75,11 @@ func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.Pub
 		kVal = 16
 	}
 
+	numColsVal := 8
+	if len(numCols) > 0 && numCols[0] > 0 {
+		numColsVal = numCols[0]
+	}
+
 	svc := &APIService{
 		pipeline:          pipeline,
 		sender:            sender,
@@ -81,6 +87,7 @@ func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.Pub
 		db:                db,
 		sequencerPubKey:   sequencerPubKey,
 		activeCols:        activeCols,
+		numCols:           numColsVal,
 		kVal:              kVal,
 		storeReadyMap:     make(map[string]map[int]map[int]bool),
 		columnReadyMap:    make(map[string]map[int]bool),
@@ -139,7 +146,11 @@ func (s *APIService) isNetColActive(colIdx int) bool {
 	if n <= 0 {
 		n = 32
 	}
-	colsPerNetCol := n / 8
+	numCols := s.numCols
+	if numCols <= 0 {
+		numCols = 8
+	}
+	colsPerNetCol := n / numCols
 	if colsPerNetCol <= 0 {
 		colsPerNetCol = 1
 	}
@@ -373,17 +384,19 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 	if reqHeight > 1 {
 		s.colReadyMu.Lock()
-		if reqHeight > s.latestCompletedHeight+2 {
-			s.colReadyMu.Unlock()
-			http.Error(w, fmt.Sprintf("Block height %d is out of sequence (current completed height: %d)", reqHeight, s.latestCompletedHeight), http.StatusUnprocessableEntity)
-			return
-		}
-		deadline := time.Now().Add(10 * time.Second)
+		deadline := time.Now().Add(60 * time.Second)
 		for s.latestCompletedHeight < reqHeight-1 && time.Now().Before(deadline) {
-			log.Printf("[Height: %d] [Publisher Queue] Waiting for block-%d to complete before publishing block-%d...", reqHeight, reqHeight-1, reqHeight)
+			log.Printf("[Height: %d] [Publisher Queue] Waiting for block-%d to complete before publishing block-%d (current completed: %d)...",
+				reqHeight, reqHeight-1, reqHeight, s.latestCompletedHeight)
 			s.colReadyMu.Unlock()
 			time.Sleep(500 * time.Millisecond)
 			s.colReadyMu.Lock()
+		}
+		if s.latestCompletedHeight < reqHeight-1 {
+			currentCompleted := s.latestCompletedHeight
+			s.colReadyMu.Unlock()
+			http.Error(w, fmt.Sprintf("Block height %d is out of sequence (current completed height: %d after waiting)", reqHeight, currentCompleted), http.StatusUnprocessableEntity)
+			return
 		}
 		s.colReadyMu.Unlock()
 	}
