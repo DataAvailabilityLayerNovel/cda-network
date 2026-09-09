@@ -7,6 +7,8 @@ WORKDIR /app
 
 # Copy all directories to compile Go workspace
 COPY go.work go.work
+RUN go work edit -dropuse ./cometbft
+
 COPY rlnc-rsmt2d/ rlnc-rsmt2d/
 COPY cda-publisher-node/ cda-publisher-node/
 COPY cda-bootstrap-node/ cda-bootstrap-node/

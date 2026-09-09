@@ -487,6 +487,9 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(colIdx int) {
 			defer wg.Done()
+			if !s.isNetColActive(colIdx) {
+				return
+			}
 			colData := eds.Col(uint(colIdx))
 			pieceCommits := pubData.PieceComm[colIdx*k : colIdx*k+k]
 

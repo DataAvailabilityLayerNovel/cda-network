@@ -53,6 +53,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                 "-port", str(bootstrap_port),
                 "-col", str(col_id),
                 "-publisher", "http://publisher:8080",
+                "-k", str(k),
                 "-k-piece", str(k_piece)
             ] + crash_arg + (["-prune-enable=true"] if prune_enable else []) + (["-prune-ttl", prune_ttl] if prune_ttl else []),
             'ports': [f"{bootstrap_port}:{bootstrap_port}", f"{bootstrap_p2p_port}:{bootstrap_p2p_port}"],
@@ -480,16 +481,15 @@ def generate_publisher_config(k, k_piece, cols, cols_per_net_col, active_cols=No
         active_cols = cols
     peers = {}
     for c in range(active_cols):
-        col_id = c * cols_per_net_col
         bootstrap_p2p_port = 9200 + c + 10000
-        for data_col in range(col_id, col_id + cols_per_net_col):
-            peers[str(data_col)] = f"/dns4/bootstrap-{c}/tcp/{bootstrap_p2p_port}"
+        peers[str(c)] = f"/dns4/bootstrap-{c}/tcp/{bootstrap_p2p_port}"
     
     pub_config = {
         "api_port": 8080,
         "k": k,
         "k_piece": k_piece,
         "active_cols": active_cols,
+        "num_cols": cols,
         "bootstrap_peers": peers
     }
     with open('publisher_config_docker.json', 'w') as f:

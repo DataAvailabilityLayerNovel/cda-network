@@ -47,7 +47,7 @@ def wait_for_block_ready_sse(sse_url, expected_block_id, timeout=120):
     deadline = time.time() + timeout
     try:
         req = urllib.request.Request(sse_url, headers={'Accept': 'text/event-stream'})
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             while time.time() < deadline:
                 line = resp.readline()
                 if not line:
