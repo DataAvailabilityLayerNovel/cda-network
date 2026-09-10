@@ -409,22 +409,21 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 }
 
 func (s *CustodyStore) GetDBSize() int64 {
-	if s.port <= 0 {
+	if s.db == nil {
 		return 0
 	}
-	baseDir := fmt.Sprintf("data/store_%d", s.port)
-	dbPath := filepath.Join(baseDir, "badger")
-
-	var size int64
-	_ = filepath.Walk(dbPath, func(_ string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			size += info.Size()
+	var totalBytes int64
+	_ = s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			totalBytes += item.KeySize() + item.ValueSize()
 		}
 		return nil
 	})
-	return size
+	return totalBytes
 }
 

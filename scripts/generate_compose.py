@@ -250,7 +250,7 @@ providers:
             {
                 "type": "stat",
                 "title": "Healthy / Online Nodes",
-                "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+                "gridPos": {"h": 5, "w": 6, "x": 0, "y": 0},
                 "targets": [
                     {"expr": "sum(up)", "legendFormat": "Nodes Up"}
                 ],
@@ -264,7 +264,7 @@ providers:
             {
                 "type": "gauge",
                 "title": "DAS Success Rate",
-                "gridPos": {"h": 6, "w": 6, "x": 6, "y": 0},
+                "gridPos": {"h": 5, "w": 6, "x": 6, "y": 0},
                 "targets": [
                     {"expr": "cda_light_das_success_rate", "legendFormat": "{{instance}}"}
                 ],
@@ -286,10 +286,11 @@ providers:
             },
             {
                 "type": "stat",
-                "title": "Byzantine Forged Pieces Blocked",
-                "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+                "title": "Byzantine Forged Pieces Blocked (Security Alerts)",
+                "description": "Số mảnh dữ liệu giả mạo bị phát hiện và ngăn chặn bởi chữ ký / kiểm chứng mật mã KZG (Layer 3)",
+                "gridPos": {"h": 5, "w": 6, "x": 12, "y": 0},
                 "targets": [
-                    {"expr": "sum(cda_store_byzantine_detection_count)", "legendFormat": "Detections"}
+                    {"expr": "sum(cda_store_byzantine_detection_count)", "legendFormat": "Byzantine Detections"}
                 ],
                 "options": {
                     "colorMode": "value",
@@ -311,10 +312,11 @@ providers:
             },
             {
                 "type": "stat",
-                "title": "Publisher Throughput",
-                "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+                "title": "Publisher Throughput (1m Avg)",
+                "description": "Lưu lượng phát hành trung bình động 1 phút",
+                "gridPos": {"h": 5, "w": 6, "x": 18, "y": 0},
                 "targets": [
-                    {"expr": "sum(rate(cda_publisher_throughput_bytes_total[5s]))", "legendFormat": "Bytes/sec"}
+                    {"expr": "sum(rate(cda_publisher_throughput_bytes_total[1m]))", "legendFormat": "Bytes/sec (Avg)"}
                 ],
                 "fieldConfig": {
                     "defaults": {
@@ -325,7 +327,7 @@ providers:
             {
                 "type": "graph",
                 "title": "DAS Sampling Latency (95th vs Average)",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -344,32 +346,29 @@ providers:
             },
             {
                 "type": "graph",
-                "title": "Node Encoding & Proof Durations",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+                "title": "Publisher Throughput Over Time (Moving Average)",
+                "description": "Sơ đồ lưu lượng phát hành trung bình theo thời gian (Moving Average 30s & 1m)",
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
                 **line_graph_opts(),
                 "targets": [
                     {
-                        "expr": "sum(rate(cda_publisher_rs_encode_duration_seconds_sum[5s])) / sum(rate(cda_publisher_rs_encode_duration_seconds_count[5s]))",
-                        "legendFormat": "Publisher RS Encode (Avg)"
+                        "expr": "sum(rate(cda_publisher_throughput_bytes_total[30s]))",
+                        "legendFormat": "Throughput (30s Moving Avg)"
                     },
                     {
-                        "expr": "sum(rate(cda_bootstrap_kzg_proof_duration_seconds_sum[5s])) / sum(rate(cda_bootstrap_kzg_proof_duration_seconds_count[5s]))",
-                        "legendFormat": "Bootstrap KZG Proof (Avg)"
-                    },
-                    {
-                        "expr": "sum(rate(cda_store_reconstruct_duration_seconds_sum[5s])) / sum(rate(cda_store_reconstruct_duration_seconds_count[5s]))",
-                        "legendFormat": "Store Reconstruction (Avg)"
+                        "expr": "sum(rate(cda_publisher_throughput_bytes_total[1m]))",
+                        "legendFormat": "Throughput (1m Moving Avg)"
                     }
                 ],
                 "yaxes": [
-                    {"format": "s", "show": True},
+                    {"format": "Bps", "show": True},
                     {"format": "short", "show": False}
                 ]
             },
             {
                 "type": "graph",
                 "title": "Total Stored Pieces per Store Node (Custody + Recoded Non-Custody)",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -383,25 +382,9 @@ providers:
                 ]
             },
             {
-                "type": "graph",
-                "title": "Store Node Database Size on Disk (BadgerDB)",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
-                **line_graph_opts(),
-                "targets": [
-                    {
-                        "expr": "cda_store_db_size_bytes",
-                        "legendFormat": "{{instance}}"
-                    }
-                ],
-                "yaxes": [
-                    {"format": "bytes", "show": True},
-                    {"format": "short", "show": False}
-                ]
-            },
-            {
                 "type": "table",
                 "title": "Store Node Total Stored Pieces Table",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 13},
                 "targets": [
                     {
                         "expr": "cda_store_linear_independent_pieces_count",
@@ -432,8 +415,25 @@ providers:
             },
             {
                 "type": "graph",
+                "title": "Store Node Database Size (BadgerDB Actual Data Used)",
+                "description": "Dung lượng dữ liệu thực tế đã sử dụng trong BadgerDB (User Key-Value Payload)",
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 21},
+                **line_graph_opts(),
+                "targets": [
+                    {
+                        "expr": "cda_store_db_size_bytes",
+                        "legendFormat": "{{instance}}"
+                    }
+                ],
+                "yaxes": [
+                    {"format": "bytes", "show": True},
+                    {"format": "short", "show": False}
+                ]
+            },
+            {
+                "type": "graph",
                 "title": "Store Node Network Rates (P2P Queries & GossipSub Propagation)",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 21},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -448,26 +448,43 @@ providers:
             },
             {
                 "type": "graph",
-                "title": "System CPU Usage (%)",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30},
+                "title": "Node Encoding & Proof Durations",
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 29},
                 **line_graph_opts(),
                 "targets": [
                     {
-                        "expr": "rate(process_cpu_seconds_total[5s]) * 100",
-                        "legendFormat": "{{job}} ({{instance}})"
+                        "expr": "sum(rate(cda_publisher_rs_encode_duration_seconds_sum[5s])) / sum(rate(cda_publisher_rs_encode_duration_seconds_count[5s]))",
+                        "legendFormat": "Publisher RS Encode (Avg)"
+                    },
+                    {
+                        "expr": "sum(rate(cda_bootstrap_kzg_proof_duration_seconds_sum[5s])) / sum(rate(cda_bootstrap_kzg_proof_duration_seconds_count[5s]))",
+                        "legendFormat": "Bootstrap KZG Proof (Avg)"
+                    },
+                    {
+                        "expr": "sum(rate(cda_store_reconstruct_duration_seconds_sum[5s])) / sum(rate(cda_store_reconstruct_duration_seconds_count[5s]))",
+                        "legendFormat": "Store Reconstruction (Avg)"
                     }
+                ],
+                "yaxes": [
+                    {"format": "s", "show": True},
+                    {"format": "short", "show": False}
                 ]
             },
             {
                 "type": "graph",
-                "title": "System Memory Usage (MB)",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 30},
+                "title": "System CPU Usage (Cores)",
+                "description": "Số lượng CPU Cores thực tế được sử dụng (1.0 = 1 full core)",
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 29},
                 **line_graph_opts(),
                 "targets": [
                     {
-                        "expr": "process_resident_memory_bytes / 1024 / 1024",
+                        "expr": "rate(process_cpu_seconds_total[5s])",
                         "legendFormat": "{{job}} ({{instance}})"
                     }
+                ],
+                "yaxes": [
+                    {"format": "short", "label": "Cores", "show": True},
+                    {"format": "short", "show": False}
                 ]
             }
         ]

@@ -203,7 +203,7 @@ func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, pieceIdx int,
 				break // Validation failure is a hard error, do not retry
 			}
 
-			log.Printf("[P2P Seeder] Successfully seeded piece for cell [%d, %d] to Store Node %s via %s (attempt %d)", row, col, pid, nodeProto, attempt)
+			p2pcommon.LogDebug("[P2P Seeder] Successfully seeded piece for cell [%d, %d] to Store Node %s via %s (attempt %d)", row, col, pid, nodeProto, attempt)
 			success = true
 			break
 		}

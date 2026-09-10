@@ -39,6 +39,11 @@ var (
 		Help: "Total number of Byzantine/forged pieces detected and blocked by the store node.",
 	})
 
+	DependentPiecesDroppedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "cda_store_dependent_pieces_dropped_total",
+		Help: "Total number of linearly dependent (redundant) pieces dropped by the store node.",
+	})
+
 	LinearIndependentPiecesCount = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "cda_store_linear_independent_pieces_count",
 		Help: "Number of linear independent pieces stored in custody.",
@@ -74,6 +79,7 @@ func init() {
 		GossipSubMessagesTotal,
 		GossipSubMessageRateGauge,
 		ByzantineDetectionsTotal,
+		DependentPiecesDroppedTotal,
 		LinearIndependentPiecesCount,
 		CustodyPiecesCount,
 		RecodedPiecesCount,

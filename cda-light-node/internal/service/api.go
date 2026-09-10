@@ -874,8 +874,10 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 				}
 			}
 
-			log.Printf("[DAS] [Height: %d] Received response from store node %s with %d pieces. Independent pieces accumulated: %d/%d",
-				height, storePID, len(combinedResp.Pieces), len(recvPieces), targetK)
+			if len(combinedResp.Pieces) > 0 || p2pcommon.IsDebug() {
+				log.Printf("[DAS] [Height: %d] Received response from store node %s with %d pieces. Independent pieces accumulated: %d/%d",
+					height, storePID, len(combinedResp.Pieces), len(recvPieces), targetK)
+			}
 
 			if len(recvPieces) >= targetK {
 				querySuccess = true
@@ -938,7 +940,11 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 	if height <= 0 && header != nil && header.Height > 0 {
 		height = header.Height
 	}
-	log.Printf("[DAS] [Height: %d] Cell [%d, %d] algebraic verification succeeded! Reconstructed cell data (hex): %x", height, row, col, recoveredCell)
+	if p2pcommon.IsDebug() {
+		log.Printf("[DAS] [Height: %d] Cell [%d, %d] algebraic verification succeeded! Reconstructed cell data (hex): %x", height, row, col, recoveredCell)
+	} else {
+		log.Printf("[DAS] [Height: %d] Cell [%d, %d] algebraic verification succeeded (%d bytes)", height, row, col, len(recoveredCell))
+	}
 
 	if s.port > 0 {
 		logDir := fmt.Sprintf("data/light_%d", s.port)

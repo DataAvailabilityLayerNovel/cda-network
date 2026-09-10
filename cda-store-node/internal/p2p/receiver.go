@@ -556,7 +556,8 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 	}
 
 	if !engine.IsLinearlyIndependent(existingCoeffs, decodedCoeffs, rcv.kPiece) {
-		log.Printf("[P2P] Received piece for cell [%d, %d]. Linear independence check: dependent (redundant). Dropping piece.", row, col)
+		DependentPiecesDroppedTotal.Inc()
+		p2pcommon.LogDebug("[P2P] Received piece for cell [%d, %d]. Linear independence check: dependent (redundant). Dropping piece.", row, col)
 		rcv.cellMu.Unlock()
 		return nil
 	}
@@ -615,9 +616,10 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 				if len(targetPieces) > rcv.kPiece {
 					targetPieces = targetPieces[:rcv.kPiece]
 				}
+				pieceCommits, _ := rcv.cache.GetAnchoredCommitments(bID, c)
 				broadcastSucceeded := 0
 				for i := 0; i < numBroadcast; i++ {
-					recodedPiece, err := rcv.rm.RecodePieces(targetPieces)
+					recodedPiece, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5)
 					if err != nil {
 						log.Printf("[GossipSub] Failed to recode pieces for cell [%d, %d] (round %d/%d): %v", r, c, i+1, numBroadcast, err)
 						continue
@@ -974,7 +976,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 		}
 
 		// Always recode+store once first (for local availability)
-		firstRecoded, err := rcv.rm.RecodePieces(targetPieces)
+		firstRecoded, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5)
 		if err == nil {
 			rcv.cellMu.Lock()
 			rcv.cache.StoreRecodedPiece(blockID, row, col, *firstRecoded)
@@ -989,7 +991,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 				}
 				broadcastSucceeded := 0
 				for i := 0; i < numBroadcast; i++ {
-					recodedPiece, rerr := rcv.rm.RecodePieces(targetPieces)
+					recodedPiece, rerr := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5)
 					if rerr != nil {
 						log.Printf("[GossipSub] Active pull: recode round %d/%d failed for cell [%d, %d]: %v", i+1, numBroadcast, row, col, rerr)
 						continue
@@ -1056,7 +1058,9 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 	rcv.cellMu.Unlock()
 
 	height := p2pcommon.ParseHeightFromBlockID(req.BlockID)
-	log.Printf("[Height: %d] [StoreNode] Retrieving cell [%d, %d] for block %s. Local pieces: %d", height, req.Row, req.Col, req.BlockID, len(allPieces))
+	if len(allPieces) > 0 || p2pcommon.IsDebug() {
+		log.Printf("[Height: %d] [StoreNode] Retrieving cell [%d, %d] for block %s. Local pieces: %d", height, req.Row, req.Col, req.BlockID, len(allPieces))
+	}
 
 	// Get commitments
 	pieceCommits, _ := rcv.cache.GetAnchoredCommitments(req.BlockID, req.Col)
@@ -1067,7 +1071,7 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 
 	// 2. Query peers in column network if needed and allowed
 	if len(allPieces) < rcv.kPiece && !req.IsRemoteHop {
-		log.Printf("[StoreNode] Not enough local pieces (%d/%d). Querying peers in column network...", len(allPieces), rcv.kPiece)
+		p2pcommon.LogDebug("[StoreNode] Not enough local pieces (%d/%d). Querying peers in column network...", len(allPieces), rcv.kPiece)
 		rcv.peersMu.RLock()
 		peersCopy := make([]p2pcommon.PeerInfo, len(rcv.colPeers))
 		copy(peersCopy, rcv.colPeers)
@@ -1100,7 +1104,7 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 				cancelDial()
 				continue
 			}
-			log.Printf("[StoreNode] Fetch query: requesting pieces for cell [%d, %d] from peer %s...", req.Row, req.Col, pid)
+			p2pcommon.LogDebug("[StoreNode] Fetch query: requesting pieces for cell [%d, %d] from peer %s...", req.Row, req.Col, pid)
 
 			fetchReq := p2pcommon.StoreFetchRequest{
 				BlockID:     req.BlockID,
@@ -1123,7 +1127,7 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 			}
 			pStream.Close()
 			cancelDial()
-			log.Printf("[StoreNode] Fetch query: received response from peer %s with %d pieces", pid, len(peerResp.Pieces))
+			p2pcommon.LogDebug("[StoreNode] Fetch query: received response from peer %s with %d pieces", pid, len(peerResp.Pieces))
 
 			for _, pPayload := range peerResp.Pieces {
 				decData, err1 := hex.DecodeString(pPayload.Data)
@@ -1150,7 +1154,7 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 
 				if engine.IsLinearlyIndependent(existingCoeffs, decCoeffs, rcv.kPiece) {
 					allPieces = append(allPieces, p)
-					log.Printf("[StoreNode] Added independent piece from peer %s. Current count: %d", pid, len(allPieces))
+					p2pcommon.LogDebug("[StoreNode] Added independent piece from peer %s. Current count: %d", pid, len(allPieces))
 					if len(allPieces) >= rcv.kPiece {
 						break
 					}
@@ -1187,7 +1191,9 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 			log.Printf("[StoreNode] Failed to recover cell: %v", err)
 		}
 	}
-	log.Printf("[StoreNode] Fetch query completed for cell [%d, %d]. Total independent pieces gathered: %d/%d (Recovery Success: %v)", req.Row, req.Col, len(allPieces), rcv.kPiece, recovered)
+	if len(allPieces) > 0 || p2pcommon.IsDebug() {
+		log.Printf("[StoreNode] Fetch query completed for cell [%d, %d]. Total independent pieces gathered: %d/%d (Recovery Success: %v)", req.Row, req.Col, len(allPieces), rcv.kPiece, recovered)
+	}
 
 	// Respond back
 	respPieces := make([]p2pcommon.CodedPiece, len(allPieces))

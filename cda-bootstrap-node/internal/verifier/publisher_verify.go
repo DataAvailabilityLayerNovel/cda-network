@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 
+	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 )
 
@@ -64,8 +65,11 @@ func VerifyPublisherData(
 		if !cda.VerifyMerkleProof(commitsRootBytes, pieceCommits[i], merkleProofs[i]) {
 			return false, fmt.Errorf("Merkle proof verification failed for piece commitment %d", i)
 		}
-		log.Printf("[Verifier] Layer 1: Merkle proof matches commits_root for piece commitment %d (Commitment: %x, commits_root: %s)", i, pieceCommits[i], header.CommitsRoot)
+		if p2pcommon.IsDebug() {
+			log.Printf("[Verifier] Layer 1: Merkle proof matches commits_root for piece commitment %d (Commitment: %x, commits_root: %s)", i, pieceCommits[i], header.CommitsRoot)
+		}
 	}
+	log.Printf("[Verifier] Layer 1: Merkle proofs verified for all %d piece commitments of Column %d", k, colIdx)
 
 	// 3. Layer 2 (Fiat-Shamir consistency and combined column commitment match)
 	pieceCommitsTyped := make([]cda.PieceCommitment, k)
@@ -79,7 +83,11 @@ func VerifyPublisherData(
 	if !bytes.Equal(combined, columnComm) {
 		return false, fmt.Errorf("combined commitment does not match column commitment in header")
 	}
-	log.Printf("[Verifier] Layer 2: Combined Column Commitment %d verified successfully (Computed: %x == Header: %x)", colIdx, combined, columnComm)
+	if p2pcommon.IsDebug() {
+		log.Printf("[Verifier] Layer 2: Combined Column Commitment %d verified successfully (Computed: %x == Header: %x)", colIdx, combined, columnComm)
+	} else {
+		log.Printf("[Verifier] Layer 2: Combined Column Commitment %d verified successfully", colIdx)
+	}
 
 	return true, nil
 }
