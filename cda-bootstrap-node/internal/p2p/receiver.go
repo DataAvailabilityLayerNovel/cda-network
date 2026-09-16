@@ -18,6 +18,7 @@ import (
 
 	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
+	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/rlnc"
 	"github.com/dgraph-io/badger/v4"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -328,26 +329,75 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 			log.Printf("[Height: %d] Failed to broadcast anchor for Column %d: %v", height, colIdx, err)
 		}
 
-		// Paced & Bounded Dispatch: Prevent network flooding across Store Node streams
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, 16) // Limit concurrent broadcasts to 16 to avoid overloading libp2p
-		currentRow := -1
+		// Group precomputed pieces by target Store Node
+		nodeBatches := make(map[string][]p2pcommon.SeedCellRequest)
+		nodePeers := make(map[string]p2pcommon.PeerInfo)
+
+		hexPieceCommits := make([]string, len(pieceCommits))
+		for i, c := range pieceCommits {
+			hexPieceCommits[i] = hex.EncodeToString(c)
+		}
+
 		for _, item := range precomputedPieces {
-			if item.row != currentRow {
-				if currentRow >= 0 {
-					time.Sleep(2 * time.Millisecond) // micro-pause between rows
-				}
-				currentRow = item.row
+			peers := rcv.GetPeersForCell(item.row, colIdx, item.pieceIdx)
+			if len(peers) == 0 {
+				continue
 			}
+			targetPeer := peers[0]
+			nodePeers[targetPeer.PeerID] = targetPeer
+
+			seedReq := p2pcommon.SeedCellRequest{
+				BlockID:      payload.BlockID,
+				Row:          item.row,
+				Col:          colIdx,
+				Data:         hex.EncodeToString(item.piece.Data.Data),
+				Coeffs:       hex.EncodeToString(item.piece.Data.Coeffs),
+				Proof:        hex.EncodeToString(item.piece.Proof),
+				PieceCommits: hexPieceCommits,
+				SenderPeerID: rcv.host.ID().String(),
+			}
+			nodeBatches[targetPeer.PeerID] = append(nodeBatches[targetPeer.PeerID], seedReq)
+		}
+
+		// Dispatch batches concurrently to each store node
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 64)
+		for peerID, seeds := range nodeBatches {
+			targetPeer := nodePeers[peerID]
 			wg.Add(1)
 			sem <- struct{}{}
-			go func(it precomputedPiece) {
+			go func(tp p2pcommon.PeerInfo, sList []p2pcommon.SeedCellRequest) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				if err := rcv.broadcaster.BroadcastPiece(payload.BlockID, it.row, colIdx, it.pieceIdx, it.piece, pieceCommits); err != nil {
-					log.Printf("[Height: %d] Failed to broadcast piece %d to Store Node for cell [%d, %d]: %v", height, it.pieceIdx, it.row, colIdx, err)
+
+				// Chunks of up to 64 seeds per batch stream
+				chunkSize := 64
+				for i := 0; i < len(sList); i += chunkSize {
+					end := i + chunkSize
+					if end > len(sList) {
+						end = len(sList)
+					}
+					batchReq := p2pcommon.BatchSeedCellRequest{
+						BlockID: payload.BlockID,
+						Seeds:   sList[i:end],
+					}
+					if err := rcv.broadcaster.BroadcastBatchPieces(tp, batchReq); err != nil {
+						log.Printf("[Height: %d] Fallback: broadcast batch to %s failed: %v. Sending individually...", height, tp.PeerID, err)
+						for _, s := range sList[i:end] {
+							pData, _ := hex.DecodeString(s.Data)
+							pCoeffs, _ := hex.DecodeString(s.Coeffs)
+							pProof, _ := hex.DecodeString(s.Proof)
+							pc := cda.ReceivedPiece{
+								Row:   s.Row,
+								Col:   s.Col,
+								Data:  rlnc.PieceData{Data: pData, Coeffs: pCoeffs},
+								Proof: cda.OpeningProof(pProof),
+							}
+							_ = rcv.broadcaster.BroadcastPiece(payload.BlockID, s.Row, colIdx, 0, &pc, pieceCommits)
+						}
+					}
 				}
-			}(item)
+			}(targetPeer, seeds)
 		}
 		wg.Wait()
 		log.Printf("[Height: %d] Async Phase 2 finished successfully: seeded %d pieces total (%d per store node) for Column %d", height, len(precomputedPieces), rcv.k, colIdx)

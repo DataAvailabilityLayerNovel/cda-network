@@ -219,3 +219,71 @@ func (b *Broadcaster) BroadcastPiece(blockID string, row, col int, pieceIdx int,
 func peerstoreAddressTTL() time.Duration {
 	return 10 * time.Minute
 }
+
+// BroadcastBatchPieces delivers a batch of RLNC pieces to a specific Store Node.
+func (b *Broadcaster) BroadcastBatchPieces(targetPeer p2pcommon.PeerInfo, req p2pcommon.BatchSeedCellRequest) error {
+	pid, err := peer.Decode(targetPeer.PeerID)
+	if err != nil {
+		return fmt.Errorf("invalid peer id %s: %w", targetPeer.PeerID, err)
+	}
+
+	for _, addrStr := range targetPeer.Multiaddrs {
+		maddr, err := multiaddr.NewMultiaddr(addrStr)
+		if err == nil {
+			b.host.Peerstore().AddAddr(pid, maddr, peerstoreAddressTTL())
+		}
+	}
+
+	nodeBatchProto := p2pcommon.ProtoNodeBatchSeed(targetPeer.PeerID)
+
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		ctxDial, cancelDial := context.WithTimeout(context.Background(), 5*time.Second)
+		err = b.host.Connect(ctxDial, peer.AddrInfo{ID: pid})
+		if err != nil {
+			lastErr = err
+			cancelDial()
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		streamCtx, streamCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		stream, err := b.host.NewStream(streamCtx, pid, protocol.ID(nodeBatchProto))
+		cancelDial()
+		if err != nil {
+			lastErr = err
+			streamCancel()
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		if err := json.NewEncoder(stream).Encode(req); err != nil {
+			lastErr = err
+			streamCancel()
+			stream.Reset()
+			continue
+		}
+
+		var ack struct {
+			Success bool   `json:"success"`
+			Error   string `json:"error,omitempty"`
+		}
+		if err := json.NewDecoder(stream).Decode(&ack); err != nil {
+			lastErr = err
+			streamCancel()
+			stream.Reset()
+			continue
+		}
+
+		stream.Close()
+		streamCancel()
+
+		if !ack.Success {
+			return fmt.Errorf("store node %s batch verify error: %s", targetPeer.PeerID, ack.Error)
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("failed to send batch seed of %d pieces to %s after 3 attempts: %v", len(req.Seeds), targetPeer.PeerID, lastErr)
+}

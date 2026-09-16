@@ -98,6 +98,24 @@ type Receiver struct {
 	workerChans []chan func()
 	numWorkers  int
 
+	// Gossip batch processing
+	gossipQueue     chan p2pcommon.SeedCellRequest
+	gossipBatchStop chan struct{}
+
+	// Cooldown / Grace period for active pulls
+	pullMu       sync.Mutex
+	pendingPulls map[string]bool
+
+	// Active fallback monitor tracking per block
+	fallbackMu      sync.Mutex
+	activeFallbacks map[string]bool
+
+	// Debounced block completion checker
+	completionCheckChan chan string
+
+	// Bounded concurrency semaphore for custody cell dissemination
+	disseminationSem chan struct{}
+
 	// Context for subscribeToNonCustodyCells goroutines lifetime
 	ctx context.Context
 }
@@ -180,6 +198,12 @@ func NewReceiver(
 		peerContributions: make(map[string]map[string]int),
 		workerChans:       chans,
 		numWorkers:        nWorkers,
+		pendingPulls:        make(map[string]bool),
+		activeFallbacks:     make(map[string]bool),
+		gossipQueue:         make(chan p2pcommon.SeedCellRequest, 4096),
+		gossipBatchStop:     make(chan struct{}),
+		completionCheckChan: make(chan string, 1024),
+		disseminationSem:    make(chan struct{}, 16),
 	}
 }
 
@@ -212,6 +236,12 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	for i := 0; i < rcv.numWorkers; i++ {
 		go rcv.workerLoop(ctx, rcv.workerChans[i])
 	}
+	// Start debounced completion check worker loop
+	go rcv.completionCheckWorkerLoop(ctx)
+
+	// Start batch workers for GossipSub messages (2 workers optimal for multicore MSM)
+	rcv.startGossipBatchWorkers(ctx, 2)
+
 	StartMetricsTicker(ctx)
 	LinearIndependentPiecesCount.Set(float64(rcv.totalStoredPieces))
 
@@ -250,6 +280,10 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	rcv.host.SetStreamHandler(protocol.ID(nodeProto), rcv.handleSeedStream)
 	log.Printf("[StoreNode] Registered per-node seed handler on protocol %s", nodeProto)
 
+	nodeBatchProto := p2pcommon.ProtoNodeBatchSeed(rcv.selfPeerID)
+	rcv.host.SetStreamHandler(protocol.ID(nodeBatchProto), rcv.handleBatchSeedStream)
+	log.Printf("[StoreNode] Registered per-node batch seed handler on protocol %s", nodeBatchProto)
+
 	// Keep generic fetch handlers (used by light nodes and active-pull)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreFetch, rcv.handleFetchStream)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreGetPieces, rcv.handleFetchStream)
@@ -279,8 +313,7 @@ func (rcv *Receiver) Start(ctx context.Context) {
 			data := msg.Data
 			var payload p2pcommon.SeedCellRequest
 			if err := json.Unmarshal(data, &payload); err == nil && payload.BlockID != "" {
-				cellKey := fmt.Sprintf("%s_%d_%d", payload.BlockID, payload.Row, payload.Col)
-				rcv.dispatchTask(cellKey, func() { rcv.processGossipMessage(data) })
+				rcv.enqueueGossipPiece(payload)
 			}
 		}
 	}(selfSub)
@@ -346,6 +379,20 @@ func (rcv *Receiver) workerLoop(ctx context.Context, ch chan func()) {
 	}
 }
 
+// enqueueGossipPiece queues an incoming GossipSub seed cell for batch verification.
+func (rcv *Receiver) enqueueGossipPiece(payload p2pcommon.SeedCellRequest) {
+	recordGossipMessage()
+	select {
+	case rcv.gossipQueue <- payload:
+	default:
+		// Fallback: process directly via worker if queue is full
+		cellKey := fmt.Sprintf("%s_%d_%d", payload.BlockID, payload.Row, payload.Col)
+		rcv.dispatchTask(cellKey, func() {
+			rcv.processPiece(payload.BlockID, payload.Row, payload.Col, payload.Data, payload.Coeffs, payload.Proof, payload.PieceCommits, payload.SenderPeerID, true)
+		})
+	}
+}
+
 // processGossipMessage handles incoming messages on this node's own TopicNode topic.
 // Messages here are recoded RLNC pieces published by other custody nodes.
 func (rcv *Receiver) processGossipMessage(data []byte) {
@@ -353,8 +400,43 @@ func (rcv *Receiver) processGossipMessage(data []byte) {
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return
 	}
-	recordGossipMessage()
-	rcv.processPiece(payload.BlockID, payload.Row, payload.Col, payload.Data, payload.Coeffs, payload.Proof, payload.PieceCommits, payload.SenderPeerID, true)
+	rcv.enqueueGossipPiece(payload)
+}
+
+func (rcv *Receiver) startGossipBatchWorkers(ctx context.Context, numWorkers int) {
+	for i := 0; i < numWorkers; i++ {
+		go rcv.gossipBatchWorkerLoop(ctx)
+	}
+}
+
+func (rcv *Receiver) gossipBatchWorkerLoop(ctx context.Context) {
+	batchSize := 48
+	batch := make([]p2pcommon.SeedCellRequest, 0, batchSize)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-rcv.gossipBatchStop:
+			return
+		case item, ok := <-rcv.gossipQueue:
+			if !ok {
+				return
+			}
+			batch = append(batch, item)
+			if len(batch) >= batchSize {
+				rcv.verifyAndProcessBatch(batch)
+				batch = make([]p2pcommon.SeedCellRequest, 0, batchSize)
+			}
+		case <-ticker.C:
+			if len(batch) > 0 {
+				rcv.verifyAndProcessBatch(batch)
+				batch = make([]p2pcommon.SeedCellRequest, 0, batchSize)
+			}
+		}
+	}
 }
 
 // processAnchorMessage handles incoming messages on the column's TopicCol topic.
@@ -423,16 +505,34 @@ func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []stri
 	rcv.cache.AnchorCommitments(blockID, colIdx, pieceCommits)
 	log.Printf("[Height: %d] [StoreNode] Successfully anchored commitments for Block %s, Column %d", height, blockID, colIdx)
 
-	// 5. Schedule periodic fallback pull in case GossipSub drops pieces
-	go func(bID string) {
-		for attempt := 1; attempt <= 6; attempt++ {
-			time.Sleep(3000 * time.Millisecond)
+	// 5. Schedule periodic fallback pull in case GossipSub drops pieces (deduplicated per block)
+	rcv.fallbackMu.Lock()
+	if !rcv.activeFallbacks[blockID] {
+		rcv.activeFallbacks[blockID] = true
+		rcv.fallbackMu.Unlock()
+		go func(bID string) {
+			defer func() {
+				rcv.fallbackMu.Lock()
+				delete(rcv.activeFallbacks, bID)
+				rcv.fallbackMu.Unlock()
+			}()
+
+			// Grace period of 8 seconds to allow GossipSub dissemination and Batch Verify to complete naturally
+			time.Sleep(8 * time.Second)
 			if rcv.IsComplete(bID) {
 				return
 			}
-			rcv.fallbackPullMissingCells(bID)
-		}
-	}(blockID)
+			for attempt := 1; attempt <= 4; attempt++ {
+				if rcv.IsComplete(bID) {
+					return
+				}
+				rcv.fallbackPullMissingCells(bID)
+				time.Sleep(3 * time.Second)
+			}
+		}(blockID)
+	} else {
+		rcv.fallbackMu.Unlock()
+	}
 }
 
 func (rcv *Receiver) handleSeedStream(stream network.Stream) {
@@ -453,6 +553,145 @@ func (rcv *Receiver) handleSeedStream(stream network.Stream) {
 	json.NewEncoder(stream).Encode(struct {
 		Success bool `json:"success"`
 	}{Success: true})
+}
+
+func (rcv *Receiver) handleBatchSeedStream(stream network.Stream) {
+	defer stream.Close()
+
+	var payload p2pcommon.BatchSeedCellRequest
+	if err := json.NewDecoder(stream).Decode(&payload); err != nil {
+		rcv.respondWithError(stream, fmt.Sprintf("failed to decode batch seed: %v", err))
+		return
+	}
+
+	if len(payload.Seeds) > 0 {
+		rcv.verifyAndProcessBatch(payload.Seeds)
+	}
+
+	json.NewEncoder(stream).Encode(struct {
+		Success bool `json:"success"`
+	}{Success: true})
+}
+
+func (rcv *Receiver) verifyAndProcessBatch(seeds []p2pcommon.SeedCellRequest) {
+	if len(seeds) == 0 {
+		return
+	}
+
+	type candidateItem struct {
+		blockID       string
+		row, col      int
+		piece         cda.ReceivedPiece
+		decodedCoeffs []byte
+		senderPeerID  string
+		combinedComm  []byte
+	}
+
+	var candidates []candidateItem
+	var batchItems []cda.BatchVerifyItem
+
+	for _, s := range seeds {
+		cellKey := fmt.Sprintf("%s_%d_%d", s.BlockID, s.Row, s.Col)
+		rcv.completedMu.Lock()
+		if rcv.completedBlocks != nil && rcv.completedBlocks[s.BlockID] {
+			rcv.completedMu.Unlock()
+			continue
+		}
+		rcv.completedMu.Unlock()
+
+		isPrimaryEarly := (s.Row % rcv.storesPerCol) == rcv.rowIdx
+		isBackupEarly := ((s.Row + 1) % rcv.storesPerCol) == rcv.rowIdx
+		if !isPrimaryEarly && !isBackupEarly {
+			rcv.nonCustodyLockedMu.Lock()
+			locked := rcv.nonCustodyLocked[cellKey]
+			rcv.nonCustodyLockedMu.Unlock()
+			if locked {
+				continue
+			}
+		}
+
+		rcv.pruneMu.Lock()
+		pruned := rcv.prunedCells[cellKey]
+		rcv.pruneMu.Unlock()
+		if pruned {
+			continue
+		}
+
+		decodedData, err1 := hex.DecodeString(s.Data)
+		decodedCoeffs, err2 := hex.DecodeString(s.Coeffs)
+		decodedProof, err3 := hex.DecodeString(s.Proof)
+		if err1 != nil || err2 != nil || err3 != nil {
+			continue
+		}
+
+		piece := cda.ReceivedPiece{
+			Row: s.Row,
+			Col: s.Col,
+			Data: rlnc.PieceData{
+				Data:   decodedData,
+				Coeffs: decodedCoeffs,
+			},
+			Proof: cda.OpeningProof(decodedProof),
+		}
+
+		pieceCommits, exists := rcv.cache.GetAnchoredCommitments(s.BlockID, s.Col)
+		if !exists {
+			if len(s.PieceCommits) > 0 {
+				pieceCommits = make([][]byte, len(s.PieceCommits))
+				for i, h := range s.PieceCommits {
+					b, _ := hex.DecodeString(h)
+					pieceCommits[i] = b
+				}
+				rcv.cache.AnchorCommitments(s.BlockID, s.Col, pieceCommits)
+			}
+		}
+
+		if len(pieceCommits) < rcv.kPiece {
+			continue
+		}
+
+		pieceCommitsTyped := make([]cda.PieceCommitment, rcv.kPiece)
+		for i := 0; i < rcv.kPiece; i++ {
+			pieceCommitsTyped[i] = cda.PieceCommitment(pieceCommits[i])
+		}
+		combinedCommit, err := rcv.kzg.Combine(pieceCommitsTyped, decodedCoeffs)
+		if err != nil {
+			continue
+		}
+
+		batchItems = append(batchItems, cda.BatchVerifyItem{
+			Commitment: combinedCommit,
+			Row:        s.Row,
+			Data:       decodedData,
+			Proof:      cda.OpeningProof(decodedProof),
+		})
+
+		candidates = append(candidates, candidateItem{
+			blockID:       s.BlockID,
+			row:           s.Row,
+			col:           s.Col,
+			piece:         piece,
+			decodedCoeffs: decodedCoeffs,
+			senderPeerID:  s.SenderPeerID,
+			combinedComm:  combinedCommit,
+		})
+	}
+
+	// Batch KZG Verification using RLC (only 2 pairings for the whole batch!)
+	if len(batchItems) > 0 {
+		if rcv.kzg.BatchVerify(batchItems) {
+			for _, item := range candidates {
+				_ = rcv.processVerifiedPiece(item.blockID, item.row, item.col, item.piece, item.decodedCoeffs, item.senderPeerID)
+			}
+		} else {
+			// Fallback: verify individually to isolate any corrupted piece
+			for _, item := range candidates {
+				if rcv.kzg.Verify(item.combinedComm, item.row, item.piece.Data.Data, item.piece.Proof) {
+					_ = rcv.processVerifiedPiece(item.blockID, item.row, item.col, item.piece, item.decodedCoeffs, item.senderPeerID)
+				}
+			}
+		}
+	}
 }
 
 func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsStr, proofStr string, pieceCommitsStr []string, senderPeerID string, isGossip bool) error {
@@ -558,6 +797,11 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 		return fmt.Errorf("layer 3 verification failed")
 	}
 
+	return rcv.processVerifiedPiece(blockID, row, col, piece, decodedCoeffs, senderPeerID)
+}
+
+func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cda.ReceivedPiece, decodedCoeffs []byte, senderPeerID string) error {
+
 	rcv.cellMu.Lock()
 
 	isPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
@@ -636,7 +880,7 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 			rcv.pruneMu.Unlock()
 
 			log.Printf("[StoreNode] Non-custody: cell [%d, %d] successfully recoded from %d pieces across %d sources; raw pieces pruned, cell locked.", row, col, len(updatedPieces), numSources)
-			go rcv.CheckAndLogCompletion(blockID)
+			rcv.CheckAndLogCompletion(blockID)
 			return nil
 		}
 
@@ -687,7 +931,7 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 		rcv.contribMu.Unlock()
 	}
 
-	go rcv.CheckAndLogCompletion(blockID)
+	rcv.CheckAndLogCompletion(blockID)
 
 	// 6. P2P Recoding & GossipSub forwarding
 	updatedPieces := rcv.cache.GetPieces(blockID, row, col)
@@ -698,6 +942,9 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 		// Broadcast kPiece/2 independently recoded pieces to give subscribers enough diversity.
 		if len(updatedPieces) >= rcv.kPiece {
 			go func(bID string, r, c int, pieces []cda.ReceivedPiece, primary bool) {
+				rcv.disseminationSem <- struct{}{}
+				defer func() { <-rcv.disseminationSem }()
+
 				numBroadcast := rcv.kPiece / 2
 				if numBroadcast < 1 {
 					numBroadcast = 1
@@ -739,7 +986,7 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 						rcv.broadcastMu.Lock()
 						rcv.cellBroadcastCount[cellKey]++
 						rcv.broadcastMu.Unlock()
-						go rcv.CheckAndLogCompletion(bID)
+						rcv.CheckAndLogCompletion(bID)
 					}
 				}
 
@@ -753,15 +1000,35 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 					rcv.prunedCells[cellKey] = true
 					rcv.pruneMu.Unlock()
 					log.Printf("[StoreNode] Backup: cell [%d, %d] dissemination finished (%d/%d rounds); raw pieces pruned.", r, c, broadcastSucceeded, numBroadcast)
-					go rcv.CheckAndLogCompletion(bID)
+					rcv.CheckAndLogCompletion(bID)
 				}
 			}(blockID, row, col, updatedPieces, isPrimary)
 		}
 	}
 
-	// 7. Active Pull: if custody node still lacks pieces, pull from column peers
+	// 7. Active Pull: if custody node still lacks pieces, pull from column peers after a grace period
 	if isCustody && len(updatedPieces) < rcv.kPiece {
-		go rcv.pullMissingPiecesFromPeers(blockID, row, col)
+		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+		rcv.pullMu.Lock()
+		if !rcv.pendingPulls[cellKey] {
+			rcv.pendingPulls[cellKey] = true
+			rcv.pullMu.Unlock()
+			go func(bID string, r, c int, key string) {
+				time.Sleep(3 * time.Second)
+				rcv.pullMu.Lock()
+				delete(rcv.pendingPulls, key)
+				rcv.pullMu.Unlock()
+
+				rcv.cellMu.Lock()
+				pCount := len(rcv.cache.GetPieces(bID, r, c))
+				rcv.cellMu.Unlock()
+				if pCount < rcv.kPiece {
+					rcv.pullMissingPiecesFromPeers(bID, r, c)
+				}
+			}(blockID, row, col, cellKey)
+		} else {
+			rcv.pullMu.Unlock()
+		}
 	}
 
 	return nil
@@ -865,8 +1132,7 @@ func (rcv *Receiver) subscribeToNonCustodyCells(ctx context.Context, colPeers []
 					data := msg.Data
 					var payload p2pcommon.SeedCellRequest
 					if err := json.Unmarshal(data, &payload); err == nil && payload.BlockID != "" {
-						cellKey := fmt.Sprintf("%s_%d_%d", payload.BlockID, payload.Row, payload.Col)
-						rcv.dispatchTask(cellKey, func() { rcv.processGossipMessage(data) })
+						rcv.enqueueGossipPiece(payload)
 					}
 				}
 			}(sub)
@@ -894,6 +1160,9 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string) {
 	endCol := startCol + colsPerNetCol
 
 	pulledAny := false
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+
 	for c := startCol; c < endCol; c++ {
 		for r := 0; r < n; r++ {
 			isPrimary := (r % rcv.storesPerCol) == rcv.rowIdx
@@ -907,7 +1176,13 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string) {
 				pCount := rcv.cache.GetPieceCount(blockID, r, c)
 				if pCount < rcv.kPiece || bCount < 1 {
 					pulledAny = true
-					go rcv.pullMissingPiecesFromPeers(blockID, r, c)
+					wg.Add(1)
+					sem <- struct{}{}
+					go func(row, col int) {
+						defer wg.Done()
+						defer func() { <-sem }()
+						rcv.pullMissingPiecesFromPeers(blockID, row, col)
+					}(r, c)
 				}
 			} else if !isBackup {
 				cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
@@ -917,13 +1192,20 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string) {
 
 				if !locked {
 					pulledAny = true
-					go rcv.pullNonCustodyPiece(blockID, r, c)
+					wg.Add(1)
+					sem <- struct{}{}
+					go func(row, col int) {
+						defer wg.Done()
+						defer func() { <-sem }()
+						rcv.pullNonCustodyPiece(blockID, row, col)
+					}(r, c)
 				}
 			}
 		}
 	}
+	wg.Wait()
 	if pulledAny {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		rcv.CheckAndLogCompletion(blockID)
 	}
 }
@@ -1054,7 +1336,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 					latestPieces = append(latestPieces, p)
 					log.Printf("[StoreNode] Active pull (attempt %d): stored independent piece for cell [%d, %d] from peer %s (Row %d) (count: %d/%d)", attempt, row, col, pid, pInfo.Row, len(latestPieces), rcv.kPiece)
 					allPieces = latestPieces
-					go rcv.CheckAndLogCompletion(blockID)
+					rcv.CheckAndLogCompletion(blockID)
 				}
 				rcv.cellMu.Unlock()
 
@@ -1092,7 +1374,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 			rcv.cache.StoreRecodedPiece(blockID, row, col, *firstRecoded)
 			rcv.cellMu.Unlock()
 			log.Printf("[StoreNode] Successfully recoded cell [%d, %d] in active pull.", row, col)
-			go rcv.CheckAndLogCompletion(blockID)
+			rcv.CheckAndLogCompletion(blockID)
 
 			if isPullPrimary || isPullBackup {
 				numBroadcast := rcv.kPiece / 2
@@ -1115,7 +1397,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 						rcv.broadcastMu.Lock()
 						rcv.cellBroadcastCount[cellKey]++
 						rcv.broadcastMu.Unlock()
-						go rcv.CheckAndLogCompletion(blockID)
+						rcv.CheckAndLogCompletion(blockID)
 					}
 				}
 
@@ -1143,7 +1425,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 				rcv.prunedCells[cellKey] = true
 				rcv.pruneMu.Unlock()
 				log.Printf("[StoreNode] Non-custody: active pull cell [%d, %d] recoded, raw pieces pruned, cell locked permanently.", row, col)
-				go rcv.CheckAndLogCompletion(blockID)
+				rcv.CheckAndLogCompletion(blockID)
 			}
 		} else {
 			log.Printf("[StoreNode] Failed to recode cell [%d, %d] in active pull: %v", row, col, err)
@@ -1282,7 +1564,7 @@ func (rcv *Receiver) pullNonCustodyPiece(blockID string, row, col int) {
 	rcv.pruneMu.Unlock()
 
 	log.Printf("[StoreNode] Non-custody active pull: successfully stored piece for cell [%d, %d] from %d custody sources", row, col, len(pulledPieces))
-	go rcv.CheckAndLogCompletion(blockID)
+	rcv.CheckAndLogCompletion(blockID)
 }
 
 func (rcv *Receiver) handleFetchStream(stream network.Stream) {
@@ -1571,7 +1853,48 @@ func (rcv *Receiver) IsComplete(blockID string) bool {
 	return complete
 }
 
+func (rcv *Receiver) completionCheckWorkerLoop(ctx context.Context) {
+	ticker := time.NewTicker(40 * time.Millisecond)
+	defer ticker.Stop()
+
+	pending := make(map[string]bool)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case blockID, ok := <-rcv.completionCheckChan:
+			if !ok {
+				return
+			}
+			pending[blockID] = true
+		case <-ticker.C:
+			if len(pending) == 0 {
+				continue
+			}
+			for bID := range pending {
+				rcv.doCheckAndLogCompletion(bID)
+				delete(pending, bID)
+			}
+		}
+	}
+}
+
 func (rcv *Receiver) CheckAndLogCompletion(blockID string) {
+	rcv.completedMu.Lock()
+	if rcv.completedBlocks != nil && rcv.completedBlocks[blockID] {
+		rcv.completedMu.Unlock()
+		return
+	}
+	rcv.completedMu.Unlock()
+
+	select {
+	case rcv.completionCheckChan <- blockID:
+	default:
+	}
+}
+
+func (rcv *Receiver) doCheckAndLogCompletion(blockID string) {
 	rcv.completedMu.Lock()
 	if rcv.completedBlocks == nil {
 		rcv.completedBlocks = make(map[string]bool)
@@ -1734,7 +2057,7 @@ func (rcv *Receiver) startPruner(ctx context.Context) {
 								rcv.totalStoredPiecesMu.Unlock()
 								LinearIndependentPiecesCount.Set(float64(currCount))
 							}
-							go rcv.CheckAndLogCompletion(blockID)
+							rcv.CheckAndLogCompletion(blockID)
 						}
 					}
 				}

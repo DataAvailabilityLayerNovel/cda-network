@@ -112,6 +112,11 @@ func ProtoNodeSeed(peerID string) string {
 	return fmt.Sprintf("/cda/store/%s/seed/1.0.0", peerID)
 }
 
+// ProtoNodeBatchSeed returns the per-node libp2p stream protocol for seeding a batch of pieces.
+func ProtoNodeBatchSeed(peerID string) string {
+	return fmt.Sprintf("/cda/store/%s/seed-batch/1.0.0", peerID)
+}
+
 // GossipSub Topics
 const (
 	TopicHeader     = "/cda/1.0.0/header"
@@ -182,6 +187,12 @@ type SeedCellRequest struct {
 	Proof        string   `json:"proof"`         // Hex combined proof P_i
 	PieceCommits []string `json:"piece_commits"` // Hex piece commitments C_0..C_k-1
 	SenderPeerID string   `json:"sender_peer_id,omitempty"` // PeerID of the custody node sending this piece
+}
+
+// BatchSeedCellRequest payload for sending multiple seed pieces in a single stream
+type BatchSeedCellRequest struct {
+	BlockID string            `json:"block_id"`
+	Seeds   []SeedCellRequest `json:"seeds"`
 }
 
 // StoreFetchRequest is the request to retrieve pieces from a Store node
