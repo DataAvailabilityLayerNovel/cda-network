@@ -426,16 +426,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 	s.colReadyMu.Unlock()
 
-	s.publishMu.Lock()
-	defer s.publishMu.Unlock()
-
-	s.colReadyMu.Lock()
-	if reqHeight > s.latestPublishedHeight {
-		s.latestPublishedHeight = reqHeight
-	}
-	s.colReadyMu.Unlock()
-
-	// 1. Decode hex data cells (ODS)
+	// 1. Decode hex data cells (ODS) concurrently
 	decodedData := make([][]byte, len(req.Data))
 	totalBytes := 0
 	for i, h := range req.Data {
@@ -448,7 +439,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		totalBytes += len(b)
 	}
 
-	// 2. Run engine pipeline: ODS -> EDS -> Commitments -> Header
+	// 2. Run engine pipeline concurrently: ODS -> EDS -> Commitments -> Header
 	start := time.Now()
 	header, pubData, proofs, eds, err := s.pipeline.ProcessODS(decodedData, req.BlockID)
 	duration := time.Since(start).Seconds()
@@ -473,6 +464,16 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("[Height: %d] [Publisher] SUCCESS: Header verification passed for BlockID %s against BFT consensus!", height, req.BlockID)
 	}
+
+	// 2.6. Sequential dispatch phase: acquire publishMu to serialize DB, GossipSub and P2P column distribution
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+
+	s.colReadyMu.Lock()
+	if reqHeight > s.latestPublishedHeight {
+		s.latestPublishedHeight = reqHeight
+	}
+	s.colReadyMu.Unlock()
 
 	// Record metrics
 	RSEncodeDuration.Observe(duration)

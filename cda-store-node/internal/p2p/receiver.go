@@ -517,8 +517,8 @@ func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []stri
 				rcv.fallbackMu.Unlock()
 			}()
 
-			// Grace period of 8 seconds to allow GossipSub dissemination and Batch Verify to complete naturally
-			time.Sleep(8 * time.Second)
+			// Grace period of 5 seconds to allow GossipSub dissemination and Batch Verify to complete naturally
+			time.Sleep(5 * time.Second)
 			if rcv.IsComplete(bID) {
 				return
 			}
