@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -273,6 +274,10 @@ func (s *APIService) Close() error {
 }
 
 func (s *APIService) RegisterHandlers(mux *http.ServeMux) {
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"healthy"}`))
+	})
 	mux.HandleFunc("/publish", s.handlePublish)
 	mux.HandleFunc("/header/", s.handleGetHeader)
 }
@@ -377,29 +382,49 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 0.5. Sequential Completion Gate (Multi-Block Queue Control)
+	// 0.5. Sequential Completion Gate (Multi-Block Pipeline Queue Control)
+	// Allows publisher to proactively admit and send the NEXT block (H) to bootstrap nodes
+	// for pre-computation even while block (H-1) is still reaching StoreReady.
+	// Max in-flight is 2 (1 active storage round, 1 pre-computed buffer round).
 	reqHeight := int(req.Height)
 	if reqHeight <= 0 {
 		reqHeight = p2pcommon.ParseHeightFromBlockID(req.BlockID)
 	}
+
+	queueTimeout := 300 * time.Second
+	if envTimeout := os.Getenv("PUBLISHER_QUEUE_TIMEOUT"); envTimeout != "" {
+		if d, err := time.ParseDuration(envTimeout); err == nil && d > 0 {
+			queueTimeout = d
+		} else if sec, err := strconv.Atoi(envTimeout); err == nil && sec > 0 {
+			queueTimeout = time.Duration(sec) * time.Second
+		}
+	}
+
+	maxInFlight := 1
+	if envMax := os.Getenv("PUBLISHER_MAX_IN_FLIGHT"); envMax != "" {
+		if m, err := strconv.Atoi(envMax); err == nil && m > 0 {
+			maxInFlight = m
+		}
+	}
+
+	s.colReadyMu.Lock()
 	if reqHeight > 1 {
-		s.colReadyMu.Lock()
-		deadline := time.Now().Add(60 * time.Second)
-		for s.latestCompletedHeight < reqHeight-1 && time.Now().Before(deadline) {
-			log.Printf("[Height: %d] [Publisher Queue] Waiting for block-%d to complete before publishing block-%d (current completed: %d)...",
-				reqHeight, reqHeight-1, reqHeight, s.latestCompletedHeight)
+		deadline := time.Now().Add(queueTimeout)
+		for (reqHeight - s.latestCompletedHeight) > maxInFlight && time.Now().Before(deadline) {
+			log.Printf("[Height: %d] [Publisher Queue] In-flight pipeline full (%d in-flight, latest completed: %d). Waiting for block-%d before accepting block-%d...",
+				reqHeight, reqHeight-s.latestCompletedHeight, s.latestCompletedHeight, reqHeight-maxInFlight, reqHeight)
 			s.colReadyMu.Unlock()
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 			s.colReadyMu.Lock()
 		}
-		if s.latestCompletedHeight < reqHeight-1 {
+		if (reqHeight - s.latestCompletedHeight) > maxInFlight {
 			currentCompleted := s.latestCompletedHeight
 			s.colReadyMu.Unlock()
-			http.Error(w, fmt.Sprintf("Block height %d is out of sequence (current completed height: %d after waiting)", reqHeight, currentCompleted), http.StatusUnprocessableEntity)
+			http.Error(w, fmt.Sprintf("Block height %d timed out waiting in publisher queue (current completed: %d, max in-flight: %d after waiting %v)", reqHeight, currentCompleted, maxInFlight, queueTimeout), http.StatusUnprocessableEntity)
 			return
 		}
-		s.colReadyMu.Unlock()
 	}
+	s.colReadyMu.Unlock()
 
 	s.publishMu.Lock()
 	defer s.publishMu.Unlock()

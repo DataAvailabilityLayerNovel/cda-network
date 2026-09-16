@@ -247,6 +247,13 @@ func main() {
 			}
 			var payload p2pcommon.GossipBlockReadyPayload
 			if err := json.Unmarshal(msg.Data, &payload); err == nil {
+				h := payload.Height
+				if h <= 0 {
+					h = p2pcommon.ParseHeightFromBlockID(payload.BlockID)
+				}
+				if h > 0 {
+					receiver.OnBlockCompleted(h)
+				}
 				log.Printf("[GossipSub] Bootstrap relayed BlockReady for block %s (height %d) from %s", payload.BlockID, payload.Height, msg.ReceivedFrom)
 				hub.broadcast(payload)
 			}

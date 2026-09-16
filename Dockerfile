@@ -16,11 +16,12 @@ COPY cda-store-node/ cda-store-node/
 COPY cda-light-node/ cda-light-node/
 COPY cda-p2p/ cda-p2p/
 
-# Compile all binaries
-RUN go build -o bin/publisher ./cda-publisher-node/cmd/publisher/main.go
-RUN go build -o bin/bootstrap ./cda-bootstrap-node/cmd/bootstrap/main.go
-RUN go build -o bin/store ./cda-store-node/cmd/store/main.go
-RUN go build -o bin/light ./cda-light-node/cmd/light/main.go
+# Compile all binaries statically
+ENV CGO_ENABLED=0
+RUN go build -ldflags="-s -w" -o bin/publisher ./cda-publisher-node/cmd/publisher/main.go
+RUN go build -ldflags="-s -w" -o bin/bootstrap ./cda-bootstrap-node/cmd/bootstrap/main.go
+RUN go build -ldflags="-s -w" -o bin/store ./cda-store-node/cmd/store/main.go
+RUN go build -ldflags="-s -w" -o bin/light ./cda-light-node/cmd/light/main.go
 
 # Stage 2: Runtime stage
 FROM alpine:latest

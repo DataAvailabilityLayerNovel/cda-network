@@ -422,6 +422,17 @@ func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []stri
 	// 4. Save anchored commitments
 	rcv.cache.AnchorCommitments(blockID, colIdx, pieceCommits)
 	log.Printf("[Height: %d] [StoreNode] Successfully anchored commitments for Block %s, Column %d", height, blockID, colIdx)
+
+	// 5. Schedule periodic fallback pull in case GossipSub drops pieces
+	go func(bID string) {
+		for attempt := 1; attempt <= 6; attempt++ {
+			time.Sleep(3000 * time.Millisecond)
+			if rcv.IsComplete(bID) {
+				return
+			}
+			rcv.fallbackPullMissingCells(bID)
+		}
+	}(blockID)
 }
 
 func (rcv *Receiver) handleSeedStream(stream network.Stream) {
@@ -548,7 +559,92 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 	}
 
 	rcv.cellMu.Lock()
-	// 4. Rank Filtering (Gaussian Elimination)
+
+	isPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
+	isBackup := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+	isCustody := isPrimary || isBackup
+
+	// Non-custody nodes: gather pieces from multiple sources, recode into 1 piece, and lock.
+	if !isCustody {
+		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+		rcv.nonCustodyLockedMu.Lock()
+		alreadyLocked := rcv.nonCustodyLocked[cellKey]
+		rcv.nonCustodyLockedMu.Unlock()
+
+		if alreadyLocked {
+			rcv.cellMu.Unlock()
+			return nil
+		}
+
+		existingPieces := rcv.cache.GetPieces(blockID, row, col)
+		existingCoeffs := make([][]byte, len(existingPieces))
+		for i, p := range existingPieces {
+			existingCoeffs[i] = p.Data.Coeffs
+		}
+
+		if !engine.IsLinearlyIndependent(existingCoeffs, decodedCoeffs, rcv.kPiece) {
+			DependentPiecesDroppedTotal.Inc()
+			rcv.cellMu.Unlock()
+			return nil
+		}
+
+		rcv.cache.StorePiece(blockID, row, col, piece)
+
+		if senderPeerID != "" {
+			rcv.contribMu.Lock()
+			if rcv.peerContributions[cellKey] == nil {
+				rcv.peerContributions[cellKey] = make(map[string]int)
+			}
+			rcv.peerContributions[cellKey][senderPeerID]++
+			rcv.contribMu.Unlock()
+		}
+
+		minPieces := 2
+		if rcv.kPiece < minPieces {
+			minPieces = rcv.kPiece
+		}
+		minSources := 2
+		if rcv.kPiece < minSources {
+			minSources = rcv.kPiece
+		}
+
+		rcv.contribMu.Lock()
+		numSources := len(rcv.peerContributions[cellKey])
+		rcv.contribMu.Unlock()
+
+		updatedPieces := rcv.cache.GetPieces(blockID, row, col)
+		if len(updatedPieces) >= minPieces && numSources >= minSources {
+			pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
+			var finalPiece *cda.ReceivedPiece
+			recoded, err := rcv.rm.RecodePiecesWithVerify(updatedPieces[:minPieces], pieceCommits, 5)
+			if err == nil && recoded != nil {
+				finalPiece = recoded
+			} else {
+				finalPiece = &updatedPieces[0]
+			}
+
+			rcv.cache.StoreRecodedPiece(blockID, row, col, *finalPiece)
+			rcv.cache.PruneRawPieces(blockID, row, col, rcv.rm)
+			rcv.cellMu.Unlock()
+
+			rcv.nonCustodyLockedMu.Lock()
+			rcv.nonCustodyLocked[cellKey] = true
+			rcv.nonCustodyLockedMu.Unlock()
+
+			rcv.pruneMu.Lock()
+			rcv.prunedCells[cellKey] = true
+			rcv.pruneMu.Unlock()
+
+			log.Printf("[StoreNode] Non-custody: cell [%d, %d] successfully recoded from %d pieces across %d sources; raw pieces pruned, cell locked.", row, col, len(updatedPieces), numSources)
+			go rcv.CheckAndLogCompletion(blockID)
+			return nil
+		}
+
+		rcv.cellMu.Unlock()
+		return nil
+	}
+
+	// 4. Rank Filtering (Gaussian Elimination) for Custody cells
 	existingPieces := rcv.cache.GetPieces(blockID, row, col)
 	existingCoeffs := make([][]byte, len(existingPieces))
 	for i, p := range existingPieces {
@@ -596,10 +692,6 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 	// 6. P2P Recoding & GossipSub forwarding
 	updatedPieces := rcv.cache.GetPieces(blockID, row, col)
 	rcv.cellMu.Unlock()
-
-	isPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
-	isBackup := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
-	isCustody := isPrimary || isBackup
 
 	if isCustody {
 		// Custody nodes (primary + backup): recode only when rank >= kPiece (full rank).
@@ -651,8 +743,8 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 					}
 				}
 
-				if !primary && broadcastSucceeded > 0 {
-					// Backup custody node: prune raw pieces immediately after full dissemination round completes
+				if !primary {
+					// Backup custody node: prune raw pieces after dissemination attempt
 					rcv.cellMu.Lock()
 					rcv.cache.PruneRawPieces(bID, r, c, rcv.rm)
 					rcv.cellMu.Unlock()
@@ -660,53 +752,10 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 					rcv.pruneMu.Lock()
 					rcv.prunedCells[cellKey] = true
 					rcv.pruneMu.Unlock()
-					log.Printf("[StoreNode] Backup: cell [%d, %d] dissemination completed (%d/%d rounds); raw pieces pruned.", r, c, broadcastSucceeded, numBroadcast)
+					log.Printf("[StoreNode] Backup: cell [%d, %d] dissemination finished (%d/%d rounds); raw pieces pruned.", r, c, broadcastSucceeded, numBroadcast)
 					go rcv.CheckAndLogCompletion(bID)
 				}
 			}(blockID, row, col, updatedPieces, isPrimary)
-		}
-	} else {
-		// Non-custody nodes: recode as soon as >=2 independent pieces from >=2 different sources are available.
-		// Then keep exactly 1 recoded piece, discard raw pieces, and lock the cell to ignore further pieces.
-		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
-		rcv.contribMu.Lock()
-		numSources := len(rcv.peerContributions[cellKey])
-		rcv.contribMu.Unlock()
-
-		if len(updatedPieces) >= 2 && numSources >= 2 {
-			// Atomically acquire the lock before launching goroutine to prevent parallel recode attempts
-			rcv.nonCustodyLockedMu.Lock()
-			alreadyLocked := rcv.nonCustodyLocked[cellKey]
-			if !alreadyLocked {
-				rcv.nonCustodyLocked[cellKey] = true
-			}
-			rcv.nonCustodyLockedMu.Unlock()
-
-			if !alreadyLocked {
-				go func(bID string, r, c int, pieces []cda.ReceivedPiece, ck string) {
-					targetPieces := pieces
-					if len(targetPieces) > 2 {
-						targetPieces = targetPieces[:2]
-					}
-					pieceCommits, _ := rcv.cache.GetAnchoredCommitments(bID, c)
-					log.Printf("[StoreNode] Non-custody: cell [%d, %d] has %d pieces from %d sources (recoding 2 pieces with self-verify). Recoding and locking cell.", r, c, len(pieces), numSources)
-					recodedPiece, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5)
-					if err != nil {
-						log.Printf("[StoreNode] Non-custody recode failed for cell [%d, %d] after 5 attempts: %v. Retaining raw piece 0.", r, c, err)
-						recodedPiece = &targetPieces[0]
-					}
-					rcv.cellMu.Lock()
-					rcv.cache.StoreRecodedPiece(bID, r, c, *recodedPiece)
-					// Prune raw pieces — non-custody node keeps only the 1 recoded piece
-					rcv.cache.PruneRawPieces(bID, r, c, rcv.rm)
-					rcv.cellMu.Unlock()
-					rcv.pruneMu.Lock()
-					rcv.prunedCells[ck] = true
-					rcv.pruneMu.Unlock()
-					log.Printf("[StoreNode] Non-custody: cell [%d, %d] recoded, raw pieces pruned, cell locked permanently.", r, c)
-					go rcv.CheckAndLogCompletion(bID)
-				}(blockID, row, col, updatedPieces, cellKey)
-			}
 		}
 	}
 
@@ -825,6 +874,60 @@ func (rcv *Receiver) subscribeToNonCustodyCells(ctx context.Context, colPeers []
 	}
 }
 
+func (rcv *Receiver) fallbackPullMissingCells(blockID string) {
+	if rcv.IsComplete(blockID) {
+		return
+	}
+
+	n := 2 * rcv.kBlock
+	numCols := rcv.numCols
+	if numCols <= 0 {
+		numCols = 8
+	}
+	colsPerNetCol := n / numCols
+	if colsPerNetCol == 0 {
+		colsPerNetCol = 1
+	}
+
+	netColIdx := rcv.colIdx / colsPerNetCol
+	startCol := netColIdx * colsPerNetCol
+	endCol := startCol + colsPerNetCol
+
+	pulledAny := false
+	for c := startCol; c < endCol; c++ {
+		for r := 0; r < n; r++ {
+			isPrimary := (r % rcv.storesPerCol) == rcv.rowIdx
+			isBackup := ((r + 1) % rcv.storesPerCol) == rcv.rowIdx
+			if isPrimary {
+				cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
+				rcv.broadcastMu.Lock()
+				bCount := rcv.cellBroadcastCount[cellKey]
+				rcv.broadcastMu.Unlock()
+
+				pCount := rcv.cache.GetPieceCount(blockID, r, c)
+				if pCount < rcv.kPiece || bCount < 1 {
+					pulledAny = true
+					go rcv.pullMissingPiecesFromPeers(blockID, r, c)
+				}
+			} else if !isBackup {
+				cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
+				rcv.nonCustodyLockedMu.Lock()
+				locked := rcv.nonCustodyLocked[cellKey]
+				rcv.nonCustodyLockedMu.Unlock()
+
+				if !locked {
+					pulledAny = true
+					go rcv.pullNonCustodyPiece(blockID, r, c)
+				}
+			}
+		}
+	}
+	if pulledAny {
+		time.Sleep(500 * time.Millisecond)
+		rcv.CheckAndLogCompletion(blockID)
+	}
+}
+
 func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 	rcv.cellMu.Lock()
 	localPieces := rcv.cache.GetPieces(blockID, row, col)
@@ -842,9 +945,16 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 		return
 	}
 
-	// Prioritize Backup Node for this row (Row == (row + 1) % storesPerCol)
+	// Prioritize Primary Node, then Backup Node for this row
+	primaryRow := row % rcv.storesPerCol
 	backupRow := (row + 1) % rcv.storesPerCol
 	sort.SliceStable(peersCopy, func(i, j int) bool {
+		if peersCopy[i].Row == primaryRow {
+			return true
+		}
+		if peersCopy[j].Row == primaryRow {
+			return false
+		}
 		if peersCopy[i].Row == backupRow {
 			return true
 		}
@@ -1009,18 +1119,170 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 					}
 				}
 
-				if !isPullPrimary && broadcastSucceeded > 0 {
-					// Backup: prune raw pieces after successful active-pull broadcast round
+				if !isPullPrimary {
+					// Backup: prune raw pieces after active-pull dissemination attempt
 					rcv.cellMu.Lock()
 					rcv.cache.PruneRawPieces(blockID, row, col, rcv.rm)
 					rcv.cellMu.Unlock()
-					log.Printf("[StoreNode] Backup: active pull cell [%d, %d] dissemination completed (%d/%d rounds); raw pieces pruned.", row, col, broadcastSucceeded, numBroadcast)
+					cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+					rcv.pruneMu.Lock()
+					rcv.prunedCells[cellKey] = true
+					rcv.pruneMu.Unlock()
+					log.Printf("[StoreNode] Backup: active pull cell [%d, %d] dissemination finished (%d/%d rounds); raw pieces pruned.", row, col, broadcastSucceeded, numBroadcast)
 				}
+			} else {
+				// Non-custody node: prune raw pieces, lock cell permanently, and satisfy IsComplete
+				rcv.cellMu.Lock()
+				rcv.cache.PruneRawPieces(blockID, row, col, rcv.rm)
+				rcv.cellMu.Unlock()
+				cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+				rcv.nonCustodyLockedMu.Lock()
+				rcv.nonCustodyLocked[cellKey] = true
+				rcv.nonCustodyLockedMu.Unlock()
+				rcv.pruneMu.Lock()
+				rcv.prunedCells[cellKey] = true
+				rcv.pruneMu.Unlock()
+				log.Printf("[StoreNode] Non-custody: active pull cell [%d, %d] recoded, raw pieces pruned, cell locked permanently.", row, col)
+				go rcv.CheckAndLogCompletion(blockID)
 			}
 		} else {
 			log.Printf("[StoreNode] Failed to recode cell [%d, %d] in active pull: %v", row, col, err)
 		}
 	}
+}
+
+func (rcv *Receiver) pullNonCustodyPiece(blockID string, row, col int) {
+	cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+	rcv.nonCustodyLockedMu.Lock()
+	if rcv.nonCustodyLocked[cellKey] {
+		rcv.nonCustodyLockedMu.Unlock()
+		return
+	}
+	rcv.nonCustodyLockedMu.Unlock()
+
+	rcv.peersMu.RLock()
+	peersCopy := make([]p2pcommon.PeerInfo, len(rcv.colPeers))
+	copy(peersCopy, rcv.colPeers)
+	rcv.peersMu.RUnlock()
+
+	if len(peersCopy) == 0 {
+		return
+	}
+
+	primaryRow := row % rcv.storesPerCol
+	backupRow := (row + 1) % rcv.storesPerCol
+	sort.SliceStable(peersCopy, func(i, j int) bool {
+		if peersCopy[i].Row == primaryRow {
+			return true
+		}
+		if peersCopy[j].Row == primaryRow {
+			return false
+		}
+		if peersCopy[i].Row == backupRow {
+			return true
+		}
+		return false
+	})
+
+	var pulledPieces []cda.ReceivedPiece
+	for _, pInfo := range peersCopy {
+		if pInfo.Row != primaryRow && pInfo.Row != backupRow {
+			continue
+		}
+		pid, err := peer.Decode(pInfo.PeerID)
+		if err != nil || pid == rcv.host.ID() {
+			continue
+		}
+
+		ctxDial, cancelDial := context.WithTimeout(context.Background(), 2*time.Second)
+		err = rcv.host.Connect(ctxDial, peer.AddrInfo{ID: pid})
+		if err != nil {
+			cancelDial()
+			continue
+		}
+
+		pStream, err := rcv.host.NewStream(ctxDial, pid, p2pcommon.ProtoStoreFetch)
+		if err != nil {
+			cancelDial()
+			continue
+		}
+
+		fetchReq := p2pcommon.StoreFetchRequest{
+			BlockID:     blockID,
+			Row:         row,
+			Col:         col,
+			IsRemoteHop: true,
+		}
+		if err := json.NewEncoder(pStream).Encode(fetchReq); err != nil {
+			pStream.Close()
+			cancelDial()
+			continue
+		}
+
+		var peerResp p2pcommon.StoreFetchResponse
+		if err := json.NewDecoder(pStream).Decode(&peerResp); err != nil {
+			pStream.Close()
+			cancelDial()
+			continue
+		}
+		pStream.Close()
+		cancelDial()
+
+		if len(peerResp.Pieces) > 0 {
+			pPayload := peerResp.Pieces[0]
+			decData, err1 := hex.DecodeString(pPayload.Data)
+			decCoeffs, err2 := hex.DecodeString(pPayload.Coeffs)
+			decProof, err3 := hex.DecodeString(pPayload.Proof)
+			if err1 == nil && err2 == nil && err3 == nil {
+				p := cda.ReceivedPiece{
+					Row: pPayload.Row,
+					Col: pPayload.Col,
+					Data: rlnc.PieceData{
+						Data:   decData,
+						Coeffs: decCoeffs,
+					},
+					Proof: cda.OpeningProof(decProof),
+				}
+				pulledPieces = append(pulledPieces, p)
+				if len(pulledPieces) >= 2 {
+					break
+				}
+			}
+		}
+	}
+
+	if len(pulledPieces) == 0 {
+		return
+	}
+
+	pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
+	var finalPiece *cda.ReceivedPiece
+	if len(pulledPieces) >= 2 {
+		recoded, err := rcv.rm.RecodePiecesWithVerify(pulledPieces[:2], pieceCommits, 5)
+		if err == nil && recoded != nil {
+			finalPiece = recoded
+		} else {
+			finalPiece = &pulledPieces[0]
+		}
+	} else {
+		finalPiece = &pulledPieces[0]
+	}
+
+	rcv.cellMu.Lock()
+	rcv.cache.StoreRecodedPiece(blockID, row, col, *finalPiece)
+	rcv.cache.PruneRawPieces(blockID, row, col, rcv.rm)
+	rcv.cellMu.Unlock()
+
+	rcv.nonCustodyLockedMu.Lock()
+	rcv.nonCustodyLocked[cellKey] = true
+	rcv.nonCustodyLockedMu.Unlock()
+
+	rcv.pruneMu.Lock()
+	rcv.prunedCells[cellKey] = true
+	rcv.pruneMu.Unlock()
+
+	log.Printf("[StoreNode] Non-custody active pull: successfully stored piece for cell [%d, %d] from %d custody sources", row, col, len(pulledPieces))
+	go rcv.CheckAndLogCompletion(blockID)
 }
 
 func (rcv *Receiver) handleFetchStream(stream network.Stream) {
@@ -1221,7 +1483,7 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 	json.NewEncoder(stream).Encode(resp)
 }
 
-func (rcv *Receiver) IsComplete(blockID string) bool {
+func (rcv *Receiver) DiagnoseCompletion(blockID string) (bool, map[string]interface{}) {
 	n := 2 * rcv.kBlock
 	numCols := rcv.numCols
 	if numCols <= 0 {
@@ -1241,14 +1503,12 @@ func (rcv *Receiver) IsComplete(blockID string) bool {
 		storesPerCol = 8
 	}
 
-	// Minimum number of broadcast rounds required per cell
-	minBroadcast := rcv.kPiece / 2
-	if minBroadcast < 1 {
-		minBroadcast = 1
-	}
+	minBroadcast := 1
 
 	rcv.broadcastMu.Lock()
 	defer rcv.broadcastMu.Unlock()
+
+	var unmetReasons []string
 
 	for c := startCol; c < endCol; c++ {
 		for r := 0; r < n; r++ {
@@ -1257,12 +1517,14 @@ func (rcv *Receiver) IsComplete(blockID string) bool {
 			cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
 			if isPrimary {
 				// Primary: must retain >= kPiece raw pieces for long-term storage
-				// AND must have disseminated >= kPiece/2 recoded pieces to the network
-				if rcv.cache.GetPieceCount(blockID, r, c) < rcv.kPiece {
-					return false
+				// AND must have disseminated >= 1 recoded piece to the network
+				pCount := rcv.cache.GetPieceCount(blockID, r, c)
+				bCount := rcv.cellBroadcastCount[cellKey]
+				if pCount < rcv.kPiece {
+					unmetReasons = append(unmetReasons, fmt.Sprintf("primary [%d,%d]: pieces=%d < %d", r, c, pCount, rcv.kPiece))
 				}
-				if rcv.cellBroadcastCount[cellKey] < minBroadcast {
-					return false
+				if bCount < minBroadcast {
+					unmetReasons = append(unmetReasons, fmt.Sprintf("primary [%d,%d]: broadcast=%d < %d", r, c, bCount, minBroadcast))
 				}
 			} else if isBackup {
 				// Backup: complete if dissemination finished (>= minBroadcast) OR if raw pieces pruned (<= 1 piece)
@@ -1270,30 +1532,43 @@ func (rcv *Receiver) IsComplete(blockID string) bool {
 					rcv.pruneMu.Lock()
 					pruned := rcv.prunedCells[cellKey]
 					rcv.pruneMu.Unlock()
-					if !pruned && rcv.cache.GetPieceCount(blockID, r, c) > 1 {
-						return false
+					total := rcv.cache.GetTotalPiecesForCell(blockID, r, c)
+					if !pruned && total > 1 {
+						unmetReasons = append(unmetReasons, fmt.Sprintf("backup [%d,%d]: not pruned and pieces=%d > 1", r, c, total))
 					}
 				}
 			} else {
-				// Non-custody: cell must have been processed & pruned to 1 recoded piece (rejecting 0 pieces or > 1 pieces)
+				// Non-custody: must store exactly 1 piece and be locked!
+				cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
 				rcv.nonCustodyLockedMu.Lock()
 				locked := rcv.nonCustodyLocked[cellKey]
 				rcv.nonCustodyLockedMu.Unlock()
-				if !locked {
-					rcv.pruneMu.Lock()
-					pruned := rcv.prunedCells[cellKey]
-					rcv.pruneMu.Unlock()
-					if !pruned {
-						pc := rcv.cache.GetPieceCount(blockID, r, c)
-						if pc == 0 || pc > 1 {
-							return false
-						}
-					}
+
+				total := rcv.cache.GetTotalPiecesForCell(blockID, r, c)
+				if locked && total > 1 {
+					rcv.cellMu.Lock()
+					rcv.cache.PruneRawPieces(blockID, r, c, rcv.rm)
+					rcv.cellMu.Unlock()
+					total = rcv.cache.GetTotalPiecesForCell(blockID, r, c)
+				}
+				if !locked || total != 1 {
+					unmetReasons = append(unmetReasons, fmt.Sprintf("non-custody [%d,%d]: locked=%v, pieces=%d != 1", r, c, locked, total))
 				}
 			}
 		}
 	}
-	return true
+
+	details := map[string]interface{}{
+		"unmet_count":   len(unmetReasons),
+		"unmet_reasons": unmetReasons,
+	}
+	return len(unmetReasons) == 0, details
+}
+
+// IsComplete returns true if all custody requirements for blockID are satisfied.
+func (rcv *Receiver) IsComplete(blockID string) bool {
+	complete, _ := rcv.DiagnoseCompletion(blockID)
+	return complete
 }
 
 func (rcv *Receiver) CheckAndLogCompletion(blockID string) {

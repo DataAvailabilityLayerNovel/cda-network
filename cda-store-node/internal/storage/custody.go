@@ -230,6 +230,16 @@ func (s *CustodyStore) GetPieceCount(blockID string, row, col int) int {
 	return count
 }
 
+// GetTotalPiecesForCell returns the total count of pieces (raw + recoded) stored for cell [row, col].
+func (s *CustodyStore) GetTotalPiecesForCell(blockID string, row, col int) int {
+	if s.db == nil {
+		return 0
+	}
+	rawCount := s.GetPieceCount(blockID, row, col)
+	recodedPieces := s.GetRecodedPieces(blockID, row, col)
+	return rawCount + len(recodedPieces)
+}
+
 func (s *CustodyStore) GetTotalPieceCount() int {
 	if s.db == nil {
 		return 0

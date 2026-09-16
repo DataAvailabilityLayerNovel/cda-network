@@ -25,7 +25,11 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
         'command': ["/usr/local/bin/publisher", "-config", "/app/publisher_config.json"],
         'ports': ["8080:8080", "18080:18080"],
         'volumes': ["./publisher_config_docker.json:/app/publisher_config.json"],
-        'networks': ['cda-net']
+        'networks': ['cda-net'],
+        'environment': [
+            'PUBLISHER_QUEUE_TIMEOUT=300s',
+            'PUBLISHER_MAX_IN_FLIGHT=2'
+        ]
     }
 
     bootstrap_addresses = []
@@ -111,7 +115,8 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                 "-bootstraps", bootstraps_arg,
                 "-k", str(k),
                 "-k-piece", str(k_piece),
-                "-num-cols", str(cols)
+                "-num-cols", str(cols),
+                "-auto-das=true"
             ] + crash_arg,
             'ports': [f"{light_port}:{light_port}", f"{light_port + 10000}:{light_port + 10000}"],
             'volumes': [f"./data/light_{light_port}:/app/data/light_{light_port}"],
@@ -515,12 +520,12 @@ def generate_publisher_config(k, k_piece, cols, cols_per_net_col, active_cols=No
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate docker-compose.yml for CDA network")
-    parser.add_argument('--k', type=int, default=16, help='K parameter for erasure coding (matrix size)')
-    parser.add_argument('--k-piece', type=int, default=4, help='KPiece parameter for RLNC/KZG')
-    parser.add_argument('--cols', type=int, default=8, help='Number of columns to simulate')
-    parser.add_argument('--active-cols', type=int, default=None, help='Number of active columns to run in Compose')
-    parser.add_argument('--stores-per-col', type=int, default=8, help='Number of store nodes per column')
-    parser.add_argument('--lights', type=int, default=2, help='Number of light nodes')
+    parser.add_argument('-k', '--k', type=int, default=16, help='K parameter for erasure coding (matrix size)')
+    parser.add_argument('-p', '--k-piece', '--piece', type=int, default=4, help='KPiece parameter for RLNC/KZG')
+    parser.add_argument('-n', '--num-cols', '--cols', dest='cols', type=int, default=8, help='Total number of network columns (N)')
+    parser.add_argument('-c', '--active-cols', type=int, default=None, help='Number of active columns to run in Compose (C)')
+    parser.add_argument('-s', '--stores-per-col', type=int, default=8, help='Number of store nodes per column (S)')
+    parser.add_argument('-l', '--lights', '--light-nodes', type=int, default=2, help='Number of light nodes (L)')
     parser.add_argument('--crash-on-fail', action='store_true', help='Enable crash on fail for nodes')
     parser.add_argument('--prune-enable', action='store_true', help='Enable pruning for store and bootstrap nodes')
     parser.add_argument('--prune-ttl', type=str, default=None, help='TTL duration before pruning (e.g. 5m)')

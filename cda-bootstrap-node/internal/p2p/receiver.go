@@ -43,6 +43,11 @@ type Receiver struct {
 
 	pruneEnable bool
 	pruneTTL    time.Duration
+
+	// Multi-block Pipelining & Pre-computation State
+	pipelineMu            sync.Mutex
+	pipelineCond          *sync.Cond
+	latestCompletedHeight int
 }
 
 func NewReceiver(
@@ -74,6 +79,7 @@ func NewReceiver(
 		pruneEnable:   pruneEnable,
 		pruneTTL:      pruneTTL,
 	}
+	rcv.pipelineCond = sync.NewCond(&rcv.pipelineMu)
 	// Connect broadcaster back to registry
 	broadcaster.SetRegistry(rcv)
 
@@ -237,22 +243,15 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 
 	log.Printf("[Height: %d] [P2P] Verification succeeded for Column %d", height, colIdx)
 
-	// 3. Gossip commitments and Merkle proofs immediately (Fast Path Phase 1)
-	if err := rcv.broadcaster.BroadcastAnchor(payload.BlockID, colIdx, pieceCommits, merkleProofs); err != nil {
-		log.Printf("[Height: %d] Failed to broadcast anchor for Column %d: %v", height, colIdx, err)
-		rcv.respondWithError(stream, "Anchor broadcast failed: "+err.Error())
-		return
-	}
-
-	// 4. Store in Local Cache
+	// 3. Store in Local Cache
 	rcv.cache.Store(payload.BlockID, colIdx, columnData, pieceCommits)
 
-	// Respond with success
+	// Respond with success to Publisher immediately
 	json.NewEncoder(stream).Encode(struct {
 		Success bool `json:"success"`
 	}{Success: true})
 
-	// 5. Phase 2 (Async Heavy Task)
+	// 4. Phase 2 (Async Heavy Task & Pipelined Pre-computation)
 	go func() {
 		log.Printf("[Height: %d] [P2P] Starting Phase 2 Async: computing proofs and seeding RLNC pieces for Column %d", height, colIdx)
 
@@ -269,13 +268,17 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 		rcv.cache.SetProofs(payload.BlockID, proofs)
 		log.Printf("[Height: %d] Successfully generated opening proofs async for Column %d", height, colIdx)
 
-		// Encode RLNC pieces and broadcast 2 seeds to EVERY active Store Node in the column network
+		// Encode RLNC pieces and pre-compute all seeds in memory buffer for active Store Nodes
 		n := len(columnData)
-		// We generate 2 * rcv.k seeds per row (k for the primary store node, and k for 1 backup store node)
 		totalSeeds := 2 * rcv.k
 
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, 16) // Limit concurrent broadcasts to 16 to avoid overloading libp2p
+		type precomputedPiece struct {
+			row      int
+			pieceIdx int
+			piece    *cda.ReceivedPiece
+		}
+		var precomputedPieces []precomputedPiece
+
 		for row := 0; row < n; row++ {
 			codedPieces, err := rcv.encoder.EncodeRowNSeeds(row, colIdx, columnData, proofs[row], totalSeeds)
 			if err != nil {
@@ -284,20 +287,84 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 			}
 
 			for pieceIdx, piece := range codedPieces {
-				wg.Add(1)
-				sem <- struct{}{}
-				go func(r, pIdx int, p *cda.ReceivedPiece) {
-					defer wg.Done()
-					defer func() { <-sem }()
-					if err := rcv.broadcaster.BroadcastPiece(payload.BlockID, r, colIdx, pIdx, p, pieceCommits); err != nil {
-						log.Printf("[Height: %d] Failed to broadcast piece %d to Store Node for cell [%d, %d]: %v", height, pIdx, r, colIdx, err)
-					}
-				}(row, pieceIdx, piece)
+				precomputedPieces = append(precomputedPieces, precomputedPiece{
+					row:      row,
+					pieceIdx: pieceIdx,
+					piece:    piece,
+				})
 			}
 		}
+
+		log.Printf("[Height: %d] [Bootstrap Pre-computation] Successfully pre-computed %d opening proofs and %d RLNC seeds in buffer for Column %d, Block %s",
+			height, n, len(precomputedPieces), colIdx, payload.BlockID)
+
+		// Sequential Completion Gate: Wait until store nodes complete block-(height-1) before dispatching
+		if height > 1 {
+			rcv.pipelineMu.Lock()
+			if rcv.latestCompletedHeight < height-1 {
+				log.Printf("[Height: %d] [Bootstrap Pipeline] Pre-computed buffer ready! Waiting for store nodes to complete block-%d before dispatching (current completed: %d)...",
+					height, height-1, rcv.latestCompletedHeight)
+				deadline := time.Now().Add(120 * time.Second)
+				for rcv.latestCompletedHeight < height-1 && time.Now().Before(deadline) {
+					rcv.pipelineMu.Unlock()
+					time.Sleep(100 * time.Millisecond)
+					rcv.pipelineMu.Lock()
+				}
+				if rcv.latestCompletedHeight < height-1 {
+					log.Printf("[Height: %d] [Bootstrap Pipeline] ERROR: Safety timeout reached without block-%d completion (completed: %d). Aborting dispatch of block-%d seeds to maintain multi-column synchronization!",
+						height, height-1, rcv.latestCompletedHeight, height)
+					rcv.pipelineMu.Unlock()
+					return
+				} else {
+					log.Printf("[Height: %d] [Bootstrap Pipeline] Store nodes finished block-%d! Instantly dispatching pre-computed seeds for block-%d...",
+						height, height-1, height)
+				}
+			}
+			rcv.pipelineMu.Unlock()
+		}
+
+		// Dispatch Anchor to GossipSub now that previous block is complete and this block is active
+		if err := rcv.broadcaster.BroadcastAnchor(payload.BlockID, colIdx, pieceCommits, merkleProofs); err != nil {
+			log.Printf("[Height: %d] Failed to broadcast anchor for Column %d: %v", height, colIdx, err)
+		}
+
+		// Paced & Bounded Dispatch: Prevent network flooding across Store Node streams
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 16) // Limit concurrent broadcasts to 16 to avoid overloading libp2p
+		currentRow := -1
+		for _, item := range precomputedPieces {
+			if item.row != currentRow {
+				if currentRow >= 0 {
+					time.Sleep(2 * time.Millisecond) // micro-pause between rows
+				}
+				currentRow = item.row
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(it precomputedPiece) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if err := rcv.broadcaster.BroadcastPiece(payload.BlockID, it.row, colIdx, it.pieceIdx, it.piece, pieceCommits); err != nil {
+					log.Printf("[Height: %d] Failed to broadcast piece %d to Store Node for cell [%d, %d]: %v", height, it.pieceIdx, it.row, colIdx, err)
+				}
+			}(item)
+		}
 		wg.Wait()
-		log.Printf("[Height: %d] Async Phase 2 finished successfully: seeded %d pieces total (%d per store node) for Column %d", height, totalSeeds, rcv.k, colIdx)
+		log.Printf("[Height: %d] Async Phase 2 finished successfully: seeded %d pieces total (%d per store node) for Column %d", height, len(precomputedPieces), rcv.k, colIdx)
 	}()
+}
+
+// OnBlockCompleted records completion of a block height to trigger immediate dispatch of pre-computed seeds for the next block.
+func (rcv *Receiver) OnBlockCompleted(height int) {
+	rcv.pipelineMu.Lock()
+	if height > rcv.latestCompletedHeight {
+		rcv.latestCompletedHeight = height
+		log.Printf("[Bootstrap Pipeline] Recorded completed height %d (ready to dispatch seeds for height %d)", height, height+1)
+		if rcv.pipelineCond != nil {
+			rcv.pipelineCond.Broadcast()
+		}
+	}
+	rcv.pipelineMu.Unlock()
 }
 
 func (rcv *Receiver) handleRouting(stream network.Stream) {

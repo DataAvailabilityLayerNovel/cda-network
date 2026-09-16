@@ -133,10 +133,12 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/store/status/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		completed := receiver.IsComplete(r.URL.Path[len("/store/status/"):])
+		bID := r.URL.Path[len("/store/status/"):]
+		completed, details := receiver.DiagnoseCompletion(bID)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"block_id":  r.URL.Path[len("/store/status/"):],
+			"block_id":  bID,
 			"completed": completed,
+			"details":   details,
 		})
 	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
