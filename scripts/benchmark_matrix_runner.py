@@ -241,6 +241,7 @@ def execute_benchmark_scenario(scenario, blocks=3, timeout_per_block=120, dry_ru
         time.sleep(2)
 
     # Step 5: Execute benchmark timing
+    cell_size = scenario.get("cell_size", 64)
     timing_script = "scripts/test_pipeline_block_timing.py" if mode == "pipeline" else "scripts/test_sequential_block_timing.py"
     cmd = [
         "python3", timing_script,
@@ -248,7 +249,8 @@ def execute_benchmark_scenario(scenario, blocks=3, timeout_per_block=120, dry_ru
         "--bootstrap", "http://localhost:9200",
         "--k", str(k),
         "--count", str(blocks),
-        "--timeout", str(timeout_per_block)
+        "--timeout", str(timeout_per_block),
+        "--cell-size", str(cell_size)
     ]
 
     log(f"Executing timing probe: {' '.join(cmd)}")
@@ -489,6 +491,24 @@ def build_scenario_matrix(matrix_type="baseline", custom_k="8,16"):
                 "stores_per_col": 8,
                 "lights": 1
             })
+
+        # Phase 7: Approach B - Cell 512B with K_piece=16 (Fragment=32B matching Fr Scalar)
+        scenarios.append({
+            "id": "opt_k64_512b_p16",
+            "k": 64,
+            "k_piece": 16,
+            "cell_size": 512,
+            "mode": "pipeline",
+            "store_gossip_batch_size": 96,
+            "store_gossip_batch_workers": 2,
+            "bootstrap_proof_gen_sem": 16,
+            "publisher_max_in_flight": 2,
+            "cpus": "8",
+            "num_cols": 16,
+            "active_cols": 1,
+            "stores_per_col": 8,
+            "lights": 1
+        })
 
     return scenarios
 

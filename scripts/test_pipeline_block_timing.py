@@ -23,14 +23,16 @@ import urllib.request
 import urllib.error
 
 
-def generate_ods_data(k):
-    """Generates k*k dummy cell field elements as 128-char hex strings."""
-    return ['%0128x' % random.randint(1, 1_000_000) for _ in range(k * k)]
+def generate_ods_data(k, cell_size=64):
+    """Generates k*k dummy cell field elements as hex strings (cell_size*2 hex chars)."""
+    hex_len = cell_size * 2
+    fmt = f'%0{hex_len}x'
+    return [fmt % random.randint(1, 1_000_000) for _ in range(k * k)]
 
 
-def publish_block(publish_url, block_id, height, k, timeout=60):
+def publish_block(publish_url, block_id, height, k, timeout=60, cell_size=64):
     """Publish a single block to the Publisher Node. Returns (success, http_latency_seconds, error_msg)."""
-    data = generate_ods_data(k)
+    data = generate_ods_data(k, cell_size=cell_size)
     payload = {
         "block_id": block_id,
         "height": height,
@@ -118,7 +120,7 @@ def wait_for_block(latest_url, sse_url, block_id, timeout):
     return wait_for_block_ready_poll(latest_url, block_id, timeout=max(1.0, timeout - lat))
 
 
-def run_pipeline_benchmark(publisher_url, bootstrap_url, k, count, timeout):
+def run_pipeline_benchmark(publisher_url, bootstrap_url, k, count, timeout, cell_size=64):
     publish_api = f"{publisher_url.rstrip('/')}/publish"
     sse_api     = f"{bootstrap_url.rstrip('/')}/events/block-ready"
     latest_api  = f"{bootstrap_url.rstrip('/')}/block-ready/latest"
@@ -129,6 +131,7 @@ def run_pipeline_benchmark(publisher_url, bootstrap_url, k, count, timeout):
     print(f"[*] Publisher API : {publish_api}")
     print(f"[*] Bootstrap API : {bootstrap_url}")
     print(f"[*] Matrix K      : {k} (ODS cells: {k*k})")
+    print(f"[*] Cell Size     : {cell_size} bytes (ODS Block: {(k*k*cell_size)/(1024*1024):.2f} MB)")
     print(f"[*] Target Blocks : {count}")
     print(f"[*] Max Timeout   : {timeout}s per block")
     print(f"[*] Mode          : Pipelined 1-Block-Ahead Pre-Computation")
@@ -145,7 +148,7 @@ def run_pipeline_benchmark(publisher_url, bootstrap_url, k, count, timeout):
     # Step 1: Push initial block-1
     block1_id = "block-1"
     print(f"[{time.strftime('%H:%M:%S')}] Pushing initial {block1_id} (height 1)...", end="", flush=True)
-    ok1, pub_lat1, err1 = publish_block(publish_api, block1_id, 1, k, timeout=timeout)
+    ok1, pub_lat1, err1 = publish_block(publish_api, block1_id, 1, k, timeout=timeout, cell_size=cell_size)
     if not ok1:
         print(f" ❌ FAILED to publish block-1: {err1}")
         return
@@ -155,7 +158,7 @@ def run_pipeline_benchmark(publisher_url, bootstrap_url, k, count, timeout):
     if count >= 2:
         block2_id = "block-2"
         print(f"[{time.strftime('%H:%M:%S')}] 🚀 [PIPELINE] Proactively pushing ahead {block2_id} (height 2) while block-1 is running...", end="", flush=True)
-        ahead_future = executor.submit(publish_block, publish_api, block2_id, 2, k, timeout)
+        ahead_future = executor.submit(publish_block, publish_api, block2_id, 2, k, timeout, cell_size)
         next_ahead_height = 3
 
     # Main Loop: Process blocks 1 to count
@@ -204,7 +207,7 @@ def run_pipeline_benchmark(publisher_url, bootstrap_url, k, count, timeout):
         if next_ahead_height <= count:
             ahead_block_id = f"block-{next_ahead_height}"
             print(f"[{time.strftime('%H:%M:%S')}] 🚀 [PIPELINE] Proactively pushing ahead {ahead_block_id} (height {next_ahead_height}) into buffer...", end="", flush=True)
-            ahead_future = executor.submit(publish_block, publish_api, ahead_block_id, next_ahead_height, k, timeout)
+            ahead_future = executor.submit(publish_block, publish_api, ahead_block_id, next_ahead_height, k, timeout, cell_size)
             next_ahead_height += 1
 
     total_benchmark_time = time.time() - benchmark_start
@@ -253,6 +256,7 @@ if __name__ == "__main__":
     parser.add_argument("--k", type=int, default=8, help="ODS matrix dimension K (default: 8)")
     parser.add_argument("--count", type=int, default=3, help="Number of blocks to test (default: 3)")
     parser.add_argument("--timeout", type=float, default=120.0, help="Timeout per block in seconds (default: 120s)")
+    parser.add_argument("--cell-size", type=int, default=64, help="Cell size in bytes (default: 64)")
     args = parser.parse_args()
 
-    run_pipeline_benchmark(args.publisher, args.bootstrap, args.k, args.count, args.timeout)
+    run_pipeline_benchmark(args.publisher, args.bootstrap, args.k, args.count, args.timeout, cell_size=args.cell_size)

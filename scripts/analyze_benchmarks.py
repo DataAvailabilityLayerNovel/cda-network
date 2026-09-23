@@ -101,8 +101,9 @@ def generate_report(results, title="CDA Network Benchmark Analysis"):
     for r in results:
         sc = r.get("scenario", {})
         s_id = sc.get("id", "")
-        if "p2" in s_id or "p4" in s_id or "p8" in s_id:
+        if any(x in s_id for x in ["p2", "p4", "p8", "p16", "512b"]):
             p = sc.get("k_piece", 4)
+            cell_size = sc.get("cell_size", 64)
             avg_t = r.get("avg_block_time", 0.0)
             bpm = r.get("blocks_per_minute", 0.0)
             if avg_t > 0:
@@ -112,9 +113,10 @@ def generate_report(results, title="CDA Network Benchmark Analysis"):
                 non_custody = 768
                 total_pieces = custody_pieces + backup_pieces + non_custody
                 
-                # Piece payload: (64/p) + 2p + 48 bytes
-                piece_bytes = int((64 / p) + 2 * p + 48)
+                # Piece payload: (cell_size/p) + 2p + 48 bytes
+                piece_bytes = int((cell_size / p) + 2 * p + 48)
                 crypto_kb_per_block = round((total_pieces * piece_bytes) / 1024.0, 1)
+                block_mb = (64 * 64 * cell_size) / (1024 * 1024)
                 
                 # Actual store metrics if captured
                 store_m = r.get("store_metrics", {})
@@ -125,22 +127,22 @@ def generate_report(results, title="CDA Network Benchmark Analysis"):
                     disk_kb_str = f"~{int(crypto_kb_per_block * 2.8)} KB (est)"
 
                 storage_rows.append([
-                    f"KPiece={p} ({s_id})",
+                    f"{s_id} (p={p}, {cell_size}B/cell)",
+                    f"{block_mb:.2f} MB",
                     f"{avg_t:.3f}s",
                     f"{bpm:.2f}",
                     str(total_pieces),
                     f"{crypto_kb_per_block} KB",
                     disk_kb_str,
-                    f"Cần {p} mảnh",
-                    f"1:{p} (x{p} redundancy)"
+                    f"Cần {p} mảnh"
                 ])
 
     if storage_rows:
         lines.append("## 3. Phân Tích Đánh Đổi: Dung Lượng Lưu Trữ Mỗi Node vs. Hiệu Năng & Độ Phục Hồi")
         lines.append("")
         st_headers = [
-            "K_Piece Scenario", "Avg Time (s)", "Throughput (BPM)", "Mảnh Lưu/Node/Block", 
-            "Crypto Data/Block", "Dung Lượng Đĩa/Block", "Phục Hồi Cell", "Mức Độc Lập Tuyến Tính"
+            "Kịch Bản (KPiece & CellSize)", "Dung Lượng ODS Block", "Avg Time (s)", "Throughput (BPM)", 
+            "Mảnh Lưu/Node/Block", "Crypto Data/Block", "Dung Lượng Đĩa/Block", "Độ Phục Hồi Cell"
         ]
         lines.append(format_table(st_headers, storage_rows))
         lines.append("")
