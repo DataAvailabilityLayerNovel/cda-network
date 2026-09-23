@@ -2,6 +2,9 @@ package engine
 
 import (
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 
 	rsmt2d "github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d"
@@ -53,10 +56,23 @@ func (pg *ProofGenerator) GenerateColumnProofs(colIdx int, columnData [][]byte) 
 	var computeErr error
 	var wg sync.WaitGroup
 
+	var sem chan struct{}
+	if envLimit := strings.TrimSpace(os.Getenv("BOOTSTRAP_PROOF_GEN_SEM")); envLimit != "" {
+		if limit, err := strconv.Atoi(envLimit); err == nil && limit > 0 {
+			sem = make(chan struct{}, limit)
+		}
+	}
+
 	for r := 0; r < n; r++ {
+		if sem != nil {
+			sem <- struct{}{}
+		}
 		wg.Add(1)
 		go func(rowIdx int) {
 			defer wg.Done()
+			if sem != nil {
+				defer func() { <-sem }()
+			}
 			cellProofs, err := cda.ComputeOpenProofCell(rlncCodec, eds, pg.kzg, rowIdx, colIdx)
 			if err != nil {
 				errOnce.Do(func() {

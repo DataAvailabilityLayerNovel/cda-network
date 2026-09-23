@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,15 @@ import (
 
 // mathRandIntn wraps rand.Intn for use in shuffle (avoids import collision)
 func mathRandIntn(n int) int { return rand.Intn(n) }
+
+func getEnvInt(key string, defaultVal int) int {
+	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultVal
+}
 
 type Receiver struct {
 	host          host.Host
@@ -164,6 +174,9 @@ func NewReceiver(
 	if nWorkers < 4 {
 		nWorkers = 4
 	}
+	if envWorkers := getEnvInt("STORE_SHARDED_WORKERS", 0); envWorkers > 0 {
+		nWorkers = envWorkers
+	}
 	chans := make([]chan func(), nWorkers)
 	for i := 0; i < nWorkers; i++ {
 		chans[i] = make(chan func(), 2000)
@@ -203,7 +216,7 @@ func NewReceiver(
 		gossipQueue:         make(chan p2pcommon.SeedCellRequest, 4096),
 		gossipBatchStop:     make(chan struct{}),
 		completionCheckChan: make(chan string, 1024),
-		disseminationSem:    make(chan struct{}, 16),
+		disseminationSem:    make(chan struct{}, getEnvInt("STORE_DISSEMINATION_SEM", 16)),
 	}
 }
 
@@ -239,8 +252,8 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	// Start debounced completion check worker loop
 	go rcv.completionCheckWorkerLoop(ctx)
 
-	// Start batch workers for GossipSub messages (2 workers optimal for multicore MSM)
-	rcv.startGossipBatchWorkers(ctx, 2)
+	// Start batch workers for GossipSub messages (configurable via STORE_GOSSIP_BATCH_WORKERS, default 2)
+	rcv.startGossipBatchWorkers(ctx, getEnvInt("STORE_GOSSIP_BATCH_WORKERS", 2))
 
 	StartMetricsTicker(ctx)
 	LinearIndependentPiecesCount.Set(float64(rcv.totalStoredPieces))
@@ -410,9 +423,10 @@ func (rcv *Receiver) startGossipBatchWorkers(ctx context.Context, numWorkers int
 }
 
 func (rcv *Receiver) gossipBatchWorkerLoop(ctx context.Context) {
-	batchSize := 48
+	batchSize := getEnvInt("STORE_GOSSIP_BATCH_SIZE", 48)
 	batch := make([]p2pcommon.SeedCellRequest, 0, batchSize)
-	ticker := time.NewTicker(10 * time.Millisecond)
+	tickerMs := getEnvInt("STORE_GOSSIP_BATCH_TICKER_MS", 10)
+	ticker := time.NewTicker(time.Duration(tickerMs) * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -1161,7 +1175,8 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string) {
 
 	pulledAny := false
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 8)
+	fallbackLimit := getEnvInt("STORE_FALLBACK_PULL_SEM", 8)
+	sem := make(chan struct{}, fallbackLimit)
 
 	for c := startCol; c < endCol; c++ {
 		for r := 0; r < n; r++ {

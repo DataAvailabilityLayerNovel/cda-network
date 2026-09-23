@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +26,15 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
+
+func getEnvInt(key string, defaultVal int) int {
+	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultVal
+}
 
 type Receiver struct {
 	host          host.Host
@@ -147,7 +158,7 @@ func (rcv *Receiver) Start(ctx context.Context) {
 				rcv.peersMu.Lock()
 				now := time.Now()
 				for pid, lastSeen := range rcv.lastSeenPeer {
-					if now.Sub(lastSeen) > 15*time.Second {
+					if now.Sub(lastSeen) > 90*time.Second {
 						log.Printf("[P2P Registry] Removing stale peer: %s", pid)
 						if rcv.db != nil {
 							_ = rcv.db.Update(func(txn *badger.Txn) error {
@@ -361,7 +372,9 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 
 		// Dispatch batches concurrently to each store node
 		var wg sync.WaitGroup
-		sem := make(chan struct{}, 64)
+		seedingLimit := getEnvInt("BOOTSTRAP_SEEDING_SEM", 64)
+		sem := make(chan struct{}, seedingLimit)
+		chunkSize := getEnvInt("BOOTSTRAP_BATCH_CHUNK_SIZE", 64)
 		for peerID, seeds := range nodeBatches {
 			targetPeer := nodePeers[peerID]
 			wg.Add(1)
@@ -370,8 +383,7 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				// Chunks of up to 64 seeds per batch stream
-				chunkSize := 64
+				// Chunks of seeds per batch stream
 				for i := 0; i < len(sList); i += chunkSize {
 					end := i + chunkSize
 					if end > len(sList) {

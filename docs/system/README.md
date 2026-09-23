@@ -36,3 +36,5 @@ Tài liệu về giao thức truyền thông P2P, định tuyến LibP2P và cơ
   Tài liệu mô tả chi tiết kiến trúc hiện thực thực tế của toàn bộ codebase: vị trí file mã nguồn, pipeline xử lý dữ liệu, giao thức stream P2P, cơ chế quản lý custody/pruning.
 - **[Hướng Dẫn CLI & Lệnh Curl REST API (cli_and_curl_guide.md)](file:///home/ubuntu/cda-network/docs/system/technical_docs/cli_and_curl_guide.md)**:
   Tài liệu mô tả chi tiết các lệnh `curl` HTTP REST API (Publisher, Light, Bootstrap SSE) và bộ script tự động hóa CLI (`publish.sh`, `das.sh`, `bot_das.sh`, `block_publisher_bot.py`).
+- **[Đặc Tả Thiết Lập Concurrency & Tối Ưu Phần Cứng (concurrency_and_hardware_tuning.md)](file:///home/ubuntu/cda-network/docs/system/technical_docs/concurrency_and_hardware_tuning.md)**:
+  Tài liệu tổng hợp toàn bộ các thiết lập concurrency (goroutines, semaphores, worker pools, batch size, grace period) trên từng node và hướng dẫn tinh chỉnh cấu hình theo quy mô ma trận $K$.

@@ -505,10 +505,11 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 4. Distribute each column via P2P sender in parallel
+	// 4. Distribute each column via P2P sender in parallel (bounded concurrency to avoid TLS stream resets)
 	n := int(eds.Width())
 	k := len(pubData.PieceComm) / n
 	var wg sync.WaitGroup
+	colSem := make(chan struct{}, 4)
 	for c := 0; c < n; c++ {
 		wg.Add(1)
 		go func(colIdx int) {
@@ -516,6 +517,9 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 			if !s.isNetColActive(colIdx) {
 				return
 			}
+			colSem <- struct{}{}
+			defer func() { <-colSem }()
+
 			colData := eds.Col(uint(colIdx))
 			pieceCommits := pubData.PieceComm[colIdx*k : colIdx*k+k]
 
@@ -526,8 +530,17 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 
 			colProofs := proofs[colIdx*k : colIdx*k+k]
 
-			if err := s.sender.SendColumnChunk(header.BlockID, colIdx, colData, pieceCommitsBytes, colProofs); err != nil {
-				log.Printf("[Height: %d] [Publisher] Warning: Failed to distribute column %d to bootstrap (likely offline): %v", height, colIdx, err)
+			var sendErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				sendErr = s.sender.SendColumnChunk(header.BlockID, colIdx, colData, pieceCommitsBytes, colProofs)
+				if sendErr == nil {
+					break
+				}
+				log.Printf("[Height: %d] [Publisher] Retry %d/3 sending column %d: %v", height, attempt, colIdx, sendErr)
+				time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			}
+			if sendErr != nil {
+				log.Printf("[Height: %d] [Publisher] Warning: Failed to distribute column %d to bootstrap after 3 attempts: %v", height, colIdx, sendErr)
 			}
 		}(c)
 	}

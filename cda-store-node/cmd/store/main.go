@@ -264,7 +264,7 @@ func main() {
 	}
 
 	registerAndSyncPeers := func() {
-		connCtx, connCancel := context.WithTimeout(ctx, 3*time.Second)
+		connCtx, connCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer connCancel()
 
 		if err := p2pHost.Connect(connCtx, *bootInfo); err != nil {

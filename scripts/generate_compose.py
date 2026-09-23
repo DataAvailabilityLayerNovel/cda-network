@@ -3,7 +3,11 @@ import argparse
 import json
 import os
 
-def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=False, active_cols=None, prune_enable=False, prune_ttl=None):
+def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=False, active_cols=None, prune_enable=False, prune_ttl=None,
+                     store_gossip_batch_size=None, store_gossip_batch_workers=None, store_gossip_batch_ticker_ms=None,
+                     store_dissemination_sem=None, store_fallback_pull_sem=None, store_sharded_workers=None,
+                     bootstrap_proof_gen_sem=None, bootstrap_seeding_sem=None, bootstrap_batch_chunk_size=None,
+                     publisher_max_in_flight=None, gomaxprocs=None, cpus=None):
     if active_cols is None:
         active_cols = cols
     crash_arg = ["-crash-on-fail=true"] if crash_on_fail else []
@@ -17,6 +21,13 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
     }
 
     # Publisher
+    pub_env = [
+        'PUBLISHER_QUEUE_TIMEOUT=300s',
+        f'PUBLISHER_MAX_IN_FLIGHT={publisher_max_in_flight if publisher_max_in_flight is not None else 2}'
+    ]
+    if gomaxprocs is not None:
+        pub_env.append(f'GOMAXPROCS={gomaxprocs}')
+
     compose['services']['publisher'] = {
         'build': {
             'context': '.',
@@ -26,10 +37,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
         'ports': ["8080:8080", "18080:18080"],
         'volumes': ["./publisher_config_docker.json:/app/publisher_config.json"],
         'networks': ['cda-net'],
-        'environment': [
-            'PUBLISHER_QUEUE_TIMEOUT=300s',
-            'PUBLISHER_MAX_IN_FLIGHT=2'
-        ]
+        'environment': pub_env
     }
 
     bootstrap_addresses = []
@@ -47,7 +55,17 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
         bootstrap_p2p_port = bootstrap_port + 10000
         bootstrap_name = f'bootstrap-{c}'
 
-        compose['services'][bootstrap_name] = {
+        boot_env = []
+        if bootstrap_proof_gen_sem is not None:
+            boot_env.append(f'BOOTSTRAP_PROOF_GEN_SEM={bootstrap_proof_gen_sem}')
+        if bootstrap_seeding_sem is not None:
+            boot_env.append(f'BOOTSTRAP_SEEDING_SEM={bootstrap_seeding_sem}')
+        if bootstrap_batch_chunk_size is not None:
+            boot_env.append(f'BOOTSTRAP_BATCH_CHUNK_SIZE={bootstrap_batch_chunk_size}')
+        if gomaxprocs is not None:
+            boot_env.append(f'GOMAXPROCS={gomaxprocs}')
+
+        boot_svc = {
             'build': {
                 'context': '.',
                 'dockerfile': 'Dockerfile'
@@ -64,6 +82,9 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
             'networks': ['cda-net'],
             'depends_on': ['publisher']
         }
+        if boot_env:
+            boot_svc['environment'] = boot_env
+        compose['services'][bootstrap_name] = boot_svc
 
         bootstrap_addresses.append(f"{c}:/dns4/{bootstrap_name}/tcp/{bootstrap_p2p_port}")
 
@@ -72,7 +93,23 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
             store_name = f'store-{c}-{s}'
             store_ports.append(current_store_host_port)
 
-            compose['services'][store_name] = {
+            store_env = []
+            if store_gossip_batch_size is not None:
+                store_env.append(f'STORE_GOSSIP_BATCH_SIZE={store_gossip_batch_size}')
+            if store_gossip_batch_workers is not None:
+                store_env.append(f'STORE_GOSSIP_BATCH_WORKERS={store_gossip_batch_workers}')
+            if store_gossip_batch_ticker_ms is not None:
+                store_env.append(f'STORE_GOSSIP_BATCH_TICKER_MS={store_gossip_batch_ticker_ms}')
+            if store_dissemination_sem is not None:
+                store_env.append(f'STORE_DISSEMINATION_SEM={store_dissemination_sem}')
+            if store_fallback_pull_sem is not None:
+                store_env.append(f'STORE_FALLBACK_PULL_SEM={store_fallback_pull_sem}')
+            if store_sharded_workers is not None:
+                store_env.append(f'STORE_SHARDED_WORKERS={store_sharded_workers}')
+            if gomaxprocs is not None:
+                store_env.append(f'GOMAXPROCS={gomaxprocs}')
+
+            store_svc = {
                 'build': {
                     'context': '.',
                     'dockerfile': 'Dockerfile'
@@ -95,6 +132,9 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                 'networks': ['cda-net'],
                 'depends_on': [bootstrap_name]
             }
+            if store_env:
+                store_svc['environment'] = store_env
+            compose['services'][store_name] = store_svc
             current_store_host_port += 1
 
     # Light Nodes
@@ -103,7 +143,11 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
         light_port = 9400 + l
         light_name = f'light-{l}'
 
-        compose['services'][light_name] = {
+        light_env = []
+        if gomaxprocs is not None:
+            light_env.append(f'GOMAXPROCS={gomaxprocs}')
+
+        light_svc = {
             'build': {
                 'context': '.',
                 'dockerfile': 'Dockerfile'
@@ -123,6 +167,20 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
             'networks': ['cda-net'],
             'depends_on': ['publisher']
         }
+        if light_env:
+            light_svc['environment'] = light_env
+        compose['services'][light_name] = light_svc
+
+    # Apply CPU quota limits if specified
+    if cpus is not None:
+        for svc_name in compose['services']:
+            compose['services'][svc_name]['deploy'] = {
+                'resources': {
+                    'limits': {
+                        'cpus': str(cpus)
+                    }
+                }
+            }
 
     # Prometheus
     compose['services']['prometheus'] = {
@@ -529,12 +587,46 @@ if __name__ == '__main__':
     parser.add_argument('--crash-on-fail', action='store_true', help='Enable crash on fail for nodes')
     parser.add_argument('--prune-enable', action='store_true', help='Enable pruning for store and bootstrap nodes')
     parser.add_argument('--prune-ttl', type=str, default=None, help='TTL duration before pruning (e.g. 5m)')
+    parser.add_argument('--store-gossip-batch-size', type=int, default=None, help='Store GossipSub batch verification size')
+    parser.add_argument('--store-gossip-batch-workers', type=int, default=None, help='Store GossipSub batch worker count')
+    parser.add_argument('--store-gossip-batch-ticker-ms', type=int, default=None, help='Store GossipSub batch flush interval in ms')
+    parser.add_argument('--store-dissemination-sem', type=int, default=None, help='Store dissemination semaphore limit')
+    parser.add_argument('--store-fallback-pull-sem', type=int, default=None, help='Store fallback pull semaphore limit')
+    parser.add_argument('--store-sharded-workers', type=int, default=None, help='Store sharded cell worker pool size')
+    parser.add_argument('--bootstrap-proof-gen-sem', type=int, default=None, help='Bootstrap KZG opening proof generator concurrency semaphore')
+    parser.add_argument('--bootstrap-seeding-sem', type=int, default=None, help='Bootstrap P2P seeding stream semaphore')
+    parser.add_argument('--bootstrap-batch-chunk-size', type=int, default=None, help='Bootstrap P2P batch chunk size')
+    parser.add_argument('--publisher-max-in-flight', type=int, default=None, help='Publisher max in-flight blocks')
+    parser.add_argument('--gomaxprocs', type=int, default=None, help='GOMAXPROCS for Go runtime')
+    parser.add_argument('--cpus', type=str, default=None, help='Docker container CPU limit (e.g. 4, 8, 12)')
     parser.add_argument('--out', type=str, default='docker-compose.json', help='Output file')
     
     args = parser.parse_args()
 
     active_cols = args.active_cols if args.active_cols is not None else args.cols
-    compose_dict, store_ports = generate_compose(args.k, args.k_piece, args.cols, args.stores_per_col, args.lights, args.crash_on_fail, active_cols, args.prune_enable, args.prune_ttl)
+    compose_dict, store_ports = generate_compose(
+        k=args.k,
+        k_piece=args.k_piece,
+        cols=args.cols,
+        stores_per_col=args.stores_per_col,
+        lights=args.lights,
+        crash_on_fail=args.crash_on_fail,
+        active_cols=active_cols,
+        prune_enable=args.prune_enable,
+        prune_ttl=args.prune_ttl,
+        store_gossip_batch_size=args.store_gossip_batch_size,
+        store_gossip_batch_workers=args.store_gossip_batch_workers,
+        store_gossip_batch_ticker_ms=args.store_gossip_batch_ticker_ms,
+        store_dissemination_sem=args.store_dissemination_sem,
+        store_fallback_pull_sem=args.store_fallback_pull_sem,
+        store_sharded_workers=args.store_sharded_workers,
+        bootstrap_proof_gen_sem=args.bootstrap_proof_gen_sem,
+        bootstrap_seeding_sem=args.bootstrap_seeding_sem,
+        bootstrap_batch_chunk_size=args.bootstrap_batch_chunk_size,
+        publisher_max_in_flight=args.publisher_max_in_flight,
+        gomaxprocs=args.gomaxprocs,
+        cpus=args.cpus
+    )
     
     n = 2 * args.k
     cols_per_net_col = n // args.cols if args.cols > 0 else 1
