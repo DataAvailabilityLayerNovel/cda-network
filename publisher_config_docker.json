@@ -1,7 +1,7 @@
 {
   "api_port": 8080,
-  "k": 128,
-  "k_piece": 4,
+  "k": 64,
+  "k_piece": 8,
   "active_cols": 1,
   "num_cols": 16,
   "bootstrap_peers": {

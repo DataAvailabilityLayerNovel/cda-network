@@ -118,6 +118,12 @@ func ProtoNodeBatchSeed(peerID string) string {
 	return fmt.Sprintf("/cda/store/%s/seed-batch/1.0.0", peerID)
 }
 
+// ProtoNodePersistentSeed returns the per-node libp2p stream protocol for a persistent seeding stream.
+// Bootstrap maintains a long-lived stream to this protocol for delivering batches of RLNC pieces.
+func ProtoNodePersistentSeed(peerID string) string {
+	return fmt.Sprintf("/cda/store/%s/seed-stream/1.0.0", peerID)
+}
+
 // GossipSub Topics
 const (
 	TopicHeader     = "/cda/1.0.0/header"

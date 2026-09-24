@@ -405,9 +405,9 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 
 		// Dispatch batches concurrently to each store node
 		var wg sync.WaitGroup
-		seedingLimit := getEnvInt("BOOTSTRAP_SEEDING_SEM", 64)
+		seedingLimit := getEnvInt("BOOTSTRAP_SEEDING_SEM", 128)
 		sem := make(chan struct{}, seedingLimit)
-		chunkSize := getEnvInt("BOOTSTRAP_BATCH_CHUNK_SIZE", 64)
+		chunkSize := getEnvInt("BOOTSTRAP_BATCH_CHUNK_SIZE", 256)
 		for peerID, seeds := range nodeBatches {
 			targetPeer := nodePeers[peerID]
 			wg.Add(1)
@@ -491,6 +491,7 @@ func (rcv *Receiver) handleRouting(stream network.Stream) {
 			delete(rcv.activePeers, pid)
 			delete(rcv.lastSeenPeer, pid)
 			rcv.peersMu.Unlock()
+			rcv.broadcaster.ClosePersistentStream(pid)
 			log.Printf("[P2P Registry] Peer gracefully left: %s", pid)
 			return
 		}

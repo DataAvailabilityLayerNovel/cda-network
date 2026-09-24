@@ -532,7 +532,7 @@ Mặc dù hệ thống đã vận hành ổn định và vượt qua các bài k
 
 1. **Chuyển Đổi Sang Mô Hình PubSub Phân Tầng (Hierarchical Subnet Mesh)**:
    - Thay thế việc mỗi Store Node tự mở 1 topic riêng bằng mô hình **Cell-Group Subnets** hoặc **Row-Group Gossip Topics**.
-   - Gom các dòng có cùng tính chất thành 1 topic chung, giảm số lượng Mesh Overlays từ $O(S^2)$ xuống $O(S)$, giải phóng hoàn toàn gánh nặng Libp2p GossipSub Heartbeat.
+   - Gom các dòng có cùng tính chất thành 1 topic chung, giảm số lượng Mesh Overlays từ $O(S^2)$ xuống $O(S)$, giải phóng hoàn toàn gánh nặng Libp2p GossipSub Heartbeat. ( QUAN TRỌNG )
 2. **Giao Thức Truyền Tải Đa Ghép Kênh QUIC (Multiplexed QUIC Transport)**:
    - Chuyển đổi tầng transport của libp2p từ TCP sang **QUIC** (thông qua `go-libp2p/p2p/transport/quic`).
    - Tận dụng cơ chế 0-RTT handshake và loại bỏ hoàn toàn hiện tượng nghẽn đầu dòng (Head-of-Line Blocking) khi mở hàng loạt stream unicast giữa Bootstrap và Store Nodes.

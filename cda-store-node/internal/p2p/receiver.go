@@ -297,6 +297,10 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	rcv.host.SetStreamHandler(protocol.ID(nodeBatchProto), rcv.handleBatchSeedStream)
 	log.Printf("[StoreNode] Registered per-node batch seed handler on protocol %s", nodeBatchProto)
 
+	nodePersistentProto := p2pcommon.ProtoNodePersistentSeed(rcv.selfPeerID)
+	rcv.host.SetStreamHandler(protocol.ID(nodePersistentProto), rcv.handlePersistentSeedStream)
+	log.Printf("[StoreNode] Registered per-node persistent seed handler on protocol %s", nodePersistentProto)
+
 	// Keep generic fetch handlers (used by light nodes and active-pull)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreFetch, rcv.handleFetchStream)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreGetPieces, rcv.handleFetchStream)
@@ -589,6 +593,35 @@ func (rcv *Receiver) handleBatchSeedStream(stream network.Stream) {
 	}{Success: true})
 }
 
+func (rcv *Receiver) handlePersistentSeedStream(stream network.Stream) {
+	defer stream.Close()
+
+	remotePeer := stream.Conn().RemotePeer()
+	log.Printf("[StoreNode] Persistent seed stream connected from %s", remotePeer)
+
+	dec := json.NewDecoder(stream)
+	enc := json.NewEncoder(stream)
+
+	for {
+		var payload p2pcommon.BatchSeedCellRequest
+		if err := dec.Decode(&payload); err != nil {
+			log.Printf("[StoreNode] Persistent seed stream from %s closed: %v", remotePeer, err)
+			return
+		}
+
+		if len(payload.Seeds) > 0 {
+			rcv.verifyAndProcessBatch(payload.Seeds)
+		}
+
+		if err := enc.Encode(struct {
+			Success bool `json:"success"`
+		}{Success: true}); err != nil {
+			log.Printf("[StoreNode] Failed to write ACK on persistent seed stream to %s: %v", remotePeer, err)
+			return
+		}
+	}
+}
+
 func (rcv *Receiver) verifyAndProcessBatch(seeds []p2pcommon.SeedCellRequest) {
 	if len(seeds) == 0 {
 		return
@@ -873,7 +906,7 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 		rcv.contribMu.Unlock()
 
 		updatedPieces := rcv.cache.GetPieces(blockID, row, col)
-		if len(updatedPieces) >= minPieces && numSources >= minSources {
+		if (len(updatedPieces) >= minPieces && numSources >= minSources) || (rcv.kPiece >= 2 && len(updatedPieces) >= rcv.kPiece/2) {
 			pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
 			var finalPiece *cda.ReceivedPiece
 			recoded, err := rcv.rm.RecodePiecesWithVerify(updatedPieces[:minPieces], pieceCommits, 5)
@@ -1411,17 +1444,24 @@ func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, send
 				bCount := rcv.cellBroadcastCount[cellKey]
 				rcv.broadcastMu.Unlock()
 				if bCount < 1 {
+					numBroadcast := rcv.kPiece / 2
+					if numBroadcast < 1 {
+						numBroadcast = 1
+					}
 					pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
 					rcv.cellMu.Lock()
 					allPieces := rcv.cache.GetPieces(blockID, row, col)
 					rcv.cellMu.Unlock()
 					if len(allPieces) >= rcv.kPiece {
-						recodedPiece, err := rcv.rm.RecodePiecesWithVerify(allPieces[:rcv.kPiece], pieceCommits, 5)
-						if err == nil {
-							if err := rcv.broadcaster.BroadcastRecodedPiece(blockID, row, col, recodedPiece, pieceCommits); err == nil {
-								rcv.broadcastMu.Lock()
-								rcv.cellBroadcastCount[cellKey]++
-								rcv.broadcastMu.Unlock()
+						targetPieces := allPieces[:rcv.kPiece]
+						for i := 0; i < numBroadcast; i++ {
+							recodedPiece, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5)
+							if err == nil {
+								if err := rcv.broadcaster.BroadcastRecodedPiece(blockID, row, col, recodedPiece, pieceCommits); err == nil {
+									rcv.broadcastMu.Lock()
+									rcv.cellBroadcastCount[cellKey]++
+									rcv.broadcastMu.Unlock()
+								}
 							}
 						}
 					}
