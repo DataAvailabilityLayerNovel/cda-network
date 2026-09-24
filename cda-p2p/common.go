@@ -93,7 +93,10 @@ func GenerateDeterministicKeypair(seedStr string) (crypto.PrivKey, peer.ID, erro
 func NewP2PHost(listenPort int, privKey crypto.PrivKey) (host.Host, error) {
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
-		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", listenPort)),
+		libp2p.ListenAddrStrings(
+			fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", listenPort),
+			fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", listenPort),
+		),
 	}
 	return libp2p.New(opts...)
 }
@@ -122,6 +125,11 @@ func ProtoNodeBatchSeed(peerID string) string {
 // Bootstrap maintains a long-lived stream to this protocol for delivering batches of RLNC pieces.
 func ProtoNodePersistentSeed(peerID string) string {
 	return fmt.Sprintf("/cda/store/%s/seed-stream/1.0.0", peerID)
+}
+
+// ProtoNodeBinaryPersistentSeed returns the per-node libp2p stream protocol for binary batch seeding.
+func ProtoNodeBinaryPersistentSeed(peerID string) string {
+	return fmt.Sprintf("/cda/store/%s/seed-binary/1.0.0", peerID)
 }
 
 // GossipSub Topics

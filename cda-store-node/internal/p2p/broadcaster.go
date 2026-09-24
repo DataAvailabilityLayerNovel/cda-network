@@ -2,7 +2,6 @@ package p2p
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -65,36 +64,23 @@ func (b *Broadcaster) UpdatePeers(peers []peer.ID) {
 // Using TopicNode(selfPeerID) instead of the shared column topic ensures that only nodes
 // which explicitly subscribed to this custody node's topic receive the recoded piece.
 func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece *cda.ReceivedPiece, pieceCommits [][]byte) error {
-	log.Printf("[GossipSub] Broadcasting recoded piece (coeffs: %x, data len: %d) for cell [%d, %d] to node topic %s",
-		piece.Data.Coeffs, len(piece.Data.Data), row, col, p2pcommon.TopicNode(b.selfPeerID))
-
-	commitsStr := make([]string, len(pieceCommits))
-	for i, c := range pieceCommits {
-		commitsStr[i] = hex.EncodeToString(c)
-	}
-
-	payload := p2pcommon.SeedCellRequest{
-		BlockID:      blockID,
-		Row:          row,
-		Col:          col,
-		Data:         hex.EncodeToString(piece.Data.Data),
-		Coeffs:       hex.EncodeToString(piece.Data.Coeffs),
-		Proof:        hex.EncodeToString(piece.Proof),
-		PieceCommits: commitsStr,
-		SenderPeerID: b.selfPeerID,
-	}
-
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal store payload: %w", err)
-	}
-
 	// Publish on this node's own dedicated topic (per-node channel)
 	topicName := p2pcommon.TopicNode(b.selfPeerID)
 	topic, err := b.JoinTopic(topicName)
 	if err != nil {
 		return fmt.Errorf("failed to join GossipSub topic %s: %w", topicName, err)
 	}
+
+	binaryPiece := &p2pcommon.BinaryGossipPiece{
+		BlockID:      blockID,
+		Row:          uint16(row),
+		Col:          uint16(col),
+		Coeffs:       piece.Data.Coeffs,
+		Proof:        piece.Proof,
+		Data:         piece.Data.Data,
+		SenderPeerID: b.selfPeerID,
+	}
+	payloadBytes := p2pcommon.EncodeBinaryGossipPiece(binaryPiece)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -104,7 +90,7 @@ func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece 
 	}
 
 	recordGossipMessage()
-	log.Printf("[GossipSub] Successfully gossiped recoded piece for cell [%d, %d] to topic %s", row, col, topicName)
+	p2pcommon.LogDebug("[GossipSub] Successfully gossiped binary recoded piece for cell [%d, %d] to topic %s", row, col, topicName)
 	return nil
 }
 

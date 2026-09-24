@@ -81,7 +81,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                 "-k", str(k),
                 "-k-piece", str(k_piece)
             ] + crash_arg + (["-prune-enable=true"] if prune_enable else []) + (["-prune-ttl", prune_ttl] if prune_ttl else []),
-            'ports': [f"{bootstrap_port}:{bootstrap_port}", f"{bootstrap_p2p_port}:{bootstrap_p2p_port}"],
+            'ports': [f"{bootstrap_port}:{bootstrap_port}", f"{bootstrap_p2p_port}:{bootstrap_p2p_port}", f"{bootstrap_p2p_port}:{bootstrap_p2p_port}/udp"],
             'networks': ['cda-net'],
             'depends_on': ['publisher']
         }
@@ -130,7 +130,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                     "-stores-per-col", str(stores_per_col),
                     "-myaddr", f"http://{store_name}:8080"
                 ] + crash_arg + (["-prune-enable=true"] if prune_enable else []) + (["-prune-ttl", prune_ttl] if prune_ttl else []),
-                'ports': [f"{current_store_host_port}:8080", f"{current_store_host_port + 10000}:18080"],
+                'ports': [f"{current_store_host_port}:8080", f"{current_store_host_port + 10000}:18080", f"{current_store_host_port + 10000}:18080/udp"],
                 'volumes': [f"./data/store_{current_store_host_port}:/app/data/store_8080"],
                 'networks': ['cda-net'],
                 'depends_on': [bootstrap_name]
@@ -165,7 +165,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                 "-num-cols", str(cols),
                 "-auto-das=true"
             ] + crash_arg,
-            'ports': [f"{light_port}:{light_port}", f"{light_port + 10000}:{light_port + 10000}"],
+            'ports': [f"{light_port}:{light_port}", f"{light_port + 10000}:{light_port + 10000}", f"{light_port + 10000}:{light_port + 10000}/udp"],
             'volumes': [f"./data/light_{light_port}:/app/data/light_{light_port}"],
             'networks': ['cda-net'],
             'depends_on': ['publisher']

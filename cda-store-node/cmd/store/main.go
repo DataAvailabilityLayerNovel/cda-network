@@ -184,6 +184,8 @@ func main() {
 		hostName = u.Hostname()
 	}
 	myP2PAddr := fmt.Sprintf("/dns4/%s/tcp/%d", hostName, p2pPort)
+	myP2PAddrQUIC := fmt.Sprintf("/dns4/%s/udp/%d/quic-v1", hostName, p2pPort)
+	myAddrs := []string{myP2PAddrQUIC, myP2PAddr}
 
 	// Helper to resolve address to multiaddr
 	resolveToMultiaddr := func(addrStr string, bootPID peer.ID) (multiaddr.Multiaddr, error) {
@@ -225,7 +227,7 @@ func main() {
 							req := p2pcommon.BootstrapRoutingRequest{
 								Peer: p2pcommon.PeerInfo{
 									PeerID:     pid.String(),
-									Multiaddrs: []string{myP2PAddr},
+									Multiaddrs: myAddrs,
 									Row:        cfg.RowIdx,
 									Col:        cfg.ColIdx,
 								},
@@ -282,7 +284,7 @@ func main() {
 		req := p2pcommon.BootstrapRoutingRequest{
 			Peer: p2pcommon.PeerInfo{
 				PeerID:     pid.String(),
-				Multiaddrs: []string{myP2PAddr},
+				Multiaddrs: myAddrs,
 				Row:        cfg.RowIdx,
 				Col:        cfg.ColIdx,
 			},

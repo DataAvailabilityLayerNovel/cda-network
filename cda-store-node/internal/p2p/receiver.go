@@ -44,6 +44,15 @@ func getEnvInt(key string, defaultVal int) int {
 	return defaultVal
 }
 
+func getEnvBool(key string, defaultVal bool) bool {
+	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+		if b, err := strconv.ParseBool(val); err == nil {
+			return b
+		}
+	}
+	return defaultVal
+}
+
 type Receiver struct {
 	host          host.Host
 	ps            *pubsub.PubSub
@@ -301,6 +310,10 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	rcv.host.SetStreamHandler(protocol.ID(nodePersistentProto), rcv.handlePersistentSeedStream)
 	log.Printf("[StoreNode] Registered per-node persistent seed handler on protocol %s", nodePersistentProto)
 
+	nodeBinaryPersistentProto := p2pcommon.ProtoNodeBinaryPersistentSeed(rcv.selfPeerID)
+	rcv.host.SetStreamHandler(protocol.ID(nodeBinaryPersistentProto), rcv.handleBinaryPersistentSeedStream)
+	log.Printf("[StoreNode] Registered per-node binary persistent seed handler on protocol %s", nodeBinaryPersistentProto)
+
 	// Keep generic fetch handlers (used by light nodes and active-pull)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreFetch, rcv.handleFetchStream)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreGetPieces, rcv.handleFetchStream)
@@ -329,6 +342,13 @@ func (rcv *Receiver) Start(ctx context.Context) {
 				continue // skip self
 			}
 			data := msg.Data
+			if len(data) > 0 && data[0] == p2pcommon.BinaryGossipMagic {
+				bgp, err := p2pcommon.DecodeBinaryGossipPiece(data)
+				if err == nil && bgp.BlockID != "" {
+					rcv.enqueueBinaryGossipPiece(bgp)
+				}
+				continue
+			}
 			var payload p2pcommon.SeedCellRequest
 			if err := json.Unmarshal(data, &payload); err == nil && payload.BlockID != "" {
 				rcv.enqueueGossipPiece(payload)
@@ -397,6 +417,20 @@ func (rcv *Receiver) workerLoop(ctx context.Context, ch chan func()) {
 	}
 }
 
+// enqueueBinaryGossipPiece converts a compact binary gossip piece to a SeedCellRequest for batch verification
+func (rcv *Receiver) enqueueBinaryGossipPiece(bgp *p2pcommon.BinaryGossipPiece) {
+	req := p2pcommon.SeedCellRequest{
+		BlockID:      bgp.BlockID,
+		Row:          int(bgp.Row),
+		Col:          int(bgp.Col),
+		Data:         hex.EncodeToString(bgp.Data),
+		Coeffs:       hex.EncodeToString(bgp.Coeffs),
+		Proof:        hex.EncodeToString(bgp.Proof),
+		SenderPeerID: bgp.SenderPeerID,
+	}
+	rcv.enqueueGossipPiece(req)
+}
+
 // enqueueGossipPiece queues an incoming GossipSub seed cell for batch verification.
 func (rcv *Receiver) enqueueGossipPiece(payload p2pcommon.SeedCellRequest) {
 	recordGossipMessage()
@@ -414,6 +448,13 @@ func (rcv *Receiver) enqueueGossipPiece(payload p2pcommon.SeedCellRequest) {
 // processGossipMessage handles incoming messages on this node's own TopicNode topic.
 // Messages here are recoded RLNC pieces published by other custody nodes.
 func (rcv *Receiver) processGossipMessage(data []byte) {
+	if len(data) > 0 && data[0] == p2pcommon.BinaryGossipMagic {
+		bgp, err := p2pcommon.DecodeBinaryGossipPiece(data)
+		if err == nil && bgp.BlockID != "" {
+			rcv.enqueueBinaryGossipPiece(bgp)
+		}
+		return
+	}
 	var payload p2pcommon.SeedCellRequest
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return
@@ -618,6 +659,141 @@ func (rcv *Receiver) handlePersistentSeedStream(stream network.Stream) {
 		}{Success: true}); err != nil {
 			log.Printf("[StoreNode] Failed to write ACK on persistent seed stream to %s: %v", remotePeer, err)
 			return
+		}
+	}
+}
+
+func (rcv *Receiver) handleBinaryPersistentSeedStream(stream network.Stream) {
+	defer stream.Close()
+
+	remotePeer := stream.Conn().RemotePeer()
+	log.Printf("[StoreNode] Binary persistent seed stream connected from %s", remotePeer)
+
+	for {
+		payload, err := p2pcommon.ReadBinaryBatchSeed(stream)
+		if err != nil {
+			log.Printf("[StoreNode] Binary persistent seed stream from %s closed: %v", remotePeer, err)
+			return
+		}
+
+		if len(payload.Seeds) > 0 {
+			rcv.verifyAndProcessBinaryBatch(payload)
+		}
+
+		ack := &p2pcommon.BinaryBatchSeedResponse{
+			Success: true,
+		}
+		if err := p2pcommon.WriteBinaryBatchResponse(stream, ack); err != nil {
+			log.Printf("[StoreNode] Failed to write ACK on binary persistent seed stream to %s: %v", remotePeer, err)
+			return
+		}
+	}
+}
+
+func (rcv *Receiver) verifyAndProcessBinaryBatch(payload *p2pcommon.BinaryBatchSeedRequest) {
+	if payload == nil || len(payload.Seeds) == 0 {
+		return
+	}
+
+	blockID := payload.BlockID
+	colIdx := int(payload.ColIdx)
+
+	pieceCommits, exists := rcv.cache.GetAnchoredCommitments(blockID, colIdx)
+	if !exists && len(payload.PieceCommits) > 0 {
+		pieceCommits = payload.PieceCommits
+		rcv.cache.AnchorCommitments(blockID, colIdx, pieceCommits)
+	}
+
+	if len(pieceCommits) < rcv.kPiece {
+		return
+	}
+
+	pieceCommitsTyped := make([]cda.PieceCommitment, rcv.kPiece)
+	for i := 0; i < rcv.kPiece; i++ {
+		pieceCommitsTyped[i] = cda.PieceCommitment(pieceCommits[i])
+	}
+
+	type candidateItem struct {
+		row, col int
+		piece    cda.ReceivedPiece
+		coeffs   []byte
+	}
+
+	var candidates []candidateItem
+	var batchItems []cda.BatchVerifyItem
+
+	for _, s := range payload.Seeds {
+		row := int(s.Row)
+		col := int(s.Col)
+		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+
+		rcv.completedMu.Lock()
+		if rcv.completedBlocks != nil && rcv.completedBlocks[blockID] {
+			rcv.completedMu.Unlock()
+			continue
+		}
+		rcv.completedMu.Unlock()
+
+		isPrimaryEarly := (row % rcv.storesPerCol) == rcv.rowIdx
+		isBackupEarly := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+		if !isPrimaryEarly && !isBackupEarly {
+			rcv.nonCustodyLockedMu.Lock()
+			locked := rcv.nonCustodyLocked[cellKey]
+			rcv.nonCustodyLockedMu.Unlock()
+			if locked {
+				continue
+			}
+		}
+
+		rcv.pruneMu.Lock()
+		pruned := rcv.prunedCells[cellKey]
+		rcv.pruneMu.Unlock()
+		if pruned {
+			continue
+		}
+
+		combinedCommit, err := rcv.kzg.Combine(pieceCommitsTyped, s.Coeffs)
+		if err != nil {
+			continue
+		}
+
+		piece := cda.ReceivedPiece{
+			Row: row,
+			Col: col,
+			Data: rlnc.PieceData{
+				Data:   s.Data,
+				Coeffs: s.Coeffs,
+			},
+			Proof: cda.OpeningProof(s.Proof),
+		}
+
+		batchItems = append(batchItems, cda.BatchVerifyItem{
+			Commitment: combinedCommit,
+			Row:        row,
+			Data:       s.Data,
+			Proof:      cda.OpeningProof(s.Proof),
+		})
+
+		candidates = append(candidates, candidateItem{
+			row:    row,
+			col:    col,
+			piece:  piece,
+			coeffs: s.Coeffs,
+		})
+	}
+
+	if len(batchItems) > 0 {
+		if rcv.kzg.BatchVerify(batchItems) {
+			for _, item := range candidates {
+				_ = rcv.processVerifiedPiece(blockID, item.row, item.col, item.piece, item.coeffs, payload.SenderPeerID)
+			}
+		} else {
+			for _, item := range candidates {
+				combinedCommit, _ := rcv.kzg.Combine(pieceCommitsTyped, item.coeffs)
+				if rcv.kzg.Verify(combinedCommit, item.row, item.piece.Data.Data, item.piece.Proof) {
+					_ = rcv.processVerifiedPiece(blockID, item.row, item.col, item.piece, item.coeffs, payload.SenderPeerID)
+				}
+			}
 		}
 	}
 }
@@ -905,13 +1081,25 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 		numSources := len(rcv.peerContributions[cellKey])
 		rcv.contribMu.Unlock()
 
+		fastLock := getEnvBool("STORE_FAST_LOCK_NON_CUSTODY", true)
 		updatedPieces := rcv.cache.GetPieces(blockID, row, col)
-		if (len(updatedPieces) >= minPieces && numSources >= minSources) || (rcv.kPiece >= 2 && len(updatedPieces) >= rcv.kPiece/2) {
+		canLock := false
+		if fastLock && len(updatedPieces) >= 1 {
+			canLock = true
+		} else if (len(updatedPieces) >= minPieces && numSources >= minSources) || (rcv.kPiece >= 2 && len(updatedPieces) >= rcv.kPiece/2) {
+			canLock = true
+		}
+
+		if canLock {
 			pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
 			var finalPiece *cda.ReceivedPiece
-			recoded, err := rcv.rm.RecodePiecesWithVerify(updatedPieces[:minPieces], pieceCommits, 5)
-			if err == nil && recoded != nil {
-				finalPiece = recoded
+			if len(updatedPieces) >= minPieces {
+				recoded, err := rcv.rm.RecodePiecesWithVerify(updatedPieces[:minPieces], pieceCommits, 5)
+				if err == nil && recoded != nil {
+					finalPiece = recoded
+				} else {
+					finalPiece = &updatedPieces[0]
+				}
 			} else {
 				finalPiece = &updatedPieces[0]
 			}
@@ -928,7 +1116,7 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 			rcv.prunedCells[cellKey] = true
 			rcv.pruneMu.Unlock()
 
-			log.Printf("[StoreNode] Non-custody: cell [%d, %d] successfully recoded from %d pieces across %d sources; raw pieces pruned, cell locked.", row, col, len(updatedPieces), numSources)
+			log.Printf("[StoreNode] Non-custody: cell [%d, %d] successfully recoded/locked from %d piece(s) across %d sources; raw pieces pruned, cell locked.", row, col, len(updatedPieces), numSources)
 			rcv.CheckAndLogCompletion(blockID)
 			return nil
 		}
@@ -1063,7 +1251,11 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 			rcv.pendingPulls[cellKey] = true
 			rcv.pullMu.Unlock()
 			go func(bID string, r, c int, key string) {
-				pullDelay := time.Duration(getEnvInt("STORE_ACTIVE_PULL_DELAY_SEC", 1)) * time.Second
+				pullDelayMs := getEnvInt("STORE_ACTIVE_PULL_DELAY_MS", 200)
+				if sec := getEnvInt("STORE_ACTIVE_PULL_DELAY_SEC", 0); sec > 0 {
+					pullDelayMs = sec * 1000
+				}
+				pullDelay := time.Duration(pullDelayMs) * time.Millisecond
 				time.Sleep(pullDelay)
 				rcv.pullMu.Lock()
 				delete(rcv.pendingPulls, key)
@@ -1180,6 +1372,13 @@ func (rcv *Receiver) subscribeToNonCustodyCells(ctx context.Context, colPeers []
 						continue
 					}
 					data := msg.Data
+					if len(data) > 0 && data[0] == p2pcommon.BinaryGossipMagic {
+						bgp, err := p2pcommon.DecodeBinaryGossipPiece(data)
+						if err == nil && bgp.BlockID != "" {
+							rcv.enqueueBinaryGossipPiece(bgp)
+						}
+						continue
+					}
 					var payload p2pcommon.SeedCellRequest
 					if err := json.Unmarshal(data, &payload); err == nil && payload.BlockID != "" {
 						rcv.enqueueGossipPiece(payload)

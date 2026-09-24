@@ -374,13 +374,8 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 		}
 
 		// Group precomputed pieces by target Store Node
-		nodeBatches := make(map[string][]p2pcommon.SeedCellRequest)
+		nodeBatches := make(map[string][]p2pcommon.BinarySeedPiece)
 		nodePeers := make(map[string]p2pcommon.PeerInfo)
-
-		hexPieceCommits := make([]string, len(pieceCommits))
-		for i, c := range pieceCommits {
-			hexPieceCommits[i] = hex.EncodeToString(c)
-		}
 
 		for _, item := range precomputedPieces {
 			peers := rcv.GetPeersForCell(item.row, colIdx, item.pieceIdx)
@@ -390,15 +385,12 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 			targetPeer := peers[0]
 			nodePeers[targetPeer.PeerID] = targetPeer
 
-			seedReq := p2pcommon.SeedCellRequest{
-				BlockID:      payload.BlockID,
-				Row:          item.row,
-				Col:          colIdx,
-				Data:         hex.EncodeToString(item.piece.Data.Data),
-				Coeffs:       hex.EncodeToString(item.piece.Data.Coeffs),
-				Proof:        hex.EncodeToString(item.piece.Proof),
-				PieceCommits: hexPieceCommits,
-				SenderPeerID: rcv.host.ID().String(),
+			seedReq := p2pcommon.BinarySeedPiece{
+				Row:    uint16(item.row),
+				Col:    uint16(colIdx),
+				Data:   item.piece.Data.Data,
+				Coeffs: item.piece.Data.Coeffs,
+				Proof:  item.piece.Proof,
 			}
 			nodeBatches[targetPeer.PeerID] = append(nodeBatches[targetPeer.PeerID], seedReq)
 		}
@@ -412,7 +404,7 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 			targetPeer := nodePeers[peerID]
 			wg.Add(1)
 			sem <- struct{}{}
-			go func(tp p2pcommon.PeerInfo, sList []p2pcommon.SeedCellRequest) {
+			go func(tp p2pcommon.PeerInfo, sList []p2pcommon.BinarySeedPiece) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
@@ -422,23 +414,23 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 					if end > len(sList) {
 						end = len(sList)
 					}
-					batchReq := p2pcommon.BatchSeedCellRequest{
-						BlockID: payload.BlockID,
-						Seeds:   sList[i:end],
+					batchReq := p2pcommon.BinaryBatchSeedRequest{
+						BlockID:      payload.BlockID,
+						ColIdx:       uint16(colIdx),
+						PieceCommits: pieceCommits,
+						Seeds:        sList[i:end],
+						SenderPeerID: rcv.host.ID().String(),
 					}
-					if err := rcv.broadcaster.BroadcastBatchPieces(tp, batchReq); err != nil {
-						log.Printf("[Height: %d] Fallback: broadcast batch to %s failed: %v. Sending individually...", height, tp.PeerID, err)
+					if err := rcv.broadcaster.BroadcastBinaryBatchPieces(tp, batchReq); err != nil {
+						log.Printf("[Height: %d] Fallback: broadcast binary batch to %s failed: %v. Sending individually...", height, tp.PeerID, err)
 						for _, s := range sList[i:end] {
-							pData, _ := hex.DecodeString(s.Data)
-							pCoeffs, _ := hex.DecodeString(s.Coeffs)
-							pProof, _ := hex.DecodeString(s.Proof)
 							pc := cda.ReceivedPiece{
-								Row:   s.Row,
-								Col:   s.Col,
-								Data:  rlnc.PieceData{Data: pData, Coeffs: pCoeffs},
-								Proof: cda.OpeningProof(pProof),
+								Row:   int(s.Row),
+								Col:   int(s.Col),
+								Data:  rlnc.PieceData{Data: s.Data, Coeffs: s.Coeffs},
+								Proof: cda.OpeningProof(s.Proof),
 							}
-							_ = rcv.broadcaster.BroadcastPiece(payload.BlockID, s.Row, colIdx, 0, &pc, pieceCommits)
+							_ = rcv.broadcaster.BroadcastPiece(payload.BlockID, int(s.Row), colIdx, 0, &pc, pieceCommits)
 						}
 					}
 				}

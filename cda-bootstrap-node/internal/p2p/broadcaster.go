@@ -373,7 +373,7 @@ func (b *Broadcaster) newPersistentStream(targetPeer p2pcommon.PeerInfo, pid pee
 		}
 	}
 
-	proto := p2pcommon.ProtoNodePersistentSeed(targetPeer.PeerID)
+	proto := p2pcommon.ProtoNodeBinaryPersistentSeed(targetPeer.PeerID)
 
 	ctxDial, cancelDial := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelDial()
@@ -387,7 +387,11 @@ func (b *Broadcaster) newPersistentStream(targetPeer p2pcommon.PeerInfo, pid pee
 
 	stream, err := b.host.NewStream(streamCtx, pid, protocol.ID(proto))
 	if err != nil {
-		return nil, fmt.Errorf("open persistent stream to %s on proto %s failed: %w", pid, proto, err)
+		protoLegacy := p2pcommon.ProtoNodePersistentSeed(targetPeer.PeerID)
+		stream, err = b.host.NewStream(streamCtx, pid, protocol.ID(protoLegacy))
+		if err != nil {
+			return nil, fmt.Errorf("open persistent stream to %s on proto %s failed: %w", pid, proto, err)
+		}
 	}
 
 	ps := &persistentStream{
@@ -396,8 +400,49 @@ func (b *Broadcaster) newPersistentStream(targetPeer p2pcommon.PeerInfo, pid pee
 		dec:    json.NewDecoder(stream),
 	}
 
-	log.Printf("[Bootstrap PersistentStreamPool] Established stream in pool to %s on %s", pid, proto)
+	log.Printf("[Bootstrap StreamPool] Established stream in pool to %s on %s", pid, stream.Protocol())
 	return ps, nil
+}
+
+// BroadcastBinaryBatchPieces delivers a compact binary batch of RLNC pieces over the persistent stream pool.
+func (b *Broadcaster) BroadcastBinaryBatchPieces(targetPeer p2pcommon.PeerInfo, req p2pcommon.BinaryBatchSeedRequest) error {
+	pid, err := peer.Decode(targetPeer.PeerID)
+	if err != nil {
+		return fmt.Errorf("invalid peer id %s: %w", targetPeer.PeerID, err)
+	}
+
+	pool := b.getOrCreatePool(targetPeer, pid)
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		ps, err := b.acquireStream(pool)
+		if err != nil {
+			log.Printf("[Bootstrap BinaryStreamPool] Attempt %d: could not acquire stream to %s: %v", attempt, pid, err)
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+
+		if err := p2pcommon.WriteBinaryBatchSeed(ps.stream, &req); err != nil {
+			log.Printf("[Bootstrap BinaryStreamPool] Write error to %s: %v, resetting stream", pid, err)
+			b.releaseStream(pool, ps, err)
+			continue
+		}
+
+		resp, err := p2pcommon.ReadBinaryBatchResponse(ps.stream)
+		if err != nil {
+			log.Printf("[Bootstrap BinaryStreamPool] Read ACK error from %s: %v, resetting stream", pid, err)
+			b.releaseStream(pool, ps, err)
+			continue
+		}
+
+		b.releaseStream(pool, ps, nil)
+
+		if !resp.Success {
+			return fmt.Errorf("store node %s binary batch verify error: %s", targetPeer.PeerID, resp.Error)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("failed to send binary batch of %d pieces to %s after 2 attempts", len(req.Seeds), targetPeer.PeerID)
 }
 
 // BroadcastBatchPieces delivers a batch of RLNC pieces over a persistent long-lived stream pool.

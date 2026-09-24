@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package cda.p2p;
+
+option go_package = "cda-p2p/pb";
+
+// SeedPiece represents a single encoded RLNC piece with proof in raw binary
+message SeedPiece {
+  uint32 row = 1;
+  uint32 col = 2;
+  bytes data = 3;   // 512 bytes binary
+  bytes coeffs = 4; // 8 bytes binary
+  bytes proof = 5;  // 48 bytes KZG opening proof
+}
+
+// BatchSeedRequest delivers a batch of pieces over binary stream
+message BatchSeedRequest {
+  string block_id = 1;
+  uint32 col_idx = 2;
+  repeated bytes piece_commits = 3; // 8 commitments (48 bytes each), sent ONCE per batch
+  repeated SeedPiece seeds = 4;
+  string sender_peer_id = 5;
+}
+
+// BatchSeedResponse represents ACK from Store Node
+message BatchSeedResponse {
+  bool success = 1;
+  string error = 2;
+}
