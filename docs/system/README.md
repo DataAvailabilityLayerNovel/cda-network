@@ -38,3 +38,6 @@ Tài liệu về giao thức truyền thông P2P, định tuyến LibP2P và cơ
   Tài liệu mô tả chi tiết các lệnh `curl` HTTP REST API (Publisher, Light, Bootstrap SSE) và bộ script tự động hóa CLI (`publish.sh`, `das.sh`, `bot_das.sh`, `block_publisher_bot.py`).
 - **[Đặc Tả Thiết Lập Concurrency & Tối Ưu Phần Cứng (concurrency_and_hardware_tuning.md)](file:///home/ubuntu/cda-network/docs/system/technical_docs/concurrency_and_hardware_tuning.md)**:
   Tài liệu tổng hợp toàn bộ các thiết lập concurrency (goroutines, semaphores, worker pools, batch size, grace period) trên từng node và hướng dẫn tinh chỉnh cấu hình theo quy mô ma trận $K$.
+- **[Đặc Tả Chi Tiết Các Node & Lan Truyền Ma Trận Mạng Store Node (node_architecture_and_matrix_propagation.md)](file:///home/ubuntu/cda-network/docs/system/technical_docs/node_architecture_and_matrix_propagation.md)**:
+  Tài liệu mô tả chi tiết nhiệm vụ, phép tính mật mã toán học, cấu hình tối ưu concurrency/parallel, thiết lập mạng P2P/PubSub của 4 loại node và phân tích chuyên sâu điểm nghẽn lan truyền dữ liệu trong ma trận Store Node.
+

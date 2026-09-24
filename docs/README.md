@@ -23,6 +23,11 @@ Tài liệu mô tả kiến trúc, giao thức truyền thông, thuật toán to
   Tài liệu mô tả chi tiết kiến trúc hiện thực thực tế của toàn bộ codebase: vị trí file mã nguồn, pipeline xử lý dữ liệu, giao thức stream P2P, cơ chế quản lý custody/pruning.
 - **[Hướng Dẫn CLI & Lệnh Curl REST API (CLI & Curl API Guide)](file:///home/ubuntu/cda-network/docs/system/technical_docs/cli_and_curl_guide.md)**: 
   Tài liệu mô tả chi tiết các lệnh `curl` HTTP REST API (Publisher, Light Node DAS, Bootstrap SSE) và các công cụ dòng lệnh CLI (`publish.sh`, `das.sh`, `bot_das.sh`, `block_publisher_bot.py`).
+- **[Đặc Tả Thiết Lập Concurrency & Tối Ưu Phần Cứng (concurrency_and_hardware_tuning.md)](file:///home/ubuntu/cda-network/docs/system/technical_docs/concurrency_and_hardware_tuning.md)**: 
+  Tài liệu tổng hợp các thiết lập concurrency (goroutines, semaphores, worker pools, batch size) và hướng dẫn tinh chỉnh cấu hình theo quy mô ma trận $K$.
+- **[Đặc Tả Chi Tiết Các Node & Lan Truyền Ma Trận Mạng Store Node (node_architecture_and_matrix_propagation.md)](file:///home/ubuntu/cda-network/docs/system/technical_docs/node_architecture_and_matrix_propagation.md)**: 
+  Tài liệu mô tả chi tiết nhiệm vụ tính toán, cấu hình song song / đồng thời, thiết lập mạng P2P/PubSub và phân tích chuyên sâu điểm nghẽn lan truyền dữ liệu trong ma trận Store Node.
+
 
 ---
 

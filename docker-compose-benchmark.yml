@@ -1,0 +1,620 @@
+{
+  "services": {
+    "publisher": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "command": [
+        "/usr/local/bin/publisher",
+        "-config",
+        "/app/publisher_config.json"
+      ],
+      "ports": [
+        "8080:8080",
+        "18080:18080"
+      ],
+      "volumes": [
+        "./publisher_config_docker.json:/app/publisher_config.json"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "environment": [
+        "PUBLISHER_QUEUE_TIMEOUT=300s",
+        "PUBLISHER_MAX_IN_FLIGHT=1"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "bootstrap-0": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "command": [
+        "/usr/local/bin/bootstrap",
+        "-port",
+        "9200",
+        "-col",
+        "0",
+        "-publisher",
+        "http://publisher:8080",
+        "-k",
+        "128",
+        "-k-piece",
+        "4"
+      ],
+      "ports": [
+        "9200:9200",
+        "19200:19200"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "publisher"
+      ],
+      "environment": [
+        "BOOTSTRAP_PROOF_GEN_SEM=32",
+        "BOOTSTRAP_ENCODE_WORKERS=8"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "store-0-1": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "command": [
+        "/usr/local/bin/store",
+        "-port",
+        "8080",
+        "-row",
+        "0",
+        "-col",
+        "0",
+        "-publisher",
+        "http://publisher:8080",
+        "-bootstrap",
+        "/dns4/bootstrap-0/tcp/19200",
+        "-k",
+        "128",
+        "-k-piece",
+        "4",
+        "-num-cols",
+        "16",
+        "-stores-per-col",
+        "8",
+        "-myaddr",
+        "http://store-0-1:8080"
+      ],
+      "ports": [
+        "9300:8080",
+        "19300:18080"
+      ],
+      "volumes": [
+        "./data/store_9300:/app/data/store_8080"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "bootstrap-0"
+      ],
+      "environment": [
+        "STORE_GOSSIP_BATCH_SIZE=64",
+        "STORE_GOSSIP_BATCH_WORKERS=4"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "store-0-2": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "command": [
+        "/usr/local/bin/store",
+        "-port",
+        "8080",
+        "-row",
+        "1",
+        "-col",
+        "0",
+        "-publisher",
+        "http://publisher:8080",
+        "-bootstrap",
+        "/dns4/bootstrap-0/tcp/19200",
+        "-k",
+        "128",
+        "-k-piece",
+        "4",
+        "-num-cols",
+        "16",
+        "-stores-per-col",
+        "8",
+        "-myaddr",
+        "http://store-0-2:8080"
+      ],
+      "ports": [
+        "9301:8080",
+        "19301:18080"
+      ],
+      "volumes": [
+        "./data/store_9301:/app/data/store_8080"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "bootstrap-0"
+      ],
+      "environment": [
+        "STORE_GOSSIP_BATCH_SIZE=64",
+        "STORE_GOSSIP_BATCH_WORKERS=4"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "store-0-3": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "command": [
+        "/usr/local/bin/store",
+        "-port",
+        "8080",
+        "-row",
+        "2",
+        "-col",
+        "0",
+        "-publisher",
+        "http://publisher:8080",
+        "-bootstrap",
+        "/dns4/bootstrap-0/tcp/19200",
+        "-k",
+        "128",
+        "-k-piece",
+        "4",
+        "-num-cols",
+        "16",
+        "-stores-per-col",
+        "8",
+        "-myaddr",
+        "http://store-0-3:8080"
+      ],
+      "ports": [
+        "9302:8080",
+        "19302:18080"
+      ],
+      "volumes": [
+        "./data/store_9302:/app/data/store_8080"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "bootstrap-0"
+      ],
+      "environment": [
+        "STORE_GOSSIP_BATCH_SIZE=64",
+        "STORE_GOSSIP_BATCH_WORKERS=4"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "store-0-4": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "command": [
+        "/usr/local/bin/store",
+        "-port",
+        "8080",
+        "-row",
+        "3",
+        "-col",
+        "0",
+        "-publisher",
+        "http://publisher:8080",
+        "-bootstrap",
+        "/dns4/bootstrap-0/tcp/19200",
+        "-k",
+        "128",
+        "-k-piece",
+        "4",
+        "-num-cols",
+        "16",
+        "-stores-per-col",
+        "8",
+        "-myaddr",
+        "http://store-0-4:8080"
+      ],
+      "ports": [
+        "9303:8080",
+        "19303:18080"
+      ],
+      "volumes": [
+        "./data/store_9303:/app/data/store_8080"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "bootstrap-0"
+      ],
+      "environment": [
+        "STORE_GOSSIP_BATCH_SIZE=64",
+        "STORE_GOSSIP_BATCH_WORKERS=4"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "store-0-5": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "command": [
+        "/usr/local/bin/store",
+        "-port",
+        "8080",
+        "-row",
+        "4",
+        "-col",
+        "0",
+        "-publisher",
+        "http://publisher:8080",
+        "-bootstrap",
+        "/dns4/bootstrap-0/tcp/19200",
+        "-k",
+        "128",
+        "-k-piece",
+        "4",
+        "-num-cols",
+        "16",
+        "-stores-per-col",
+        "8",
+        "-myaddr",
+        "http://store-0-5:8080"
+      ],
+      "ports": [
+        "9304:8080",
+        "19304:18080"
+      ],
+      "volumes": [
+        "./data/store_9304:/app/data/store_8080"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "bootstrap-0"
+      ],
+      "environment": [
+        "STORE_GOSSIP_BATCH_SIZE=64",
+        "STORE_GOSSIP_BATCH_WORKERS=4"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "store-0-6": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "command": [
+        "/usr/local/bin/store",
+        "-port",
+        "8080",
+        "-row",
+        "5",
+        "-col",
+        "0",
+        "-publisher",
+        "http://publisher:8080",
+        "-bootstrap",
+        "/dns4/bootstrap-0/tcp/19200",
+        "-k",
+        "128",
+        "-k-piece",
+        "4",
+        "-num-cols",
+        "16",
+        "-stores-per-col",
+        "8",
+        "-myaddr",
+        "http://store-0-6:8080"
+      ],
+      "ports": [
+        "9305:8080",
+        "19305:18080"
+      ],
+      "volumes": [
+        "./data/store_9305:/app/data/store_8080"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "bootstrap-0"
+      ],
+      "environment": [
+        "STORE_GOSSIP_BATCH_SIZE=64",
+        "STORE_GOSSIP_BATCH_WORKERS=4"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "store-0-7": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "command": [
+        "/usr/local/bin/store",
+        "-port",
+        "8080",
+        "-row",
+        "6",
+        "-col",
+        "0",
+        "-publisher",
+        "http://publisher:8080",
+        "-bootstrap",
+        "/dns4/bootstrap-0/tcp/19200",
+        "-k",
+        "128",
+        "-k-piece",
+        "4",
+        "-num-cols",
+        "16",
+        "-stores-per-col",
+        "8",
+        "-myaddr",
+        "http://store-0-7:8080"
+      ],
+      "ports": [
+        "9306:8080",
+        "19306:18080"
+      ],
+      "volumes": [
+        "./data/store_9306:/app/data/store_8080"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "bootstrap-0"
+      ],
+      "environment": [
+        "STORE_GOSSIP_BATCH_SIZE=64",
+        "STORE_GOSSIP_BATCH_WORKERS=4"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "store-0-8": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "command": [
+        "/usr/local/bin/store",
+        "-port",
+        "8080",
+        "-row",
+        "7",
+        "-col",
+        "0",
+        "-publisher",
+        "http://publisher:8080",
+        "-bootstrap",
+        "/dns4/bootstrap-0/tcp/19200",
+        "-k",
+        "128",
+        "-k-piece",
+        "4",
+        "-num-cols",
+        "16",
+        "-stores-per-col",
+        "8",
+        "-myaddr",
+        "http://store-0-8:8080"
+      ],
+      "ports": [
+        "9307:8080",
+        "19307:18080"
+      ],
+      "volumes": [
+        "./data/store_9307:/app/data/store_8080"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "bootstrap-0"
+      ],
+      "environment": [
+        "STORE_GOSSIP_BATCH_SIZE=64",
+        "STORE_GOSSIP_BATCH_WORKERS=4"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "light-1": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "command": [
+        "/usr/local/bin/light",
+        "-port",
+        "9401",
+        "-publisher",
+        "http://publisher:8080",
+        "-bootstraps",
+        "0:/dns4/bootstrap-0/tcp/19200",
+        "-k",
+        "128",
+        "-k-piece",
+        "4",
+        "-num-cols",
+        "16",
+        "-auto-das=true"
+      ],
+      "ports": [
+        "9401:9401",
+        "19401:19401"
+      ],
+      "volumes": [
+        "./data/light_9401:/app/data/light_9401"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "publisher"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "light-2": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile"
+      },
+      "command": [
+        "/usr/local/bin/light",
+        "-port",
+        "9402",
+        "-publisher",
+        "http://publisher:8080",
+        "-bootstraps",
+        "0:/dns4/bootstrap-0/tcp/19200",
+        "-k",
+        "128",
+        "-k-piece",
+        "4",
+        "-num-cols",
+        "16",
+        "-auto-das=true"
+      ],
+      "ports": [
+        "9402:9402",
+        "19402:19402"
+      ],
+      "volumes": [
+        "./data/light_9402:/app/data/light_9402"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "publisher"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "prometheus": {
+      "image": "prom/prometheus:latest",
+      "volumes": [
+        "./data/prometheus.yml:/etc/prometheus/prometheus.yml"
+      ],
+      "ports": [
+        "9090:9090"
+      ],
+      "networks": [
+        "cda-net"
+      ]
+    },
+    "grafana": {
+      "image": "grafana/grafana:latest",
+      "volumes": [
+        "./data/grafana/provisioning:/etc/grafana/provisioning"
+      ],
+      "ports": [
+        "3000:3000"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "environment": [
+        "GF_SECURITY_ADMIN_PASSWORD=admin",
+        "GF_USERS_ALLOW_SIGN_UP=false"
+      ],
+      "depends_on": [
+        "prometheus"
+      ]
+    }
+  },
+  "networks": {
+    "cda-net": {
+      "driver": "bridge"
+    }
+  }
+}

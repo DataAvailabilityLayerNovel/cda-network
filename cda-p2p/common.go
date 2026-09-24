@@ -103,6 +103,7 @@ const (
 	ProtoPublisherPush    = "/cda/publisher/push-chunk/1.0.0"
 	ProtoBootstrapRouting = "/cda/bootstrap/routing/1.0.0"
 	ProtoStoreFetch       = "/cda/store/fetch-pieces/1.0.0"
+	ProtoStoreBatchFetch  = "/cda/store/fetch-batch-pieces/1.0.0"
 	ProtoStoreGetPieces   = "/cda/store/get-cell-pieces/1.0.0"
 )
 
@@ -212,6 +213,24 @@ type StoreFetchResponse struct {
 	Data        string         `json:"data,omitempty"`
 	PiecesCount int            `json:"pieces_count"`
 	Pieces      []CodedPiece   `json:"pieces"`
+}
+
+// CellCoord identifies a cell by its row and column coordinates
+type CellCoord struct {
+	Row int `json:"row"`
+	Col int `json:"col"`
+}
+
+// StoreBatchFetchRequest is a request to retrieve pieces for multiple cells in a single stream
+type StoreBatchFetchRequest struct {
+	BlockID string      `json:"block_id"`
+	Cells   []CellCoord `json:"cells"`
+}
+
+// StoreBatchFetchResponse returns slices of pieces keyed by "row_col"
+type StoreBatchFetchResponse struct {
+	BlockID string                  `json:"block_id"`
+	Cells   map[string][]CodedPiece `json:"cells"` // Key format: "row_col"
 }
 
 // CodedPiece represents one coded slice stored by a custody node

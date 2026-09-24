@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"math/big"
 
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/rlnc"
@@ -23,28 +22,66 @@ func NewRLNCEncoder(k int, kzg cda.KZGProvider) *RLNCEncoder {
 	}
 }
 
-// EvaluatePieceColumn evaluates the polynomial representing a piece-column at a given row index.
-func EvaluatePieceColumn(columnData [][]byte, pieceIdx, rowIdx, k, frSize int) []byte {
-	n := len(columnData)
-
-	var eval fr.Element
+// ComputeZPowers computes [z^0, z^1, ..., z^{n-1}] where z = rowIdx in Fr.
+func ComputeZPowers(rowIdx, n int) []fr.Element {
 	var z fr.Element
 	z.SetInterface(int64(rowIdx))
 
-	for r := 0; r < n; r++ {
-		var val fr.Element
-		val.SetBytes(columnData[r][pieceIdx*frSize : (pieceIdx+1)*frSize])
+	zPowers := make([]fr.Element, n)
+	if n > 0 {
+		zPowers[0].SetOne()
+		for r := 1; r < n; r++ {
+			zPowers[r].Mul(&zPowers[r-1], &z)
+		}
+	}
+	return zPowers
+}
 
-		var zPower fr.Element
-		zPower.Exp(z, big.NewInt(int64(r)))
+// EvaluatePieceColumn evaluates the polynomial representing a piece-column at a given row index.
+func EvaluatePieceColumn(columnData [][]byte, pieceIdx, rowIdx, k, frSize int) []byte {
+	n := len(columnData)
+	zPowers := ComputeZPowers(rowIdx, n)
+	return EvaluatePieceColumnWithPowers(columnData, pieceIdx, rowIdx, k, frSize, zPowers)
+}
 
-		var term fr.Element
-		term.Mul(&val, &zPower)
-		eval.Add(&eval, &term)
+// EvaluatePieceColumnWithPowers evaluates the polynomial representing a piece-column using precomputed powers.
+func EvaluatePieceColumnWithPowers(columnData [][]byte, pieceIdx, rowIdx, k, frSize int, zPowers []fr.Element) []byte {
+	n := len(columnData)
+	numChunks := (frSize + 31) / 32
+	if numChunks <= 0 {
+		numChunks = 1
 	}
 
-	bytesVal := eval.Bytes()
-	return append([]byte(nil), bytesVal[:]...)
+	result := make([]byte, numChunks*32)
+
+	for m := 0; m < numChunks; m++ {
+		var eval fr.Element
+		for r := 0; r < n; r++ {
+			chunkStart := pieceIdx*frSize + m*32
+			chunkEnd := chunkStart + 32
+			if chunkEnd > (pieceIdx+1)*frSize {
+				chunkEnd = (pieceIdx + 1) * frSize
+			}
+
+			var val fr.Element
+			if chunkStart < len(columnData[r]) {
+				end := chunkEnd
+				if end > len(columnData[r]) {
+					end = len(columnData[r])
+				}
+				val.SetBytes(columnData[r][chunkStart:end])
+			}
+
+			var term fr.Element
+			term.Mul(&val, &zPowers[r])
+			eval.Add(&eval, &term)
+		}
+
+		bytesVal := eval.Bytes()
+		copy(result[m*32:(m+1)*32], bytesVal[:])
+	}
+
+	return result
 }
 
 // EncodeRowNSeeds performs RLNC encoding on the cell of a specific row and column
@@ -57,11 +94,13 @@ func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pie
 		count = e.k
 	}
 
-	// 1. Evaluate piece columns at row to find fragments in evaluation form
+	// 1. Precompute zPowers once for the entire row and evaluate all k piece columns
+	n := len(columnData)
+	zPowers := ComputeZPowers(row, n)
 	frSize := len(columnData[0]) / e.k
 	fragments := make([][]byte, e.k)
 	for j := 0; j < e.k; j++ {
-		fragments[j] = EvaluatePieceColumn(columnData, j, row, e.k, frSize)
+		fragments[j] = EvaluatePieceColumnWithPowers(columnData, j, row, e.k, frSize, zPowers)
 	}
 
 	openingProofs := make([]cda.OpeningProof, e.k)
@@ -150,27 +189,10 @@ func isLinearlyIndependent(existingCoeffs [][]byte, newCoeff []byte, k int) bool
 		B[i] = make([]byte, 32)
 	}
 
-	_, err := rlnc.SolveGaussian(A, B)
+	_, err := rlnc.SolveGaussianFr(A, B)
 	return err == nil
 }
 
 func vectorMulAddFrLocal(dst, src []byte, coeff uint16) {
-	if coeff == 0 {
-		return
-	}
-
-	var dstEl fr.Element
-	var srcEl fr.Element
-	var coeffEl fr.Element
-	var term fr.Element
-
-	dstEl.SetBytes(dst)
-	srcEl.SetBytes(src)
-	coeffEl.SetUint64(uint64(coeff))
-
-	term.Mul(&srcEl, &coeffEl)
-	dstEl.Add(&dstEl, &term)
-
-	out := dstEl.Bytes()
-	copy(dst, out[32-len(dst):])
+	rlnc.VectorMulAddFr(dst, src, coeff)
 }

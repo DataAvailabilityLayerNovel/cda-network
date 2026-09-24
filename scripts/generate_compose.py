@@ -7,6 +7,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                      store_gossip_batch_size=None, store_gossip_batch_workers=None, store_gossip_batch_ticker_ms=None,
                      store_dissemination_sem=None, store_fallback_pull_sem=None, store_sharded_workers=None,
                      bootstrap_proof_gen_sem=None, bootstrap_seeding_sem=None, bootstrap_batch_chunk_size=None,
+                     bootstrap_encode_workers=None,
                      publisher_max_in_flight=None, gomaxprocs=None, cpus=None):
     if active_cols is None:
         active_cols = cols
@@ -62,6 +63,8 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
             boot_env.append(f'BOOTSTRAP_SEEDING_SEM={bootstrap_seeding_sem}')
         if bootstrap_batch_chunk_size is not None:
             boot_env.append(f'BOOTSTRAP_BATCH_CHUNK_SIZE={bootstrap_batch_chunk_size}')
+        if bootstrap_encode_workers is not None:
+            boot_env.append(f'BOOTSTRAP_ENCODE_WORKERS={bootstrap_encode_workers}')
         if gomaxprocs is not None:
             boot_env.append(f'GOMAXPROCS={gomaxprocs}')
 
@@ -580,7 +583,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate docker-compose.yml for CDA network")
     parser.add_argument('-k', '--k', type=int, default=16, help='K parameter for erasure coding (matrix size)')
     parser.add_argument('-p', '--k-piece', '--piece', type=int, default=4, help='KPiece parameter for RLNC/KZG')
-    parser.add_argument('-n', '--num-cols', '--cols', dest='cols', type=int, default=8, help='Total number of network columns (N)')
+    parser.add_argument('-n', '--num-cols', '--cols', '--columns', dest='cols', type=int, default=8, help='Total number of network columns (N)')
     parser.add_argument('-c', '--active-cols', type=int, default=None, help='Number of active columns to run in Compose (C)')
     parser.add_argument('-s', '--stores-per-col', type=int, default=8, help='Number of store nodes per column (S)')
     parser.add_argument('-l', '--lights', '--light-nodes', type=int, default=2, help='Number of light nodes (L)')
@@ -594,6 +597,7 @@ if __name__ == '__main__':
     parser.add_argument('--store-fallback-pull-sem', type=int, default=None, help='Store fallback pull semaphore limit')
     parser.add_argument('--store-sharded-workers', type=int, default=None, help='Store sharded cell worker pool size')
     parser.add_argument('--bootstrap-proof-gen-sem', type=int, default=None, help='Bootstrap KZG opening proof generator concurrency semaphore')
+    parser.add_argument('--bootstrap-encode-workers', type=int, default=None, help='Bootstrap RLNC seed encoding parallel worker count')
     parser.add_argument('--bootstrap-seeding-sem', type=int, default=None, help='Bootstrap P2P seeding stream semaphore')
     parser.add_argument('--bootstrap-batch-chunk-size', type=int, default=None, help='Bootstrap P2P batch chunk size')
     parser.add_argument('--publisher-max-in-flight', type=int, default=None, help='Publisher max in-flight blocks')
@@ -621,6 +625,7 @@ if __name__ == '__main__':
         store_fallback_pull_sem=args.store_fallback_pull_sem,
         store_sharded_workers=args.store_sharded_workers,
         bootstrap_proof_gen_sem=args.bootstrap_proof_gen_sem,
+        bootstrap_encode_workers=args.bootstrap_encode_workers,
         bootstrap_seeding_sem=args.bootstrap_seeding_sem,
         bootstrap_batch_chunk_size=args.bootstrap_batch_chunk_size,
         publisher_max_in_flight=args.publisher_max_in_flight,

@@ -300,6 +300,7 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	// Keep generic fetch handlers (used by light nodes and active-pull)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreFetch, rcv.handleFetchStream)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreGetPieces, rcv.handleFetchStream)
+	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreBatchFetch, rcv.handleBatchFetchStream)
 
 	// 2. Subscribe to this node's own dedicated GossipSub topic.
 	//    Bootstrap / other custody nodes will publish to this topic when they want to
@@ -531,8 +532,9 @@ func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []stri
 				rcv.fallbackMu.Unlock()
 			}()
 
-			// Grace period of 5 seconds to allow GossipSub dissemination and Batch Verify to complete naturally
-			time.Sleep(5 * time.Second)
+			// Grace period to allow GossipSub dissemination and Batch Verify to complete naturally
+			graceSec := getEnvInt("STORE_FALLBACK_GRACE_SEC", 3)
+			time.Sleep(time.Duration(graceSec) * time.Second)
 			if rcv.IsComplete(bID) {
 				return
 			}
@@ -540,8 +542,8 @@ func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []stri
 				if rcv.IsComplete(bID) {
 					return
 				}
-				rcv.fallbackPullMissingCells(bID)
-				time.Sleep(3 * time.Second)
+				rcv.fallbackPullMissingCells(bID, attempt)
+				time.Sleep(1500 * time.Millisecond)
 			}
 		}(blockID)
 	} else {
@@ -1028,7 +1030,8 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 			rcv.pendingPulls[cellKey] = true
 			rcv.pullMu.Unlock()
 			go func(bID string, r, c int, key string) {
-				time.Sleep(3 * time.Second)
+				pullDelay := time.Duration(getEnvInt("STORE_ACTIVE_PULL_DELAY_SEC", 1)) * time.Second
+				time.Sleep(pullDelay)
 				rcv.pullMu.Lock()
 				delete(rcv.pendingPulls, key)
 				rcv.pullMu.Unlock()
@@ -1154,7 +1157,7 @@ func (rcv *Receiver) subscribeToNonCustodyCells(ctx context.Context, colPeers []
 	}
 }
 
-func (rcv *Receiver) fallbackPullMissingCells(blockID string) {
+func (rcv *Receiver) fallbackPullMissingCells(blockID string, attempt int) {
 	if rcv.IsComplete(blockID) {
 		return
 	}
@@ -1172,57 +1175,505 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string) {
 	netColIdx := rcv.colIdx / colsPerNetCol
 	startCol := netColIdx * colsPerNetCol
 	endCol := startCol + colsPerNetCol
+	storesPerCol := rcv.storesPerCol
+	if storesPerCol <= 0 {
+		storesPerCol = 8
+	}
 
-	pulledAny := false
-	var wg sync.WaitGroup
-	fallbackLimit := getEnvInt("STORE_FALLBACK_PULL_SEM", 8)
-	sem := make(chan struct{}, fallbackLimit)
+	rcv.peersMu.RLock()
+	peersCopy := make([]p2pcommon.PeerInfo, len(rcv.colPeers))
+	copy(peersCopy, rcv.colPeers)
+	rcv.peersMu.RUnlock()
+
+	if len(peersCopy) == 0 {
+		return
+	}
+
+	peerByRow := make(map[int]p2pcommon.PeerInfo)
+	for _, p := range peersCopy {
+		peerByRow[p.Row] = p
+	}
+
+	peerRequests := make(map[string][]p2pcommon.CellCoord)
+	peerInfoMap := make(map[string]p2pcommon.PeerInfo)
 
 	for c := startCol; c < endCol; c++ {
 		for r := 0; r < n; r++ {
-			isPrimary := (r % rcv.storesPerCol) == rcv.rowIdx
-			isBackup := ((r + 1) % rcv.storesPerCol) == rcv.rowIdx
+			isPrimary := (r % storesPerCol) == rcv.rowIdx
+			isBackup := ((r + 1) % storesPerCol) == rcv.rowIdx
+			cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
+
+			primaryRow := r % storesPerCol
+			backupRow := (r + 1) % storesPerCol
+
 			if isPrimary {
-				cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
 				rcv.broadcastMu.Lock()
 				bCount := rcv.cellBroadcastCount[cellKey]
 				rcv.broadcastMu.Unlock()
 
 				pCount := rcv.cache.GetPieceCount(blockID, r, c)
 				if pCount < rcv.kPiece || bCount < 1 {
-					pulledAny = true
-					wg.Add(1)
-					sem <- struct{}{}
-					go func(row, col int) {
-						defer wg.Done()
-						defer func() { <-sem }()
-						rcv.pullMissingPiecesFromPeers(blockID, row, col)
-					}(r, c)
+					if bp, ok := peerByRow[backupRow]; ok && bp.PeerID != rcv.selfPeerID {
+						peerRequests[bp.PeerID] = append(peerRequests[bp.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
+						peerInfoMap[bp.PeerID] = bp
+					}
+					if attempt >= 2 {
+						for _, p := range peersCopy {
+							if p.PeerID != rcv.selfPeerID && p.Row != backupRow {
+								peerRequests[p.PeerID] = append(peerRequests[p.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
+								peerInfoMap[p.PeerID] = p
+							}
+						}
+					}
 				}
-			} else if !isBackup {
-				cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
+			} else if isBackup {
+				rcv.broadcastMu.Lock()
+				bCount := rcv.cellBroadcastCount[cellKey]
+				rcv.broadcastMu.Unlock()
+
+				rcv.pruneMu.Lock()
+				pruned := rcv.prunedCells[cellKey]
+				rcv.pruneMu.Unlock()
+
+				pCount := rcv.cache.GetPieceCount(blockID, r, c)
+				if bCount < 1 && !pruned && pCount < rcv.kPiece {
+					if pp, ok := peerByRow[primaryRow]; ok && pp.PeerID != rcv.selfPeerID {
+						peerRequests[pp.PeerID] = append(peerRequests[pp.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
+						peerInfoMap[pp.PeerID] = pp
+					}
+					if attempt >= 2 {
+						for _, p := range peersCopy {
+							if p.PeerID != rcv.selfPeerID && p.Row != primaryRow {
+								peerRequests[p.PeerID] = append(peerRequests[p.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
+								peerInfoMap[p.PeerID] = p
+							}
+						}
+					}
+				}
+			} else { // Non-custody
 				rcv.nonCustodyLockedMu.Lock()
 				locked := rcv.nonCustodyLocked[cellKey]
 				rcv.nonCustodyLockedMu.Unlock()
 
 				if !locked {
-					pulledAny = true
-					wg.Add(1)
-					sem <- struct{}{}
-					go func(row, col int) {
-						defer wg.Done()
-						defer func() { <-sem }()
-						rcv.pullNonCustodyPiece(blockID, row, col)
-					}(r, c)
+					if pp, ok := peerByRow[primaryRow]; ok && pp.PeerID != rcv.selfPeerID {
+						peerRequests[pp.PeerID] = append(peerRequests[pp.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
+						peerInfoMap[pp.PeerID] = pp
+					}
+					if bp, ok := peerByRow[backupRow]; ok && bp.PeerID != rcv.selfPeerID {
+						peerRequests[bp.PeerID] = append(peerRequests[bp.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
+						peerInfoMap[bp.PeerID] = bp
+					}
+					if attempt >= 2 {
+						for _, p := range peersCopy {
+							if p.PeerID != rcv.selfPeerID && p.Row != primaryRow && p.Row != backupRow {
+								peerRequests[p.PeerID] = append(peerRequests[p.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
+								peerInfoMap[p.PeerID] = p
+							}
+						}
+					}
 				}
 			}
 		}
 	}
-	wg.Wait()
-	if pulledAny {
-		time.Sleep(200 * time.Millisecond)
-		rcv.CheckAndLogCompletion(blockID)
+
+	if len(peerRequests) == 0 {
+		return
 	}
+
+	var wg sync.WaitGroup
+	for pid, coords := range peerRequests {
+		pInfo := peerInfoMap[pid]
+		wg.Add(1)
+		go func(peer p2pcommon.PeerInfo, reqCoords []p2pcommon.CellCoord) {
+			defer wg.Done()
+			cellsMap, err := rcv.batchFetchFromPeer(blockID, peer, reqCoords)
+			if err != nil {
+				log.Printf("[StoreNode] Batch fetch from peer %s (row %d, %d cells) failed: %v", peer.PeerID, peer.Row, len(reqCoords), err)
+				return
+			}
+			rcv.processBatchFetchPieces(blockID, peer.Row, peer.PeerID, cellsMap)
+		}(pInfo, coords)
+	}
+	wg.Wait()
+
+	time.Sleep(100 * time.Millisecond)
+	rcv.CheckAndLogCompletion(blockID)
+}
+
+func (rcv *Receiver) batchFetchFromPeer(blockID string, pInfo p2pcommon.PeerInfo, coords []p2pcommon.CellCoord) (map[string][]p2pcommon.CodedPiece, error) {
+	if len(coords) == 0 {
+		return nil, nil
+	}
+
+	pid, err := peer.Decode(pInfo.PeerID)
+	if err != nil || pid == rcv.host.ID() {
+		return nil, fmt.Errorf("invalid peer id or self: %v", err)
+	}
+
+	for _, addrStr := range pInfo.Multiaddrs {
+		maddr, err := multiaddr.NewMultiaddr(addrStr)
+		if err == nil {
+			rcv.host.Peerstore().AddAddr(pid, maddr, 10*time.Minute)
+		}
+	}
+
+	ctxDial, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelDial()
+
+	err = rcv.host.Connect(ctxDial, peer.AddrInfo{ID: pid})
+	if err != nil {
+		return nil, fmt.Errorf("connect failed: %w", err)
+	}
+
+	stream, err := rcv.host.NewStream(ctxDial, pid, p2pcommon.ProtoStoreBatchFetch)
+	if err != nil {
+		return nil, fmt.Errorf("open stream failed: %w", err)
+	}
+	defer stream.Close()
+
+	req := p2pcommon.StoreBatchFetchRequest{
+		BlockID: blockID,
+		Cells:   coords,
+	}
+
+	if err := json.NewEncoder(stream).Encode(req); err != nil {
+		return nil, fmt.Errorf("encode req failed: %w", err)
+	}
+
+	var resp p2pcommon.StoreBatchFetchResponse
+	if err := json.NewDecoder(stream).Decode(&resp); err != nil {
+		return nil, fmt.Errorf("decode resp failed: %w", err)
+	}
+
+	return resp.Cells, nil
+}
+
+func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, senderPeerID string, cellsMap map[string][]p2pcommon.CodedPiece) {
+	if len(cellsMap) == 0 {
+		return
+	}
+
+	storesPerCol := rcv.storesPerCol
+	if storesPerCol <= 0 {
+		storesPerCol = 8
+	}
+
+	for key, pList := range cellsMap {
+		if len(pList) == 0 {
+			continue
+		}
+		var row, col int
+		if _, err := fmt.Sscanf(key, "%d_%d", &row, &col); err != nil {
+			row = pList[0].Row
+			col = pList[0].Col
+		}
+
+		isPrimary := (row % storesPerCol) == rcv.rowIdx
+		isBackup := ((row + 1) % storesPerCol) == rcv.rowIdx
+		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+
+		if isPrimary {
+			rcv.cellMu.Lock()
+			latestPieces := rcv.cache.GetPieces(blockID, row, col)
+			for _, pPayload := range pList {
+				decData, err1 := hex.DecodeString(pPayload.Data)
+				decCoeffs, err2 := hex.DecodeString(pPayload.Coeffs)
+				decProof, err3 := hex.DecodeString(pPayload.Proof)
+				if err1 != nil || err2 != nil || err3 != nil {
+					continue
+				}
+
+				existingCoeffs := make([][]byte, len(latestPieces))
+				for idx, val := range latestPieces {
+					existingCoeffs[idx] = val.Data.Coeffs
+				}
+
+				if engine.IsLinearlyIndependent(existingCoeffs, decCoeffs, rcv.kPiece) {
+					p := cda.ReceivedPiece{
+						Row: row,
+						Col: col,
+						Data: rlnc.PieceData{
+							Data:   decData,
+							Coeffs: decCoeffs,
+						},
+						Proof: cda.OpeningProof(decProof),
+					}
+					rcv.cache.StorePiece(blockID, row, col, p)
+					latestPieces = append(latestPieces, p)
+				}
+			}
+			fullRank := len(latestPieces) >= rcv.kPiece
+			rcv.cellMu.Unlock()
+
+			if fullRank {
+				rcv.broadcastMu.Lock()
+				bCount := rcv.cellBroadcastCount[cellKey]
+				rcv.broadcastMu.Unlock()
+				if bCount < 1 {
+					pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
+					rcv.cellMu.Lock()
+					allPieces := rcv.cache.GetPieces(blockID, row, col)
+					rcv.cellMu.Unlock()
+					if len(allPieces) >= rcv.kPiece {
+						recodedPiece, err := rcv.rm.RecodePiecesWithVerify(allPieces[:rcv.kPiece], pieceCommits, 5)
+						if err == nil {
+							if err := rcv.broadcaster.BroadcastRecodedPiece(blockID, row, col, recodedPiece, pieceCommits); err == nil {
+								rcv.broadcastMu.Lock()
+								rcv.cellBroadcastCount[cellKey]++
+								rcv.broadcastMu.Unlock()
+							}
+						}
+					}
+				}
+			}
+		} else if isBackup {
+			rcv.broadcastMu.Lock()
+			bCount := rcv.cellBroadcastCount[cellKey]
+			rcv.broadcastMu.Unlock()
+
+			rcv.pruneMu.Lock()
+			pruned := rcv.prunedCells[cellKey]
+			rcv.pruneMu.Unlock()
+
+			if bCount >= 1 || pruned {
+				continue
+			}
+
+			rcv.cellMu.Lock()
+			latestPieces := rcv.cache.GetPieces(blockID, row, col)
+			for _, pPayload := range pList {
+				decData, err1 := hex.DecodeString(pPayload.Data)
+				decCoeffs, err2 := hex.DecodeString(pPayload.Coeffs)
+				decProof, err3 := hex.DecodeString(pPayload.Proof)
+				if err1 != nil || err2 != nil || err3 != nil {
+					continue
+				}
+
+				existingCoeffs := make([][]byte, len(latestPieces))
+				for idx, val := range latestPieces {
+					existingCoeffs[idx] = val.Data.Coeffs
+				}
+
+				if engine.IsLinearlyIndependent(existingCoeffs, decCoeffs, rcv.kPiece) {
+					p := cda.ReceivedPiece{
+						Row: row,
+						Col: col,
+						Data: rlnc.PieceData{
+							Data:   decData,
+							Coeffs: decCoeffs,
+						},
+						Proof: cda.OpeningProof(decProof),
+					}
+					rcv.cache.StorePiece(blockID, row, col, p)
+					latestPieces = append(latestPieces, p)
+				}
+			}
+			fullRank := len(latestPieces) >= rcv.kPiece
+			rcv.cellMu.Unlock()
+
+			if fullRank {
+				numBroadcast := rcv.kPiece / 2
+				if numBroadcast < 1 {
+					numBroadcast = 1
+				}
+				pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
+				rcv.cellMu.Lock()
+				allPieces := rcv.cache.GetPieces(blockID, row, col)
+				rcv.cellMu.Unlock()
+				if len(allPieces) >= rcv.kPiece {
+					targetPieces := allPieces[:rcv.kPiece]
+					for i := 0; i < numBroadcast; i++ {
+						recodedPiece, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5)
+						if err != nil {
+							continue
+						}
+						if err := rcv.broadcaster.BroadcastRecodedPiece(blockID, row, col, recodedPiece, pieceCommits); err == nil {
+							rcv.broadcastMu.Lock()
+							rcv.cellBroadcastCount[cellKey]++
+							rcv.broadcastMu.Unlock()
+						}
+					}
+					rcv.cellMu.Lock()
+					rcv.cache.PruneRawPieces(blockID, row, col, rcv.rm)
+					rcv.cellMu.Unlock()
+
+					rcv.pruneMu.Lock()
+					rcv.prunedCells[cellKey] = true
+					rcv.pruneMu.Unlock()
+				}
+			}
+		} else { // Non-custody
+			rcv.nonCustodyLockedMu.Lock()
+			if rcv.nonCustodyLocked[cellKey] {
+				rcv.nonCustodyLockedMu.Unlock()
+				continue
+			}
+			rcv.nonCustodyLockedMu.Unlock()
+
+			rcv.cellMu.Lock()
+			latestPieces := rcv.cache.GetPieces(blockID, row, col)
+			for _, pPayload := range pList {
+				decData, err1 := hex.DecodeString(pPayload.Data)
+				decCoeffs, err2 := hex.DecodeString(pPayload.Coeffs)
+				decProof, err3 := hex.DecodeString(pPayload.Proof)
+				if err1 != nil || err2 != nil || err3 != nil {
+					continue
+				}
+
+				existingCoeffs := make([][]byte, len(latestPieces))
+				for idx, val := range latestPieces {
+					existingCoeffs[idx] = val.Data.Coeffs
+				}
+
+				if engine.IsLinearlyIndependent(existingCoeffs, decCoeffs, rcv.kPiece) {
+					p := cda.ReceivedPiece{
+						Row: row,
+						Col: col,
+						Data: rlnc.PieceData{
+							Data:   decData,
+							Coeffs: decCoeffs,
+						},
+						Proof: cda.OpeningProof(decProof),
+					}
+					rcv.cache.StorePiece(blockID, row, col, p)
+					latestPieces = append(latestPieces, p)
+
+					rcv.contribMu.Lock()
+					if rcv.peerContributions[cellKey] == nil {
+						rcv.peerContributions[cellKey] = make(map[string]int)
+					}
+					rcv.peerContributions[cellKey][senderPeerID]++
+					rcv.contribMu.Unlock()
+				}
+			}
+
+			rcv.contribMu.Lock()
+			numSources := len(rcv.peerContributions[cellKey])
+			rcv.contribMu.Unlock()
+
+			minPieces := 2
+			if rcv.kPiece < minPieces {
+				minPieces = rcv.kPiece
+			}
+			minSources := 2
+			if rcv.kPiece < minSources {
+				minSources = rcv.kPiece
+			}
+
+			var finalPiece *cda.ReceivedPiece
+			pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
+
+			if len(latestPieces) >= minPieces && numSources >= minSources {
+				recoded, err := rcv.rm.RecodePiecesWithVerify(latestPieces[:minPieces], pieceCommits, 5)
+				if err == nil && recoded != nil {
+					finalPiece = recoded
+				} else {
+					finalPiece = &latestPieces[0]
+				}
+			} else if len(latestPieces) >= 1 {
+				if len(latestPieces) >= 2 {
+					recoded, err := rcv.rm.RecodePiecesWithVerify(latestPieces[:2], pieceCommits, 5)
+					if err == nil && recoded != nil {
+						finalPiece = recoded
+					} else {
+						finalPiece = &latestPieces[0]
+					}
+				} else {
+					finalPiece = &latestPieces[0]
+				}
+			}
+
+			if finalPiece != nil {
+				rcv.cache.StoreRecodedPiece(blockID, row, col, *finalPiece)
+				rcv.cache.PruneRawPieces(blockID, row, col, rcv.rm)
+				rcv.cellMu.Unlock()
+
+				rcv.nonCustodyLockedMu.Lock()
+				rcv.nonCustodyLocked[cellKey] = true
+				rcv.nonCustodyLockedMu.Unlock()
+
+				rcv.pruneMu.Lock()
+				rcv.prunedCells[cellKey] = true
+				rcv.pruneMu.Unlock()
+			} else {
+				rcv.cellMu.Unlock()
+			}
+		}
+	}
+}
+
+func (rcv *Receiver) handleBatchFetchStream(stream network.Stream) {
+	defer stream.Close()
+
+	remotePeer := stream.Conn().RemotePeer()
+	if !rcv.allowRequest(remotePeer) {
+		log.Printf("[RateLimiter] Rejected batch fetch request from peer %s (rate limit exceeded)", remotePeer)
+		rcv.respondWithError(stream, "rate limit exceeded")
+		return
+	}
+
+	recordP2PRequest()
+
+	var req p2pcommon.StoreBatchFetchRequest
+	if err := json.NewDecoder(stream).Decode(&req); err != nil {
+		return
+	}
+
+	resp := p2pcommon.StoreBatchFetchResponse{
+		BlockID: req.BlockID,
+		Cells:   make(map[string][]p2pcommon.CodedPiece, len(req.Cells)),
+	}
+
+	colCommitsCache := make(map[int][]string)
+
+	for _, coord := range req.Cells {
+		rcv.cellMu.Lock()
+		localPieces := rcv.cache.GetPieces(req.BlockID, coord.Row, coord.Col)
+		localRecoded := rcv.cache.GetRecodedPieces(req.BlockID, coord.Row, coord.Col)
+		rcv.cellMu.Unlock()
+
+		allPieces := append([]cda.ReceivedPiece(nil), localPieces...)
+		for _, p := range localRecoded {
+			existingCoeffs := make([][]byte, len(allPieces))
+			for idx, val := range allPieces {
+				existingCoeffs[idx] = val.Data.Coeffs
+			}
+			if engine.IsLinearlyIndependent(existingCoeffs, p.Data.Coeffs, rcv.kPiece) {
+				allPieces = append(allPieces, p)
+			}
+		}
+
+		if len(allPieces) == 0 {
+			continue
+		}
+
+		commitsStr, ok := colCommitsCache[coord.Col]
+		if !ok {
+			pieceCommits, _ := rcv.cache.GetAnchoredCommitments(req.BlockID, coord.Col)
+			commitsStr = make([]string, len(pieceCommits))
+			for i, c := range pieceCommits {
+				commitsStr[i] = hex.EncodeToString(c)
+			}
+			colCommitsCache[coord.Col] = commitsStr
+		}
+
+		cellPieces := make([]p2pcommon.CodedPiece, len(allPieces))
+		for i, p := range allPieces {
+			cellPieces[i] = p2pcommon.CodedPiece{
+				Row:          p.Row,
+				Col:          p.Col,
+				Data:         hex.EncodeToString(p.Data.Data),
+				Coeffs:       hex.EncodeToString(p.Data.Coeffs),
+				Proof:        hex.EncodeToString(p.Proof),
+				PieceCommits: commitsStr,
+			}
+		}
+		cellKey := fmt.Sprintf("%d_%d", coord.Row, coord.Col)
+		resp.Cells[cellKey] = cellPieces
+	}
+
+	_ = json.NewEncoder(stream).Encode(resp)
 }
 
 func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {

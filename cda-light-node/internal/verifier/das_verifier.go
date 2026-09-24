@@ -142,14 +142,29 @@ func VectorMulAddFr(dst, src []byte, coeff fr.Element) {
 	var srcEl fr.Element
 	var term fr.Element
 
-	dstEl.SetBytes(dst)
-	srcEl.SetBytes(src)
+	chunkSize := 32
+	for offset := 0; offset < len(dst); offset += chunkSize {
+		end := offset + chunkSize
+		if end > len(dst) {
+			end = len(dst)
+		}
+		dstEl.SetBytes(dst[offset:end])
+		if offset < len(src) {
+			srcEnd := offset + chunkSize
+			if srcEnd > len(src) {
+				srcEnd = len(src)
+			}
+			srcEl.SetBytes(src[offset:srcEnd])
+		} else {
+			srcEl.SetZero()
+		}
 
-	term.Mul(&srcEl, &coeff)
-	dstEl.Add(&dstEl, &term)
+		term.Mul(&srcEl, &coeff)
+		dstEl.Add(&dstEl, &term)
 
-	out := dstEl.Bytes()
-	copy(dst, out[:])
+		out := dstEl.Bytes()
+		copy(dst[offset:end], out[32-(end-offset):])
+	}
 }
 
 // VerifyReconstructedCell performs the direct algebraic combined verification of the cell pieces against the Block Header.
@@ -163,25 +178,22 @@ func (v *DASVerifier) VerifyReconstructedCell(
 		return "", false, fmt.Errorf("not enough pieces to reconstruct: got %d, expected %d", len(pieces), v.k)
 	}
 
-	// 1. Recover fragments
-	rlncPieces := make([]rlnc.PieceData, v.k)
+	// 1. Recover fragments using SolveGaussianFr
+	A_recode := make([][]byte, v.k)
+	recodedProofs := make([][]byte, v.k)
+	workingData := make([][]byte, v.k)
 	for i := 0; i < v.k; i++ {
-		rlncPieces[i] = pieces[i].Data
+		A_recode[i] = pieces[i].Data.Coeffs
+		recodedProofs[i] = pieces[i].Proof
+		workingData[i] = append([]byte(nil), pieces[i].Data.Data...)
 	}
 
-	recoveredFragments, err := v.codec.Decode(rlncPieces)
+	recoveredFragments, err := rlnc.SolveGaussianFr(A_recode, workingData)
 	if err != nil {
 		return "", false, fmt.Errorf("failed to decode fragments using Gaussian elimination: %w", err)
 	}
 
 	// 2. Invert coefficient matrix A
-	A_recode := make([][]byte, v.k)
-	recodedProofs := make([][]byte, v.k)
-	for i := 0; i < v.k; i++ {
-		A_recode[i] = pieces[i].Data.Coeffs
-		recodedProofs[i] = pieces[i].Proof
-	}
-
 	invA, err := InvertMatrixFr(A_recode, v.k)
 	if err != nil {
 		return "", false, fmt.Errorf("failed to invert coefficient matrix: %w", err)
@@ -209,7 +221,8 @@ func (v *DASVerifier) VerifyReconstructedCell(
 	}
 
 	// 5. Combine recovered fragments using global challenge x
-	combinedData := make([]byte, 32)
+	fragSize := len(recoveredFragments[0])
+	combinedData := make([]byte, fragSize)
 	for j := 0; j < v.k; j++ {
 		VectorMulAddFr(combinedData, recoveredFragments[j], xFr[j])
 	}
@@ -226,12 +239,16 @@ func (v *DASVerifier) VerifyReconstructedCell(
 		return "", false, nil
 	}
 
-	// 8. Reconstruct cell string (trim zero-padding from fragments)
-	pieceSize := 64 / v.k
+	// 8. Reconstruct cell string
 	var buf bytes.Buffer
 	for _, frag := range recoveredFragments {
-		if len(frag) >= pieceSize {
-			buf.Write(frag[len(frag)-pieceSize:])
+		if fragSize <= 32 && fragSize > 16 {
+			pieceSize := 64 / v.k
+			if len(frag) >= pieceSize {
+				buf.Write(frag[len(frag)-pieceSize:])
+			} else {
+				buf.Write(frag)
+			}
 		} else {
 			buf.Write(frag)
 		}

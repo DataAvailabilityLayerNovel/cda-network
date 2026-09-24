@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -289,16 +290,48 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 			pieceIdx int
 			piece    *cda.ReceivedPiece
 		}
+
+		piecesByRow := make([][]*cda.ReceivedPiece, n)
+		var encodeErr error
+		var encodeErrOnce sync.Once
+		var encodeWg sync.WaitGroup
+
+		workerLimit := getEnvInt("BOOTSTRAP_ENCODE_WORKERS", runtime.NumCPU())
+		if workerLimit > n {
+			workerLimit = n
+		}
+		if workerLimit <= 0 {
+			workerLimit = 1
+		}
+		encodeSem := make(chan struct{}, workerLimit)
+
+		for r := 0; r < n; r++ {
+			encodeSem <- struct{}{}
+			encodeWg.Add(1)
+			go func(rowIdx int) {
+				defer encodeWg.Done()
+				defer func() { <-encodeSem }()
+
+				codedPieces, err := rcv.encoder.EncodeRowNSeeds(rowIdx, colIdx, columnData, proofs[rowIdx], totalSeeds)
+				if err != nil {
+					encodeErrOnce.Do(func() {
+						encodeErr = fmt.Errorf("async RLNC encoding error for row %d (col %d): %w", rowIdx, colIdx, err)
+					})
+					return
+				}
+				piecesByRow[rowIdx] = codedPieces
+			}(r)
+		}
+		encodeWg.Wait()
+
+		if encodeErr != nil {
+			log.Printf("[Height: %d] %v", height, encodeErr)
+			return
+		}
+
 		var precomputedPieces []precomputedPiece
-
 		for row := 0; row < n; row++ {
-			codedPieces, err := rcv.encoder.EncodeRowNSeeds(row, colIdx, columnData, proofs[row], totalSeeds)
-			if err != nil {
-				log.Printf("[Height: %d] Async RLNC encoding error for row %d (col %d): %v", height, row, colIdx, err)
-				return
-			}
-
-			for pieceIdx, piece := range codedPieces {
+			for pieceIdx, piece := range piecesByRow[row] {
 				precomputedPieces = append(precomputedPieces, precomputedPiece{
 					row:      row,
 					pieceIdx: pieceIdx,
