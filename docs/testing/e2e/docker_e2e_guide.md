@@ -11,7 +11,7 @@ Kịch bản tích hợp đầy đủ luồng đồng thuận thực tế **Come
 1. **Docker Engine**: Phiên bản 24.0+
 2. **Docker Compose**: Plugin v2 (`docker compose version`)
 3. **Go**: Phiên bản 1.23+ (dùng để chạy CometBFT test runner trên host)
-4. **Python 3**: Dùng để chạy bộ sinh cấu hình `scripts/generate_compose.py`
+4. **Python 3**: Dùng để chạy bộ sinh cấu hình [`scripts/generate_compose.py`](file:///home/ubuntu/cda-network/scripts/generate_compose.py) (xem chi tiết tại **[Hướng Dẫn Cấu Hình generate_compose.py](file:///home/ubuntu/cda-network/docs/testing/generate_compose_guide.md)**).
 5. **Cổng mạng khả dụng trên Host**:
    - `8080`, `18080`: Publisher API & P2P
    - `9090`: Prometheus Server

@@ -3,7 +3,7 @@ set -e
 
 # Automatically resolve path and change directory to repository root
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-REPO_ROOT="$( cd "$SCRIPT_DIR/../.." && pwd )"
+REPO_ROOT="$( cd "$SCRIPT_DIR/../../.." && pwd )"
 cd "$REPO_ROOT"
 
 ## Default parameters
@@ -139,7 +139,7 @@ done
 
 echo ""
 echo "[Step 3/5] Running Pipelined 1-Block-Ahead Pre-Compute Benchmark..."
-python3 scripts/test_pipeline_block_timing.py \
+python3 scripts/tests/benchmark/test_pipeline_block_timing.py \
     --publisher http://localhost:8080 \
     --bootstrap http://localhost:9200 \
     --k "$K_VAL" \

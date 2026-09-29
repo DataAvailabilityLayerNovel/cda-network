@@ -34,7 +34,7 @@ docker compose -f docker-compose.json up -d --build
 Chạy bot đẩy dữ liệu event-driven để xuất bản 3 block (bot tự động chờ tín hiệu `BlockReady` từ Publisher/Bootstrap trước khi đẩy block tiếp theo):
 
 ```bash
-python3 scripts/block_publisher_bot.py --interval 0 --k 16 --count 3 --start-height 1
+python3 scripts/bots/block_publisher_bot.py --interval 0 --k 16 --count 3 --start-height 1
 ```
 
 ### Bước 2.5: Cơ Chế Reactive Auto-DAS dựa trên Tín hiệu BlockReady

@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 
 # Ensure we run from repository root
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 os.chdir(REPO_ROOT)
 
 
@@ -242,7 +242,7 @@ def execute_benchmark_scenario(scenario, blocks=3, timeout_per_block=120, dry_ru
 
     # Step 5: Execute benchmark timing
     cell_size = scenario.get("cell_size", 64)
-    timing_script = "scripts/test_pipeline_block_timing.py" if mode == "pipeline" else "scripts/test_sequential_block_timing.py"
+    timing_script = "scripts/tests/benchmark/test_pipeline_block_timing.py" if mode == "pipeline" else "scripts/tests/benchmark/test_sequential_block_timing.py"
     cmd = [
         "python3", timing_script,
         "--publisher", "http://localhost:8080",

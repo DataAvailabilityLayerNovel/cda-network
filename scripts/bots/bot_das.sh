@@ -2,6 +2,8 @@
 # bot_das.sh - Liên tục thực hiện DAS (Light Node Bot)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_ROOT"
 INTERVAL=${1:-5}
 START_HEIGHT=${2:-1}
 
@@ -30,7 +32,7 @@ while true; do
     BLOCK_ID="${BLOCK_PREFIX}-${COUNTER}"
     echo "========================================="
     echo "[DAS Bot] Thực hiện lấy mẫu DAS cho block: $BLOCK_ID"
-    if "$SCRIPT_DIR/das.sh" "$BLOCK_ID" "http://localhost:9401"; then
+    if "$REPO_ROOT/scripts/das.sh" "$BLOCK_ID" "http://localhost:9401"; then
         echo "[DAS Bot] Lấy mẫu $BLOCK_ID thành công! Chuyển sang block tiếp theo sau ${INTERVAL}s."
         COUNTER=$((COUNTER + 1))
     else

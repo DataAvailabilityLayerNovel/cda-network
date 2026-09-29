@@ -35,37 +35,48 @@ Tài liệu mô tả kiến trúc, giao thức truyền thông, thuật toán to
 
 Các kịch bản kiểm thử tích hợp (E2E), khả năng phục hồi lỗi, bảo mật và hướng dẫn đo lường hiệu năng:
 
-- **[Hướng Dẫn Kiểm Thử Toàn Mạng E2E Đa Cột & Đa Tham Số (Full Network E2E Test Guide)](file:///home/ubuntu/cda-network/docs/testing/full_network_e2e_guide.md)**:
-  Hướng dẫn toàn diện chạy kịch bản kiểm thử tích hợp 4 tầng (CometBFT -> Publisher -> Store Nodes -> Light Node Auto-DAS) với tùy biến $K$, $K_{\text{piece}}$, $ActiveCols$, $Blocks$.
-- **[Hướng Dẫn Kiểm Thử Ghi Nhận Hoàn Thành & DAS (Completion & DAS Test Guide)](file:///home/ubuntu/cda-network/docs/testing/completion_test_guide.md)**: 
-  Quy trình kiểm thử trạng thái `IsComplete` lưu trữ custody tại Store Node và ghi nhận log lấy mẫu thành công tại Light Node.
+- **[Hướng Dẫn Cấu Hình Trình Sinh Docker Compose (`generate_compose.py`)](file:///home/ubuntu/cda-network/docs/testing/generate_compose_guide.md)**:
+  Hướng dẫn chi tiết toàn bộ bảng cờ CLI, tối ưu hóa concurrency, quota CPU và tự động sinh topology mạng container hóa.
+- **[Hướng Dẫn Vận Hành Kiểm Thử Docker E2E & Grafana](file:///home/ubuntu/cda-network/docs/testing/e2e/docker_e2e_guide.md)**:
+  Kiểm thử tích hợp khép kín CometBFT -> CDA -> Auto-DAS trên container Docker và giám sát trực quan thời gian thực.
+- **[Hướng Dẫn Kiểm Thử Toàn Mạng Native E2E](file:///home/ubuntu/cda-network/docs/testing/e2e/full_network_e2e_guide.md)**:
+  Kiểm thử toàn mạng với tiến trình nền trực tiếp trên Host với tùy biến $K$, $K_{\text{piece}}$, $ActiveCols$, $Blocks$.
+- **[Hướng Dẫn Đo Lường Hiệu Năng & Độ Trễ Xử Lý Khối (Benchmark Guide)](file:///home/ubuntu/cda-network/docs/testing/benchmark/benchmark_and_latency_guide.md)**:
+  Đo đạc độ trễ xử lý khối (Pipeline 1-block-ahead, tuần tự, ma trận tự động) cho khối 2MB ($K=64$).
+- **[Hướng Dẫn Kịch Bản Chịu Lỗi & Vòng Đời Node (Resilience Guide)](file:///home/ubuntu/cda-network/docs/testing/resilience/advanced_fault_tolerance_and_lifecycle_guide.md)**:
+  Kiểm thử phục hồi dữ liệu khi mất 50% ma trận (Kịch bản 3), vòng đời Store Node (Join/Leave/Crash), và Single-seed discovery.
 
 ---
 
 ## 3. 🚀 Khởi Chạy Nhanh Các Kịch Bản Kiểm Thử (Quick Start Test Suites)
 
+Xem mục lục hướng dẫn đầy đủ tại: **[Trung Tâm Tài Liệu Kiểm Thử (Testing Hub)](file:///home/ubuntu/cda-network/docs/testing/README.md)**
+
 ```bash
-# 1. Kiểm thử Khám phá Ma trận Đơn Seed cho Light Node (32 Cột, 1024 Ô EDS)
-bash scripts/tests/test_light_single_seed_das.sh
+# 1. Kiểm thử E2E Container hóa với Docker & Grafana (CometBFT -> CDA -> Auto-DAS)
+./scripts/tests/e2e/test_docker_e2e.sh -k 8 -p 4 -c 1 -s 4 -l 1 -b 3
 
-# 2. Kiểm thử Vòng đời Tham gia, Rời mạng & Sập nguồn đột ngột Store Node
-bash scripts/tests/test_store_join_leave_lifecycle.sh
+# 2. Kiểm thử E2E Toàn Mạng Native (tiến trình nền trên Host)
+./scripts/tests/e2e/test_full_network_e2e.sh -k 8 -p 4 -b 3
 
-# 3. Kiểm thử Tích hợp Cụm Docker Compose E2E
-bash scripts/tests/run_docker_test.sh
+# 3. Đo lường hiệu năng xử lý khối (Benchmark Timing)
+python3 scripts/tests/benchmark/test_pipeline_block_timing.py --k 64 --count 3 --cell-size 512
 
-# 4. Kiểm thử Phục Hồi Dữ Liệu Khối Mất Toàn Bộ Cột Mạng (Kịch bản 3)
-bash scripts/tests/test_scenario_3.sh
+# 4. Kiểm thử phục hồi dữ liệu phân tán (Mất cột mạng & 50% ma trận - Kịch bản 3)
+bash scripts/tests/resilience/test_scenario_3.sh
 
-# 5. Kiểm thử E2E Toàn Mạng (CometBFT Consensus -> Publisher -> Store Custody -> Light Node Auto-DAS):
-# Chạy mặc định (K=8, K_piece=4, Blocks=3, Txs=16):
-./scripts/tests/test_full_network_e2e.sh
-# Hoặc truyền cờ tùy chỉnh:
-./scripts/tests/test_full_network_e2e.sh -k 16 -b 5
-./scripts/tests/test_full_network_e2e.sh --help
+# 5. Kiểm thử vòng đời Store Node (Dynamic Join, Graceful Leave & Crash Cleanup)
+bash scripts/tests/resilience/test_store_join_leave_lifecycle.sh
 
-# 6. Tiện ích xuất bản và lấy mẫu thủ công:
-# ./scripts/publish.sh manual-block-1 http://localhost:8080
-# ./scripts/das.sh manual-block-1 http://localhost:8499
+# 6. Kiểm thử luồng giao dịch đồng thuận CometBFT & CDA Header
+bash scripts/tests/resilience/test_consensus_tx_flow.sh
+
+# 7. Kiểm thử khám phá ma trận đơn seed cho Light Node (32 Cột, 1024 Ô EDS)
+bash scripts/tests/resilience/test_light_single_seed_das.sh
+
+# 8. Tiện ích xuất bản và lấy mẫu thủ công:
+./scripts/publish.sh manual-block-1 http://localhost:8080 8 64
+./scripts/das.sh manual-block-1 http://localhost:9401
 ```
+
 
