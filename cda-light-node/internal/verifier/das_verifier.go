@@ -97,16 +97,19 @@ func InvertMatrixFr(matrix [][]byte, k int) ([][]fr.Element, error) {
 }
 
 // CombineProofsFr performs a homomorphic linear combination of G1 proofs using general fr.Element coefficients.
+// Tối ưu hóa bằng Jacobian Accumulator (G1Jac) và AddMixed, loại bỏ hoàn toàn các phép nghịch đảo modulo trong vòng lặp.
 func CombineProofsFr(proofs [][]byte, coeffs []fr.Element) ([]byte, error) {
-	if len(proofs) == 0 {
+	n := len(proofs)
+	if n == 0 {
 		return nil, fmt.Errorf("proofs cannot be empty")
 	}
-	if len(proofs) != len(coeffs) {
+	if n != len(coeffs) {
 		return nil, fmt.Errorf("coeffs length does not match proofs length")
 	}
 
-	var combinedH bls12381.G1Affine
+	var accJac bls12381.G1Jac
 	var combinedValue fr.Element
+	bInt := new(big.Int)
 
 	for i, proofBytes := range proofs {
 		var tempProof gnarkkzg.OpeningProof
@@ -114,14 +117,27 @@ func CombineProofsFr(proofs [][]byte, coeffs []fr.Element) ([]byte, error) {
 			return nil, fmt.Errorf("failed to read proof %d: %w", i, err)
 		}
 
-		var scaledH bls12381.G1Affine
-		scaledH.ScalarMultiplication(&tempProof.H, coeffs[i].BigInt(new(big.Int)))
-		combinedH.Add(&combinedH, &scaledH)
+		if coeffs[i].IsZero() {
+			continue
+		}
 
 		var scaledValue fr.Element
 		scaledValue.Mul(&tempProof.ClaimedValue, &coeffs[i])
 		combinedValue.Add(&combinedValue, &scaledValue)
+
+		if coeffs[i].IsOne() {
+			accJac.AddMixed(&tempProof.H)
+			continue
+		}
+
+		var ptJac, scaledJac bls12381.G1Jac
+		ptJac.FromAffine(&tempProof.H)
+		scaledJac.ScalarMultiplication(&ptJac, coeffs[i].BigInt(bInt))
+		accJac.AddAssign(&scaledJac)
 	}
+
+	var combinedH bls12381.G1Affine
+	combinedH.FromJacobian(&accJac)
 
 	combinedProof := gnarkkzg.OpeningProof{
 		H:            combinedH,

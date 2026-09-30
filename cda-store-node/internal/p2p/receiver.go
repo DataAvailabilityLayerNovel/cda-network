@@ -578,7 +578,7 @@ func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []stri
 			}()
 
 			// Grace period to allow GossipSub dissemination and Batch Verify to complete naturally
-			graceSec := getEnvInt("STORE_FALLBACK_GRACE_SEC", 3)
+			graceSec := getEnvInt("STORE_FALLBACK_GRACE_SEC", 0.5)
 			time.Sleep(time.Duration(graceSec) * time.Second)
 			if rcv.IsComplete(bID) {
 				return

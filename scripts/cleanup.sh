@@ -9,6 +9,10 @@ pkill -9 -f "bin/publisher|bin/bootstrap|bin/store|bin/light" 2>/dev/null || tru
 if command -v docker >/dev/null 2>&1; then
     echo "[*] Stopping docker compose containers and removing volumes..."
     
+    if [ -f "docker-compose-benchmark.yml" ]; then
+        docker compose -f docker-compose-benchmark.yml down -v -t 1 --remove-orphans 2>/dev/null || true
+    fi
+    
     # Dùng docker compose down với -t 1 (tắt nhanh sau 1 giây thay vì đợi 10 giây mặc định)
     if [ -f "docker-compose.json" ]; then
         docker compose -f docker-compose.json down -v -t 1 --remove-orphans 2>/dev/null || true

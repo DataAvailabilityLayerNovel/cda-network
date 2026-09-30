@@ -1,5 +1,9 @@
 # Báo Cáo Kỹ Thuật: Vấn Đề Định Tuyến & Phát Tán Khi Có Đa Store Node Trên Cùng Vị Trí (Multi-Replica Store Nodes)
 
+> [!WARNING]
+> **Trạng thái: CHƯA XỬ LÝ (Pending / Open)**  
+> **Ghi chú:** Vấn đề định tuyến và phát tán khi có đa Store Node trên cùng vị trí (`multi_store_replica_routing_issue.md`) hiện đang mở và chưa được triển khai giải pháp vào codebase.
+
 **Ngày lập:** 2026-09-15  
 **Phạm vi:** `cda-bootstrap-node`, `cda-store-node`, `cda-light-node`, `cda-p2p`  
 **Mức độ ảnh hưởng:** **Cao (High)** đối với kịch bản mở rộng mạng lưới có nhiều hơn 1 node trên một tọa độ hàng (`Row`).
