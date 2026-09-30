@@ -45,6 +45,11 @@ func main() {
 		log.Fatalf("Failed to initialize SRS: %v", err)
 	}
 	kzg := cda.NewGnarkKZG(*srs)
+	if err := kzg.SetDomainSize(2 * cfg.K); err != nil {
+		log.Printf("[Store Node] Warning: SetDomainSize(%d): %v", 2*cfg.K, err)
+	} else {
+		log.Printf("[Store Node] KZG evaluation domain set to roots of unity (size %d)", 2*cfg.K)
+	}
 
 	// 2. Initialize Custody Cache Storage
 	cache := storage.NewCustodyStore(cfg.Port)

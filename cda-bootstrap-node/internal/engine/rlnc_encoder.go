@@ -22,11 +22,8 @@ func NewRLNCEncoder(k int, kzg cda.KZGProvider) *RLNCEncoder {
 	}
 }
 
-// ComputeZPowers computes [z^0, z^1, ..., z^{n-1}] where z = rowIdx in Fr.
-func ComputeZPowers(rowIdx, n int) []fr.Element {
-	var z fr.Element
-	z.SetInterface(int64(rowIdx))
-
+// ComputeZPowersFromPoint computes [z^0, z^1, ..., z^{n-1}] for a given evaluation point z in Fr.
+func ComputeZPowersFromPoint(z fr.Element, n int) []fr.Element {
 	zPowers := make([]fr.Element, n)
 	if n > 0 {
 		zPowers[0].SetOne()
@@ -35,6 +32,13 @@ func ComputeZPowers(rowIdx, n int) []fr.Element {
 		}
 	}
 	return zPowers
+}
+
+// ComputeZPowers computes [z^0, z^1, ..., z^{n-1}] where z = rowIdx in Fr.
+func ComputeZPowers(rowIdx, n int) []fr.Element {
+	var z fr.Element
+	z.SetInterface(int64(rowIdx))
+	return ComputeZPowersFromPoint(z, n)
 }
 
 // EvaluatePieceColumn evaluates the polynomial representing a piece-column at a given row index.
@@ -96,7 +100,8 @@ func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pie
 
 	// 1. Precompute zPowers once for the entire row and evaluate all k piece columns
 	n := len(columnData)
-	zPowers := ComputeZPowers(row, n)
+	z := e.kzg.GetEvaluationPoint(row)
+	zPowers := ComputeZPowersFromPoint(z, n)
 	frSize := len(columnData[0]) / e.k
 	fragments := make([][]byte, e.k)
 	for j := 0; j < e.k; j++ {

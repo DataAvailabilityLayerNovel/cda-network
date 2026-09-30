@@ -143,6 +143,12 @@ func main() {
 		log.Fatalf("Failed to initialize SRS: %v", err)
 	}
 	kzg := cda.NewGnarkKZG(*srs)
+	gridRows := 2 * cfg.K
+	if err := kzg.InitFK20(gridRows); err != nil {
+		log.Printf("[Bootstrap Node] Warning: FK20 init with gridRows=%d: %v", gridRows, err)
+	} else {
+		log.Printf("[Bootstrap Node] FK20 Fast Proof Engine initialized for domain size %d", gridRows)
+	}
 
 	// 2. Initialize storage cache
 	cache := storage.NewLocalCache()

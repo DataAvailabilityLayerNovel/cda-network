@@ -578,8 +578,8 @@ func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []stri
 			}()
 
 			// Grace period to allow GossipSub dissemination and Batch Verify to complete naturally
-			graceSec := getEnvInt("STORE_FALLBACK_GRACE_SEC", 0.5)
-			time.Sleep(time.Duration(graceSec) * time.Second)
+			graceMs := getEnvInt("STORE_FALLBACK_GRACE_MS", 500)
+			time.Sleep(time.Duration(graceMs) * time.Millisecond)
 			if rcv.IsComplete(bID) {
 				return
 			}
@@ -2643,7 +2643,7 @@ func (rcv *Receiver) doCheckAndLogCompletion(blockID string) {
 			go func(bID string, h int, col int, row int, stores int) {
 				for attempt := 1; attempt <= 5; attempt++ {
 					_ = rcv.broadcaster.BroadcastStoreReady(bID, h, col, row, stores)
-					time.Sleep(2 * time.Second)
+					time.Sleep(0.5 * time.Second)
 				}
 			}(blockID, height, rcv.colIdx, rcv.rowIdx, rcv.storesPerCol)
 		}

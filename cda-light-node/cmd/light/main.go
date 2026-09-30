@@ -41,6 +41,11 @@ func main() {
 		log.Fatalf("Failed to initialize SRS: %v", err)
 	}
 	kzg := cda.NewGnarkKZG(*srs)
+	if err := kzg.SetDomainSize(2 * cfg.K); err != nil {
+		log.Printf("[Light Node] Warning: SetDomainSize(%d): %v", 2*cfg.K, err)
+	} else {
+		log.Printf("[Light Node] KZG evaluation domain set to roots of unity (size %d)", 2*cfg.K)
+	}
 
 	// 2. Initialize Verifier
 	dasVerifier := verifier.NewDASVerifier(cfg.KPiece, kzg)
