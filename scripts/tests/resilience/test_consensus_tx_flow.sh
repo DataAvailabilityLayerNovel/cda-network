@@ -9,14 +9,20 @@ echo "==========================================================================
 echo "    E2E TEST: COMETBFT CONSENSUS TRANSACTION FLOW & CDA HEADER VERIFY    "
 echo "=========================================================================="
 
+# 0. Clean up any existing Docker containers and stale CDA processes
+echo "[Step 0/5] Cleaning up existing containers and processes..."
+bash scripts/cleanup.sh 2>/dev/null || true
+
 # 1. Build Publisher Binary
 echo "[Step 1/5] Building CDA Publisher Node..."
+mkdir -p bin
 go build -o bin/publisher ./cda-publisher-node/cmd/publisher/main.go
 echo "✅ Publisher Node binary built at bin/publisher"
 
 # 2. Start Live Publisher Node on Port 8888
 echo "[Step 2/5] Starting live Publisher Node on port 8888..."
 rm -f publisher_tx_test.log
+export PUBLISHER_MAX_IN_FLIGHT=10
 ./bin/publisher -port 8888 -k 32 -k-piece 32 > publisher_tx_test.log 2>&1 &
 PUB_PID=$!
 

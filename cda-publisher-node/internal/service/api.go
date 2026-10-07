@@ -47,6 +47,13 @@ type APIService struct {
 }
 
 type HeaderPayload struct {
+	ChainID         string    `json:"chain_id,omitempty"`
+	Height          int64     `json:"height,omitempty"`
+	Time            time.Time `json:"time,omitempty"`
+	DataHash        string    `json:"data_hash,omitempty"`
+	AppHash         string    `json:"app_hash,omitempty"`
+	ProposerAddress string    `json:"proposer_address,omitempty"`
+
 	CommitsRoot string   `json:"commits_root,omitempty"`
 	ColumnComm  []string `json:"column_comm,omitempty"`
 	Coeffs      string   `json:"coeffs,omitempty"`
@@ -319,6 +326,11 @@ func VerifyCDAHeader(computedHeader *engine.BlockHeader, bftHeader *HeaderPayloa
 		return fmt.Errorf("nil computed header")
 	}
 
+	// 0. Verify Height if provided in bftHeader
+	if bftHeader.Height > 0 && computedHeader.Height > 0 && bftHeader.Height != computedHeader.Height {
+		return fmt.Errorf("mismatched Height: computed=%d, bft=%d", computedHeader.Height, bftHeader.Height)
+	}
+
 	// 1. Verify CommitsRoot
 	if bftHeader.CommitsRoot != "" {
 		if !strings.EqualFold(computedHeader.CommitsRoot, bftHeader.CommitsRoot) {
@@ -449,9 +461,9 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	height := int(req.Height)
+	height := req.Height
 	if height <= 0 {
-		height = p2pcommon.ParseHeightFromBlockID(header.BlockID)
+		height = int64(p2pcommon.ParseHeightFromBlockID(header.BlockID))
 	}
 	header.Height = height
 
@@ -461,6 +473,21 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[Height: %d] [Publisher] Header verification FAILED for BlockID %s: %v", height, req.BlockID, err)
 			http.Error(w, "Header verification failed: "+err.Error(), http.StatusUnprocessableEntity)
 			return
+		}
+		if req.Header.ChainID != "" {
+			header.ChainID = req.Header.ChainID
+		}
+		if !req.Header.Time.IsZero() {
+			header.Time = req.Header.Time
+		}
+		if req.Header.DataHash != "" {
+			header.DataHash = req.Header.DataHash
+		}
+		if req.Header.AppHash != "" {
+			header.AppHash = req.Header.AppHash
+		}
+		if req.Header.ProposerAddress != "" {
+			header.ProposerAddress = req.Header.ProposerAddress
 		}
 		log.Printf("[Height: %d] [Publisher] SUCCESS: Header verification passed for BlockID %s against BFT consensus!", height, req.BlockID)
 	}

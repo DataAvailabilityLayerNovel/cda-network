@@ -12,13 +12,7 @@ import (
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 )
 
-type BlockHeader struct {
-	BlockID     string   `json:"block_id"`
-	Height      int      `json:"height,omitempty"`
-	CommitsRoot string   `json:"commits_root"`
-	ColumnComm  [][]byte `json:"column_comm"`
-	Coeffs      []byte   `json:"coeffs"` // Global Fiat-Shamir challenge vector (k * 32 bytes)
-}
+type BlockHeader = p2pcommon.BlockHeader
 
 // VerifyPublisherData performs all verifications specified in plan.md Section II.2 Step 1.
 func VerifyPublisherData(

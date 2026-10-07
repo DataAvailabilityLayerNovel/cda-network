@@ -59,13 +59,7 @@ type APIService struct {
 	dasTriggered   map[string]bool
 }
 
-type BlockHeader struct {
-	BlockID     string   `json:"block_id"`
-	Height      int      `json:"height,omitempty"`
-	CommitsRoot string   `json:"commits_root"`
-	ColumnComm  [][]byte `json:"column_comm"`
-	Coeffs      []byte   `json:"coeffs"`
-}
+type BlockHeader = p2pcommon.BlockHeader
 
 type SampleResult struct {
 	Row      int    `json:"row"`
@@ -119,7 +113,7 @@ func (s *APIService) CacheHeader(header *BlockHeader) {
 
 	height := header.Height
 	if height <= 0 {
-		height = p2pcommon.ParseHeightFromBlockID(header.BlockID)
+		height = int64(p2pcommon.ParseHeightFromBlockID(header.BlockID))
 	}
 	log.Printf("[Height: %d] [LightNode] Cached block header for block %s", height, header.BlockID)
 
@@ -200,7 +194,7 @@ func (s *APIService) TriggerAutoDAS(header *BlockHeader, numRandomSamples int) {
 	blockID := header.BlockID
 	height := header.Height
 	if height <= 0 {
-		height = p2pcommon.ParseHeightFromBlockID(blockID)
+		height = int64(p2pcommon.ParseHeightFromBlockID(blockID))
 	}
 	n := len(header.ColumnComm)
 	if n == 0 {
@@ -938,7 +932,7 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 
 	height := p2pcommon.ParseHeightFromBlockID(blockID)
 	if height <= 0 && header != nil && header.Height > 0 {
-		height = header.Height
+		height = int(header.Height)
 	}
 	if p2pcommon.IsDebug() {
 		log.Printf("[DAS] [Height: %d] Cell [%d, %d] algebraic verification succeeded! Reconstructed cell data (hex): %x", height, row, col, recoveredCell)

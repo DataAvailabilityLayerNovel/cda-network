@@ -3,7 +3,7 @@
   "k": 64,
   "k_piece": 8,
   "active_cols": 1,
-  "num_cols": 16,
+  "num_cols": 8,
   "bootstrap_peers": {
     "0": "/dns4/bootstrap-0/tcp/19200"
   }

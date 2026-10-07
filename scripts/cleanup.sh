@@ -3,7 +3,7 @@
 
 # 1. Stop native background test processes (if running)
 echo "[*] Terminating native CDA node processes..."
-pkill -9 -f "bin/publisher|bin/bootstrap|bin/store|bin/light" 2>/dev/null || true
+pkill -9 -f "bin/publisher|bin/bootstrap|bin/store|bin/light|bin/cometbft" 2>/dev/null || true
 
 # 2. Stop docker compose containers (if docker is available)
 if command -v docker >/dev/null 2>&1; then
@@ -32,10 +32,10 @@ fi
 # 3. Clean up local databases, logs, identity keys, and build artifacts
 echo "[*] Cleaning up local data directories, databases, logs, and store keys..."
 if sudo -n true 2>/dev/null; then
-    sudo rm -rf data/store_* data/light_* data/publisher data/bootstrap_*
+    sudo rm -rf data/store_* data/light_* data/publisher data/bootstrap_* data/cometbft
 else
-    rm -rf data/store_* data/light_* data/publisher data/bootstrap_* 2>/dev/null || \
-    docker run --rm -v "$(pwd):/work" -w /work alpine rm -rf data/store_* data/light_* data/publisher data/bootstrap_* 2>/dev/null || true
+    rm -rf data/store_* data/light_* data/publisher data/bootstrap_* data/cometbft 2>/dev/null || \
+    docker run --rm -v "$(pwd):/work" -w /work alpine rm -rf data/store_* data/light_* data/publisher data/bootstrap_* data/cometbft 2>/dev/null || true
 fi
 rm -f publisher.log light*.log bootstrap*.log store*.log data/completion.log
 rm -f store_*.key *.key

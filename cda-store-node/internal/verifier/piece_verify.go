@@ -7,16 +7,11 @@ import (
 	"fmt"
 	"net/http"
 
+	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 )
 
-type BlockHeader struct {
-	BlockID     string   `json:"block_id"`
-	Height      int      `json:"height,omitempty"`
-	CommitsRoot string   `json:"commits_root"`
-	ColumnComm  [][]byte `json:"column_comm"`
-	Coeffs      []byte   `json:"coeffs"`
-}
+type BlockHeader = p2pcommon.BlockHeader
 
 // FetchBlockHeader queries the publisher for a block header
 func FetchBlockHeader(publisherAddr, blockID string) (*BlockHeader, error) {
