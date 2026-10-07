@@ -118,8 +118,9 @@ type Receiver struct {
 	numWorkers  int
 
 	// Gossip batch processing
-	gossipQueue     chan p2pcommon.SeedCellRequest
-	gossipBatchStop chan struct{}
+	gossipQueue       chan p2pcommon.SeedCellRequest
+	binaryGossipQueue chan *p2pcommon.BinaryGossipPiece
+	gossipBatchStop   chan struct{}
 
 	// Cooldown / Grace period for active pulls
 	pullMu       sync.Mutex
@@ -222,7 +223,8 @@ func NewReceiver(
 		numWorkers:        nWorkers,
 		pendingPulls:        make(map[string]bool),
 		activeFallbacks:     make(map[string]bool),
-		gossipQueue:         make(chan p2pcommon.SeedCellRequest, 4096),
+		gossipQueue:         make(chan p2pcommon.SeedCellRequest, getEnvInt("STORE_GOSSIP_QUEUE_CAP", 16384)),
+		binaryGossipQueue:   make(chan *p2pcommon.BinaryGossipPiece, getEnvInt("STORE_GOSSIP_QUEUE_CAP", 16384)),
 		gossipBatchStop:     make(chan struct{}),
 		completionCheckChan: make(chan string, 1024),
 		disseminationSem:    make(chan struct{}, getEnvInt("STORE_DISSEMINATION_SEM", 16)),
@@ -417,18 +419,63 @@ func (rcv *Receiver) workerLoop(ctx context.Context, ch chan func()) {
 	}
 }
 
-// enqueueBinaryGossipPiece converts a compact binary gossip piece to a SeedCellRequest for batch verification
-func (rcv *Receiver) enqueueBinaryGossipPiece(bgp *p2pcommon.BinaryGossipPiece) {
-	req := p2pcommon.SeedCellRequest{
-		BlockID:      bgp.BlockID,
-		Row:          int(bgp.Row),
-		Col:          int(bgp.Col),
-		Data:         hex.EncodeToString(bgp.Data),
-		Coeffs:       hex.EncodeToString(bgp.Coeffs),
-		Proof:        hex.EncodeToString(bgp.Proof),
-		SenderPeerID: bgp.SenderPeerID,
+// shouldDropGossipPiece checks if an incoming piece is for a block that is already complete,
+// or for a cell that is already pruned or non-custody locked.
+func (rcv *Receiver) shouldDropGossipPiece(blockID string, row, col int) bool {
+	isPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
+	rcv.completedMu.Lock()
+	if rcv.completedBlocks != nil && rcv.completedBlocks[blockID] {
+		rcv.completedMu.Unlock()
+		if !isPrimary || rcv.cache.GetPieceCount(blockID, row, col) >= rcv.kPiece {
+			return true
+		}
+	} else {
+		rcv.completedMu.Unlock()
 	}
-	rcv.enqueueGossipPiece(req)
+
+	cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+
+	rcv.pruneMu.Lock()
+	pruned := rcv.prunedCells[cellKey]
+	rcv.pruneMu.Unlock()
+	if pruned {
+		return true
+	}
+
+	isPrimaryEarly := (row % rcv.storesPerCol) == rcv.rowIdx
+	isBackupEarly := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+	if !isPrimaryEarly && !isBackupEarly {
+		rcv.nonCustodyLockedMu.Lock()
+		locked := rcv.nonCustodyLocked[cellKey]
+		rcv.nonCustodyLockedMu.Unlock()
+		if locked {
+			return true
+		}
+	}
+	return false
+}
+
+// enqueueBinaryGossipPiece enqueues a compact binary gossip piece directly to binaryGossipQueue
+func (rcv *Receiver) enqueueBinaryGossipPiece(bgp *p2pcommon.BinaryGossipPiece) {
+	recordGossipMessage()
+	select {
+	case rcv.binaryGossipQueue <- bgp:
+	default:
+		// Queue full fallback
+		req := p2pcommon.SeedCellRequest{
+			BlockID:      bgp.BlockID,
+			Row:          int(bgp.Row),
+			Col:          int(bgp.Col),
+			Data:         hex.EncodeToString(bgp.Data),
+			Coeffs:       hex.EncodeToString(bgp.Coeffs),
+			Proof:        hex.EncodeToString(bgp.Proof),
+			SenderPeerID: bgp.SenderPeerID,
+		}
+		cellKey := fmt.Sprintf("%s_%d_%d", req.BlockID, req.Row, req.Col)
+		rcv.dispatchTask(cellKey, func() {
+			rcv.processPiece(req.BlockID, req.Row, req.Col, req.Data, req.Coeffs, req.Proof, req.PieceCommits, req.SenderPeerID, true)
+		})
+	}
 }
 
 // enqueueGossipPiece queues an incoming GossipSub seed cell for batch verification.
@@ -451,6 +498,9 @@ func (rcv *Receiver) processGossipMessage(data []byte) {
 	if len(data) > 0 && data[0] == p2pcommon.BinaryGossipMagic {
 		bgp, err := p2pcommon.DecodeBinaryGossipPiece(data)
 		if err == nil && bgp.BlockID != "" {
+			if rcv.shouldDropGossipPiece(bgp.BlockID, int(bgp.Row), int(bgp.Col)) {
+				return
+			}
 			rcv.enqueueBinaryGossipPiece(bgp)
 		}
 		return
@@ -459,12 +509,16 @@ func (rcv *Receiver) processGossipMessage(data []byte) {
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return
 	}
+	if rcv.shouldDropGossipPiece(payload.BlockID, payload.Row, payload.Col) {
+		return
+	}
 	rcv.enqueueGossipPiece(payload)
 }
 
 func (rcv *Receiver) startGossipBatchWorkers(ctx context.Context, numWorkers int) {
 	for i := 0; i < numWorkers; i++ {
 		go rcv.gossipBatchWorkerLoop(ctx)
+		go rcv.binaryGossipBatchWorkerLoop(ctx)
 	}
 }
 
@@ -496,6 +550,142 @@ func (rcv *Receiver) gossipBatchWorkerLoop(ctx context.Context) {
 				batch = make([]p2pcommon.SeedCellRequest, 0, batchSize)
 			}
 		}
+	}
+}
+
+func (rcv *Receiver) binaryGossipBatchWorkerLoop(ctx context.Context) {
+	batchSize := getEnvInt("STORE_GOSSIP_BATCH_SIZE", 48)
+	batch := make([]*p2pcommon.BinaryGossipPiece, 0, batchSize)
+	tickerMs := getEnvInt("STORE_GOSSIP_BATCH_TICKER_MS", 10)
+	ticker := time.NewTicker(time.Duration(tickerMs) * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-rcv.gossipBatchStop:
+			return
+		case item, ok := <-rcv.binaryGossipQueue:
+			if !ok {
+				return
+			}
+			batch = append(batch, item)
+			if len(batch) >= batchSize {
+				rcv.verifyAndProcessBinaryGossipBatch(batch)
+				batch = make([]*p2pcommon.BinaryGossipPiece, 0, batchSize)
+			}
+		case <-ticker.C:
+			if len(batch) > 0 {
+				rcv.verifyAndProcessBinaryGossipBatch(batch)
+				batch = make([]*p2pcommon.BinaryGossipPiece, 0, batchSize)
+			}
+		}
+	}
+}
+
+func (rcv *Receiver) verifyAndProcessBinaryGossipBatch(items []*p2pcommon.BinaryGossipPiece) {
+	if len(items) == 0 {
+		return
+	}
+
+	type candidateItem struct {
+		blockID      string
+		row, col     int
+		piece        cda.ReceivedPiece
+		coeffs       []byte
+		senderPeerID string
+		combinedComm []byte
+	}
+
+	var candidates []candidateItem
+	var batchItems []cda.BatchVerifyItem
+	var unanchored []*p2pcommon.BinaryGossipPiece
+
+	for _, s := range items {
+		row := int(s.Row)
+		col := int(s.Col)
+		cellKey := fmt.Sprintf("%s_%d_%d", s.BlockID, row, col)
+
+		if rcv.shouldDropGossipPiece(s.BlockID, row, col) {
+			continue
+		}
+
+		rcv.pruneMu.Lock()
+		pruned := rcv.prunedCells[cellKey]
+		rcv.pruneMu.Unlock()
+		if pruned {
+			continue
+		}
+
+		pieceCommits, exists := rcv.cache.GetAnchoredCommitments(s.BlockID, col)
+		if !exists || len(pieceCommits) < rcv.kPiece {
+			unanchored = append(unanchored, s)
+			continue
+		}
+
+		pieceCommitsTyped := make([]cda.PieceCommitment, rcv.kPiece)
+		for i := 0; i < rcv.kPiece; i++ {
+			pieceCommitsTyped[i] = cda.PieceCommitment(pieceCommits[i])
+		}
+
+		combinedCommit, err := rcv.kzg.Combine(pieceCommitsTyped, s.Coeffs)
+		if err != nil {
+			continue
+		}
+
+		piece := cda.ReceivedPiece{
+			Row: row,
+			Col: col,
+			Data: rlnc.PieceData{
+				Data:   s.Data,
+				Coeffs: s.Coeffs,
+			},
+			Proof: cda.OpeningProof(s.Proof),
+		}
+
+		batchItems = append(batchItems, cda.BatchVerifyItem{
+			Commitment: combinedCommit,
+			Row:        row,
+			Data:       s.Data,
+			Proof:      cda.OpeningProof(s.Proof),
+		})
+
+		candidates = append(candidates, candidateItem{
+			blockID:      s.BlockID,
+			row:          row,
+			col:          col,
+			piece:        piece,
+			coeffs:       s.Coeffs,
+			senderPeerID: s.SenderPeerID,
+			combinedComm: combinedCommit,
+		})
+	}
+
+	if len(batchItems) > 0 {
+		if rcv.kzg.BatchVerify(batchItems) {
+			for _, item := range candidates {
+				_ = rcv.processVerifiedPiece(item.blockID, item.row, item.col, item.piece, item.coeffs, item.senderPeerID)
+			}
+		} else {
+			for _, item := range candidates {
+				if rcv.kzg.Verify(item.combinedComm, item.row, item.piece.Data.Data, item.piece.Proof) {
+					_ = rcv.processVerifiedPiece(item.blockID, item.row, item.col, item.piece, item.coeffs, item.senderPeerID)
+				}
+			}
+		}
+	}
+
+	if len(unanchored) > 0 {
+		go func(retryItems []*p2pcommon.BinaryGossipPiece) {
+			time.Sleep(15 * time.Millisecond)
+			for _, it := range retryItems {
+				select {
+				case rcv.binaryGossipQueue <- it:
+				default:
+				}
+			}
+		}(unanchored)
 	}
 }
 
@@ -578,17 +768,18 @@ func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []stri
 			}()
 
 			// Grace period to allow GossipSub dissemination and Batch Verify to complete naturally
-			graceMs := getEnvInt("STORE_FALLBACK_GRACE_MS", 500)
+			graceMs := getEnvInt("STORE_FALLBACK_GRACE_MS", 600)
 			time.Sleep(time.Duration(graceMs) * time.Millisecond)
 			if rcv.IsComplete(bID) {
 				return
 			}
+			retryIntervalMs := getEnvInt("STORE_FALLBACK_RETRY_INTERVAL_MS", 300)
 			for attempt := 1; attempt <= 4; attempt++ {
 				if rcv.IsComplete(bID) {
 					return
 				}
 				rcv.fallbackPullMissingCells(bID, attempt)
-				time.Sleep(1500 * time.Millisecond)
+				time.Sleep(time.Duration(retryIntervalMs) * time.Millisecond)
 			}
 		}(blockID)
 	} else {
@@ -727,15 +918,17 @@ func (rcv *Receiver) verifyAndProcessBinaryBatch(payload *p2pcommon.BinaryBatchS
 		col := int(s.Col)
 		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
 
-		rcv.completedMu.Lock()
-		if rcv.completedBlocks != nil && rcv.completedBlocks[blockID] {
-			rcv.completedMu.Unlock()
-			continue
-		}
-		rcv.completedMu.Unlock()
-
 		isPrimaryEarly := (row % rcv.storesPerCol) == rcv.rowIdx
 		isBackupEarly := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+
+		rcv.completedMu.Lock()
+		isBlockCompleted := rcv.completedBlocks != nil && rcv.completedBlocks[blockID]
+		rcv.completedMu.Unlock()
+		if isBlockCompleted {
+			if !isPrimaryEarly || rcv.cache.GetPieceCount(blockID, row, col) >= rcv.kPiece {
+				continue
+			}
+		}
 		if !isPrimaryEarly && !isBackupEarly {
 			rcv.nonCustodyLockedMu.Lock()
 			locked := rcv.nonCustodyLocked[cellKey]
@@ -817,15 +1010,17 @@ func (rcv *Receiver) verifyAndProcessBatch(seeds []p2pcommon.SeedCellRequest) {
 
 	for _, s := range seeds {
 		cellKey := fmt.Sprintf("%s_%d_%d", s.BlockID, s.Row, s.Col)
-		rcv.completedMu.Lock()
-		if rcv.completedBlocks != nil && rcv.completedBlocks[s.BlockID] {
-			rcv.completedMu.Unlock()
-			continue
-		}
-		rcv.completedMu.Unlock()
-
 		isPrimaryEarly := (s.Row % rcv.storesPerCol) == rcv.rowIdx
 		isBackupEarly := ((s.Row + 1) % rcv.storesPerCol) == rcv.rowIdx
+
+		rcv.completedMu.Lock()
+		isBlockCompleted := rcv.completedBlocks != nil && rcv.completedBlocks[s.BlockID]
+		rcv.completedMu.Unlock()
+		if isBlockCompleted {
+			if !isPrimaryEarly || rcv.cache.GetPieceCount(s.BlockID, s.Row, s.Col) >= rcv.kPiece {
+				continue
+			}
+		}
 		if !isPrimaryEarly && !isBackupEarly {
 			rcv.nonCustodyLockedMu.Lock()
 			locked := rcv.nonCustodyLocked[cellKey]
@@ -922,17 +1117,18 @@ func (rcv *Receiver) verifyAndProcessBatch(seeds []p2pcommon.SeedCellRequest) {
 func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsStr, proofStr string, pieceCommitsStr []string, senderPeerID string, isGossip bool) error {
 	cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
 
-	// Early exit 1: drop incoming pieces if this block is already completed and locked
-	rcv.completedMu.Lock()
-	if rcv.completedBlocks != nil && rcv.completedBlocks[blockID] {
-		rcv.completedMu.Unlock()
-		return nil
-	}
-	rcv.completedMu.Unlock()
-
-	// Early exit 2: non-custody cells that are already locked (recoded and done)
 	isPrimaryEarly := (row % rcv.storesPerCol) == rcv.rowIdx
 	isBackupEarly := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+
+	// Early exit 1: drop incoming pieces if this block is already completed and locked
+	rcv.completedMu.Lock()
+	isBlockCompleted := rcv.completedBlocks != nil && rcv.completedBlocks[blockID]
+	rcv.completedMu.Unlock()
+	if isBlockCompleted {
+		if !isPrimaryEarly || rcv.cache.GetPieceCount(blockID, row, col) >= rcv.kPiece {
+			return nil
+		}
+	}
 	if !isPrimaryEarly && !isBackupEarly {
 		rcv.nonCustodyLockedMu.Lock()
 		locked := rcv.nonCustodyLocked[cellKey]
@@ -1182,7 +1378,7 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 				rcv.disseminationSem <- struct{}{}
 				defer func() { <-rcv.disseminationSem }()
 
-				numBroadcast := rcv.kPiece / 2
+				numBroadcast := getEnvInt("STORE_BROADCAST_ROUNDS", 2)
 				if numBroadcast < 1 {
 					numBroadcast = 1
 				}
@@ -2072,12 +2268,14 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 			targetPieces = targetPieces[:rcv.kPiece]
 		}
 
-		// Always recode+store once first (for local availability)
+		// Always recode+store once first (for local availability) if not primary custody
 		firstRecoded, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5)
 		if err == nil {
-			rcv.cellMu.Lock()
-			rcv.cache.StoreRecodedPiece(blockID, row, col, *firstRecoded)
-			rcv.cellMu.Unlock()
+			if !isPullPrimary {
+				rcv.cellMu.Lock()
+				rcv.cache.StoreRecodedPiece(blockID, row, col, *firstRecoded)
+				rcv.cellMu.Unlock()
+			}
 			log.Printf("[StoreNode] Successfully recoded cell [%d, %d] in active pull.", row, col)
 			rcv.CheckAndLogCompletion(blockID)
 
@@ -2559,7 +2757,8 @@ func (rcv *Receiver) IsComplete(blockID string) bool {
 }
 
 func (rcv *Receiver) completionCheckWorkerLoop(ctx context.Context) {
-	ticker := time.NewTicker(40 * time.Millisecond)
+	tickerMs := getEnvInt("STORE_COMPLETION_CHECK_TICKER_MS", 15)
+	ticker := time.NewTicker(time.Duration(tickerMs) * time.Millisecond)
 	defer ticker.Stop()
 
 	pending := make(map[string]bool)
@@ -2643,10 +2842,60 @@ func (rcv *Receiver) doCheckAndLogCompletion(blockID string) {
 			go func(bID string, h int, col int, row int, stores int) {
 				for attempt := 1; attempt <= 5; attempt++ {
 					_ = rcv.broadcaster.BroadcastStoreReady(bID, h, col, row, stores)
-					time.Sleep(0.5 * time.Second)
+					time.Sleep(200 * time.Millisecond)
 				}
 			}(blockID, height, rcv.colIdx, rcv.rowIdx, rcv.storesPerCol)
 		}
+
+		// Final Block Cleanup: Prune all raw pieces for Backup and Non-Custody cells,
+		// and delete any errant recoded pieces for Primary cells to guarantee strict steady-state piece counts.
+		go func(bID string) {
+			n := 2 * rcv.kBlock
+			numCols := rcv.numCols
+			if numCols <= 0 {
+				numCols = 8
+			}
+			colsPerNetCol := n / numCols
+			if colsPerNetCol == 0 {
+				colsPerNetCol = 1
+			}
+			netColIdx := rcv.colIdx / colsPerNetCol
+			startCol := netColIdx * colsPerNetCol
+			endCol := startCol + colsPerNetCol
+			storesPerCol := rcv.storesPerCol
+			if storesPerCol <= 0 {
+				storesPerCol = 8
+			}
+
+			for c := startCol; c < endCol; c++ {
+				for r := 0; r < n; r++ {
+					isPrimary := (r % storesPerCol) == rcv.rowIdx
+					if isPrimary {
+						rcv.cellMu.Lock()
+						rcv.cache.DeleteRecodedPieces(bID, r, c)
+						rcv.cellMu.Unlock()
+					} else {
+						rcv.cellMu.Lock()
+						rcv.cache.PruneRawPieces(bID, r, c, rcv.rm)
+						rcv.cellMu.Unlock()
+						cellKey := fmt.Sprintf("%s_%d_%d", bID, r, c)
+						rcv.pruneMu.Lock()
+						rcv.prunedCells[cellKey] = true
+						rcv.pruneMu.Unlock()
+					}
+				}
+			}
+
+			actualPieces := rcv.cache.GetTotalPieceCount()
+			custodyPieces := rcv.cache.GetCustodyPieceCount(rcv.storesPerCol, rcv.rowIdx)
+			recodedPieces := rcv.cache.GetRecodedPieceCount()
+			rcv.totalStoredPiecesMu.Lock()
+			rcv.totalStoredPieces = int64(actualPieces)
+			rcv.totalStoredPiecesMu.Unlock()
+			LinearIndependentPiecesCount.Set(float64(actualPieces))
+			CustodyPiecesCount.Set(float64(custodyPieces))
+			RecodedPiecesCount.Set(float64(recodedPieces))
+		}(blockID)
 	}
 }
 

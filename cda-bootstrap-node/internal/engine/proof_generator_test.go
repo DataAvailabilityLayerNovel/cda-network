@@ -107,3 +107,49 @@ func TestFK20_ProofGenerator_And_StoreVerification_EndToEnd(t *testing.T) {
 		require.True(t, recodedVerified, "Recoded piece verification failed for row %d", targetRow)
 	}
 }
+
+func TestEncodeRowNSeeds_StrictLinearIndependence(t *testing.T) {
+	kPiece := 8
+	n := 16
+	cellSize := 512
+	columnData := make([][]byte, n)
+	for r := 0; r < n; r++ {
+		columnData[r] = make([]byte, cellSize)
+		_, _ = rand.Read(columnData[r])
+	}
+
+	srs, err := bls12381kzg.NewSRS(128, big.NewInt(-1))
+	require.NoError(t, err)
+	kzgBootstrap := cda.NewGnarkKZG(*srs)
+	require.NoError(t, kzgBootstrap.InitFK20(n))
+
+	proofGen := NewProofGenerator(kPiece, kzgBootstrap)
+	proofs, err := proofGen.GenerateColumnProofs(0, columnData)
+	require.NoError(t, err)
+
+	encoder := NewRLNCEncoder(kPiece, kzgBootstrap)
+
+	// Test 5 random rows, verifying both primary (seeds 0..7) and backup (seeds 8..15)
+	for row := 0; row < 5; row++ {
+		seeds, err := encoder.EncodeRowNSeeds(row, 0, columnData, proofs[row], 16)
+		require.NoError(t, err)
+		require.Len(t, seeds, 16)
+
+		// Group 1: Primary seeds (0..7) must have rank exactly kPiece
+		primaryBasis := NewEchelonBasis(kPiece)
+		for i := 0; i < kPiece; i++ {
+			added := primaryBasis.TryAdd(seeds[i].Data.Coeffs)
+			require.True(t, added, "Primary seed %d must be linearly independent", i)
+		}
+		require.Equal(t, kPiece, primaryBasis.Rank(), "Primary group must have full rank kPiece")
+
+		// Group 2: Backup seeds (8..15) must have rank exactly kPiece
+		backupBasis := NewEchelonBasis(kPiece)
+		for i := kPiece; i < 2*kPiece; i++ {
+			added := backupBasis.TryAdd(seeds[i].Data.Coeffs)
+			require.True(t, added, "Backup seed %d must be linearly independent", i)
+		}
+		require.Equal(t, kPiece, backupBasis.Rank(), "Backup group must have full rank kPiece")
+	}
+}
+

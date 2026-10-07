@@ -3,7 +3,7 @@ import argparse
 import json
 import os
 
-def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=False, active_cols=None, prune_enable=False, prune_ttl=None,
+def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=False, active_cols=None, prune_enable=True, prune_ttl='15s',
                      store_gossip_batch_size=None, store_gossip_batch_workers=None, store_gossip_batch_ticker_ms=None,
                      store_dissemination_sem=None, store_fallback_pull_sem=None, store_sharded_workers=None,
                      bootstrap_proof_gen_sem=None, bootstrap_seeding_sem=None, bootstrap_batch_chunk_size=None,
@@ -588,8 +588,9 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--stores-per-col', type=int, default=8, help='Number of store nodes per column (S)')
     parser.add_argument('-l', '--lights', '--light-nodes', type=int, default=2, help='Number of light nodes (L)')
     parser.add_argument('--crash-on-fail', action='store_true', help='Enable crash on fail for nodes')
-    parser.add_argument('--prune-enable', action='store_true', help='Enable pruning for store and bootstrap nodes')
-    parser.add_argument('--prune-ttl', type=str, default=None, help='TTL duration before pruning (e.g. 5m)')
+    parser.add_argument('--prune-enable', action='store_true', default=True, help='Enable pruning for store and bootstrap nodes (default: True)')
+    parser.add_argument('--no-prune', dest='prune_enable', action='store_false', help='Disable pruning for store and bootstrap nodes')
+    parser.add_argument('--prune-ttl', type=str, default='15s', help='TTL duration before pruning (default: 15s)')
     parser.add_argument('--store-gossip-batch-size', type=int, default=None, help='Store GossipSub batch verification size')
     parser.add_argument('--store-gossip-batch-workers', type=int, default=None, help='Store GossipSub batch worker count')
     parser.add_argument('--store-gossip-batch-ticker-ms', type=int, default=None, help='Store GossipSub batch flush interval in ms')

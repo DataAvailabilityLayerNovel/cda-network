@@ -114,12 +114,20 @@ func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pie
 	}
 
 	pieces := make([]*cda.ReceivedPiece, count)
-	var generatedCoeffs [][]byte
+	basis := NewEchelonBasis(e.k)
 
 	for seedIdx := 0; seedIdx < count; seedIdx++ {
-		// 2. Generate random coefficients in Fr and check linear independence
+		// When transitioning to a new group of e.k seeds (e.g. from Primary to Backup),
+		// reset the basis so that the backup seeds are mutually independent among themselves.
+		if seedIdx > 0 && seedIdx%e.k == 0 {
+			basis.Reset()
+		}
+
+		// 2. Generate coefficients in Fr guaranteed to be linearly independent via Row Echelon reduction
 		var coeffs []byte
+		attempts := 0
 		for {
+			attempts++
 			coeffs = make([]byte, 2*e.k)
 			for i := 0; i < e.k; i++ {
 				b := make([]byte, 2)
@@ -130,13 +138,18 @@ func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pie
 					binary.BigEndian.PutUint16(coeffs[i*2:], val)
 				}
 			}
-			if isLinearlyIndependent(generatedCoeffs, coeffs, e.k) {
+
+			// Deterministic fallback if random sampling exceeds 50 attempts
+			if attempts > 50 {
+				targetCol := basis.Rank()
+				if targetCol < e.k {
+					binary.BigEndian.PutUint16(coeffs[targetCol*2:], uint16(1001+attempts))
+				}
+			}
+
+			if basis.TryAdd(coeffs) {
 				break
 			}
-		}
-		generatedCoeffs = append(generatedCoeffs, coeffs)
-		if len(generatedCoeffs) == e.k {
-			generatedCoeffs = nil
 		}
 
 		// 3. Compute RLNC coded data: d_i = sum(g_{i,j} * S_j)
@@ -171,31 +184,109 @@ func (e *RLNCEncoder) EncodeRow3Seeds(row int, col int, columnData [][]byte, pie
 	return e.EncodeRowNSeeds(row, col, columnData, pieceProofs, e.k)
 }
 
-func isLinearlyIndependent(existingCoeffs [][]byte, newCoeff []byte, k int) bool {
-	m := len(existingCoeffs)
-	if m >= k {
+// EchelonBasis tracks a basis of vectors in Fr^k in reduced row echelon form.
+type EchelonBasis struct {
+	k     int
+	basis [][]fr.Element
+}
+
+func NewEchelonBasis(k int) *EchelonBasis {
+	return &EchelonBasis{
+		k:     k,
+		basis: make([][]fr.Element, 0, k),
+	}
+}
+
+// Reset clears the basis so a new independent set of vectors can be formed.
+func (eb *EchelonBasis) Reset() {
+	eb.basis = eb.basis[:0]
+}
+
+// Rank returns the current dimension of the vector space spanned by the basis.
+func (eb *EchelonBasis) Rank() int {
+	return len(eb.basis)
+}
+
+// TryAdd tests if the given coefficient vector is linearly independent of the current basis.
+// If it is independent, it is added to the basis in reduced row echelon form and returns true.
+// If it is linearly dependent (remainder is 0), returns false.
+func (eb *EchelonBasis) TryAdd(rawCoeffs []byte) bool {
+	if len(eb.basis) >= eb.k {
 		return false
 	}
 
-	A := make([][]byte, k)
-	for i := 0; i < m; i++ {
-		A[i] = append([]byte(nil), existingCoeffs[i]...)
-	}
-	A[m] = append([]byte(nil), newCoeff...)
-
-	for i := m + 1; i < k; i++ {
-		row := make([]byte, 2*k)
-		row[2*i+1] = 1
-		A[i] = row
-	}
-
-	B := make([][]byte, k)
-	for i := 0; i < k; i++ {
-		B[i] = make([]byte, 32)
+	// 1. Convert raw bytes to []fr.Element
+	row := make([]fr.Element, eb.k)
+	if len(rawCoeffs) == 2*eb.k {
+		for j := 0; j < eb.k; j++ {
+			val := binary.BigEndian.Uint16(rawCoeffs[j*2 : (j+1)*2])
+			row[j].SetUint64(uint64(val))
+		}
+	} else if len(rawCoeffs) == eb.k {
+		for j := 0; j < eb.k; j++ {
+			row[j].SetUint64(uint64(rawCoeffs[j]))
+		}
+	} else {
+		return false
 	}
 
-	_, err := rlnc.SolveGaussianFr(A, B)
-	return err == nil
+	// 2. Eliminate row against current basis
+	for i := 0; i < len(eb.basis); i++ {
+		pivotCol := -1
+		for c := 0; c < eb.k; c++ {
+			if !eb.basis[i][c].IsZero() {
+				pivotCol = c
+				break
+			}
+		}
+		if pivotCol == -1 {
+			continue
+		}
+
+		if !row[pivotCol].IsZero() {
+			factor := row[pivotCol]
+			for c := pivotCol; c < eb.k; c++ {
+				var term fr.Element
+				term.Mul(&eb.basis[i][c], &factor)
+				row[c].Sub(&row[c], &term)
+			}
+		}
+	}
+
+	// 3. Find leading non-zero element in remainder
+	pivotCol := -1
+	for c := 0; c < eb.k; c++ {
+		if !row[c].IsZero() {
+			pivotCol = c
+			break
+		}
+	}
+
+	if pivotCol == -1 {
+		// All zeros: linearly dependent!
+		return false
+	}
+
+	// 4. Normalize the row so that basis[pivotCol] == 1
+	var inv fr.Element
+	inv.Inverse(&row[pivotCol])
+	for c := pivotCol; c < eb.k; c++ {
+		row[c].Mul(&row[c], &inv)
+	}
+
+	eb.basis = append(eb.basis, row)
+	return true
+}
+
+func isLinearlyIndependent(existingCoeffs [][]byte, newCoeff []byte, k int) bool {
+	if len(existingCoeffs) >= k {
+		return false
+	}
+	basis := NewEchelonBasis(k)
+	for _, c := range existingCoeffs {
+		_ = basis.TryAdd(c)
+	}
+	return basis.TryAdd(newCoeff)
 }
 
 func vectorMulAddFrLocal(dst, src []byte, coeff uint16) {

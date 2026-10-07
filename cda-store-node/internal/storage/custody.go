@@ -143,22 +143,36 @@ func (s *CustodyStore) StorePiece(blockID string, row, col int, piece cda.Receiv
 	pieces = append(pieces, piece)
 	s.piecesCache[keyStr] = pieces
 	newCount := len(pieces)
-	s.memMu.Unlock()
+
+	// Make defensive copy to prevent data race with background persistence
+	pList := make([]cda.ReceivedPiece, newCount)
+	copy(pList, pieces)
 
 	s.countMu.Lock()
 	s.pieceCountCache[keyStr] = newCount
 	s.countMu.Unlock()
+	s.memMu.Unlock()
 
 	if s.db != nil {
-		go func(k string, pList []cda.ReceivedPiece) {
-			valData, err := json.Marshal(pList)
+		go func(k string, toSave []cda.ReceivedPiece) {
+			valData, err := json.Marshal(toSave)
 			if err != nil {
 				return
 			}
 			_ = s.db.Update(func(txn *badger.Txn) error {
+				// Anti-regression: do not overwrite DB with fewer pieces if an out-of-order write occurs
+				item, err := txn.Get([]byte(k))
+				if err == nil {
+					var existing []cda.ReceivedPiece
+					if err := item.Value(func(val []byte) error {
+						return json.Unmarshal(val, &existing)
+					}); err == nil && len(existing) >= len(toSave) {
+						return nil // Existing state has equal or more pieces; do not overwrite!
+					}
+				}
 				return txn.Set([]byte(k), valData)
 			})
-		}(keyStr, pieces)
+		}(keyStr, pList)
 	}
 }
 
@@ -217,6 +231,22 @@ func (s *CustodyStore) StoreRecodedPiece(blockID string, row, col int, piece cda
 				return txn.Set([]byte(keyStr), valData)
 			})
 		}()
+	}
+}
+
+func (s *CustodyStore) DeleteRecodedPieces(blockID string, row, col int) {
+	keyStr := fmt.Sprintf("recoded_%s_%d_%d", blockID, row, col)
+
+	s.memMu.Lock()
+	delete(s.recodedCache, keyStr)
+	s.memMu.Unlock()
+
+	if s.db != nil {
+		go func(k []byte) {
+			_ = s.db.Update(func(txn *badger.Txn) error {
+				return txn.Delete(k)
+			})
+		}([]byte(keyStr))
 	}
 }
 
@@ -314,10 +344,23 @@ func (s *CustodyStore) GetTotalPiecesForCell(blockID string, row, col int) int {
 }
 
 func (s *CustodyStore) GetTotalPieceCount() int {
+	count := 0
+	s.memMu.RLock()
+	if len(s.piecesCache) > 0 || len(s.recodedCache) > 0 {
+		for _, pieces := range s.piecesCache {
+			count += len(pieces)
+		}
+		for _, pieces := range s.recodedCache {
+			count += len(pieces)
+		}
+		s.memMu.RUnlock()
+		return count
+	}
+	s.memMu.RUnlock()
+
 	if s.db == nil {
 		return 0
 	}
-	count := 0
 	_ = s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		it := txn.NewIterator(opts)
@@ -341,10 +384,20 @@ func (s *CustodyStore) GetTotalPieceCount() int {
 }
 
 func (s *CustodyStore) GetRecodedPieceCount() int {
+	count := 0
+	s.memMu.RLock()
+	if len(s.recodedCache) > 0 {
+		for _, pieces := range s.recodedCache {
+			count += len(pieces)
+		}
+		s.memMu.RUnlock()
+		return count
+	}
+	s.memMu.RUnlock()
+
 	if s.db == nil {
 		return 0
 	}
-	count := 0
 	_ = s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		it := txn.NewIterator(opts)
@@ -366,10 +419,32 @@ func (s *CustodyStore) GetRecodedPieceCount() int {
 }
 
 func (s *CustodyStore) GetCustodyPieceCount(storesPerCol, rowIdx int) int {
-	if s.db == nil || storesPerCol <= 0 {
+	if storesPerCol <= 0 {
 		return 0
 	}
 	count := 0
+	s.memMu.RLock()
+	if len(s.piecesCache) > 0 {
+		for key, pieces := range s.piecesCache {
+			parts := strings.Split(key, "_")
+			if len(parts) >= 3 {
+				rowStr := parts[len(parts)-2]
+				var row int
+				if _, err := fmt.Sscanf(rowStr, "%d", &row); err == nil {
+					if (row % storesPerCol) == rowIdx {
+						count += len(pieces)
+					}
+				}
+			}
+		}
+		s.memMu.RUnlock()
+		return count
+	}
+	s.memMu.RUnlock()
+
+	if s.db == nil {
+		return 0
+	}
 	_ = s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		it := txn.NewIterator(opts)
@@ -447,11 +522,10 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 	s.memMu.Lock()
 	rawPieces := s.piecesCache[rawKeyStr]
 	delete(s.piecesCache, rawKeyStr)
-	s.memMu.Unlock()
-
 	s.countMu.Lock()
 	s.pieceCountCache[rawKeyStr] = 0
 	s.countMu.Unlock()
+	s.memMu.Unlock()
 
 	deletedCount := len(rawPieces)
 	pieceCommits, _ := s.GetAnchoredCommitments(blockID, col)
@@ -468,25 +542,29 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 		compressedPiece = rawPieces[0]
 	}
 
-	if len(rawPieces) > 0 {
-		s.memMu.Lock()
+	s.memMu.Lock()
+	alreadyHasRecoded := len(s.recodedCache[recodedKeyStr]) > 0
+	if !alreadyHasRecoded && len(rawPieces) > 0 {
 		s.recodedCache[recodedKeyStr] = []cda.ReceivedPiece{compressedPiece}
-		s.memMu.Unlock()
 	}
+	s.memMu.Unlock()
 
 	if s.db != nil {
-		go func(rawKey, recKey []byte, pList []cda.ReceivedPiece, compPiece cda.ReceivedPiece) {
+		go func(rawKey, recKey []byte, pList []cda.ReceivedPiece, compPiece cda.ReceivedPiece, hadRecoded bool) {
 			_ = s.db.Update(func(txn *badger.Txn) error {
 				_ = txn.Delete(rawKey)
-				if len(pList) > 0 {
-					valData, err := json.Marshal([]cda.ReceivedPiece{compPiece})
-					if err == nil {
-						_ = txn.Set(recKey, valData)
+				if !hadRecoded && len(pList) > 0 {
+					_, err := txn.Get(recKey)
+					if err != nil {
+						valData, err := json.Marshal([]cda.ReceivedPiece{compPiece})
+						if err == nil {
+							_ = txn.Set(recKey, valData)
+						}
 					}
 				}
 				return nil
 			})
-		}([]byte(rawKeyStr), []byte(recodedKeyStr), rawPieces, compressedPiece)
+		}([]byte(rawKeyStr), []byte(recodedKeyStr), rawPieces, compressedPiece, alreadyHasRecoded)
 	}
 
 	return deletedCount

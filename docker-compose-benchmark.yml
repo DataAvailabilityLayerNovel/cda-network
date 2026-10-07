@@ -48,7 +48,10 @@
         "-k",
         "64",
         "-k-piece",
-        "8"
+        "8",
+        "-prune-enable=true",
+        "-prune-ttl",
+        "15s"
       ],
       "ports": [
         "9200:9200",
@@ -99,7 +102,10 @@
         "-stores-per-col",
         "8",
         "-myaddr",
-        "http://store-0-1:8080"
+        "http://store-0-1:8080",
+        "-prune-enable=true",
+        "-prune-ttl",
+        "15s"
       ],
       "ports": [
         "9300:8080",
@@ -153,7 +159,10 @@
         "-stores-per-col",
         "8",
         "-myaddr",
-        "http://store-0-2:8080"
+        "http://store-0-2:8080",
+        "-prune-enable=true",
+        "-prune-ttl",
+        "15s"
       ],
       "ports": [
         "9301:8080",
@@ -207,7 +216,10 @@
         "-stores-per-col",
         "8",
         "-myaddr",
-        "http://store-0-3:8080"
+        "http://store-0-3:8080",
+        "-prune-enable=true",
+        "-prune-ttl",
+        "15s"
       ],
       "ports": [
         "9302:8080",
@@ -261,7 +273,10 @@
         "-stores-per-col",
         "8",
         "-myaddr",
-        "http://store-0-4:8080"
+        "http://store-0-4:8080",
+        "-prune-enable=true",
+        "-prune-ttl",
+        "15s"
       ],
       "ports": [
         "9303:8080",
@@ -315,7 +330,10 @@
         "-stores-per-col",
         "8",
         "-myaddr",
-        "http://store-0-5:8080"
+        "http://store-0-5:8080",
+        "-prune-enable=true",
+        "-prune-ttl",
+        "15s"
       ],
       "ports": [
         "9304:8080",
@@ -369,7 +387,10 @@
         "-stores-per-col",
         "8",
         "-myaddr",
-        "http://store-0-6:8080"
+        "http://store-0-6:8080",
+        "-prune-enable=true",
+        "-prune-ttl",
+        "15s"
       ],
       "ports": [
         "9305:8080",
@@ -423,7 +444,10 @@
         "-stores-per-col",
         "8",
         "-myaddr",
-        "http://store-0-7:8080"
+        "http://store-0-7:8080",
+        "-prune-enable=true",
+        "-prune-ttl",
+        "15s"
       ],
       "ports": [
         "9306:8080",
@@ -477,7 +501,10 @@
         "-stores-per-col",
         "8",
         "-myaddr",
-        "http://store-0-8:8080"
+        "http://store-0-8:8080",
+        "-prune-enable=true",
+        "-prune-ttl",
+        "15s"
       ],
       "ports": [
         "9307:8080",
