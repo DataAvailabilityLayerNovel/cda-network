@@ -346,6 +346,7 @@ providers:
     # 3. Premium High-Resolution Dashboard JSON
     dashboard_json = {
         "id": None,
+        "uid": "8957bec6-5c22-49c3-af8c-9c9153b3f117",
         "title": "CDA Network Performance Dashboard",
         "tags": ["cda", "production", "high-resolution"],
         "timezone": "browser",
@@ -360,13 +361,14 @@ providers:
             "time_options": ["1m", "2m", "5m", "15m", "1h", "6h", "12h", "24h"]
         },
         "panels": [
+            # Top Stats: System Overview (Height, ODS Dimension, In-Flight)
             {
                 "type": "stat",
-                "title": "CometBFT Block Height",
+                "title": "CometBFT Consensus Height",
                 "description": "Chiều cao khối hiện tại được đồng thuận bởi cụm validator CometBFT",
-                "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+                "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
                 "targets": [
-                    {"expr": "max(cometbft_consensus_height) or vector(0)", "legendFormat": "Height"}
+                    {"expr": "max(cometbft_consensus_height) or vector(0)", "legendFormat": "Consensus Height"}
                 ],
                 "options": {
                     "colorMode": "value",
@@ -384,9 +386,9 @@ providers:
                 "type": "stat",
                 "title": "CDA BlockReady Height",
                 "description": "Chiều cao khối mới nhất đã hoàn tất lưu trữ trên 8 Store Nodes và phát tín hiệu BlockReady",
-                "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+                "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
                 "targets": [
-                    {"expr": "cda_publisher_latest_completed_height or vector(0)", "legendFormat": "BlockReady"}
+                    {"expr": "max(cda_publisher_latest_completed_height) or vector(0)", "legendFormat": "BlockReady"}
                 ],
                 "options": {
                     "colorMode": "value",
@@ -402,11 +404,11 @@ providers:
             },
             {
                 "type": "stat",
-                "title": "CDA Dimension K (ODS Matrix)",
-                "description": "Kích thước ma trận ODS (KxK cells) và EDS (2Kx2K cells) của khối gần nhất",
-                "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+                "title": "ODS Matrix Dimension",
+                "description": "Kích thước ma trận Original Data Square (K x K cells, 512B/cell) của khối gần nhất",
+                "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
                 "targets": [
-                    {"expr": "cda_publisher_latest_k or vector(0)", "legendFormat": "K"}
+                    {"expr": "max(cda_publisher_latest_k) or vector(0)", "legendFormat": "K"}
                 ],
                 "options": {
                     "colorMode": "value",
@@ -416,72 +418,63 @@ providers:
                 },
                 "fieldConfig": {
                     "defaults": {
-                        "color": {"mode": "fixed", "fixedColor": "orange"}
+                        "color": {"mode": "fixed", "fixedColor": "orange"},
+                        "mappings": [
+                            {
+                                "type": "value",
+                                "options": {
+                                    "0": {"text": "0 × 0"},
+                                    "16": {"text": "16 × 16 (256 cells)"},
+                                    "32": {"text": "32 × 32 (1,024 cells)"},
+                                    "64": {"text": "64 × 64 (4,096 cells)"},
+                                    "128": {"text": "128 × 128 (16,384 cells)"},
+                                    "256": {"text": "256 × 256 (65,536 cells)"}
+                                }
+                            }
+                        ]
                     }
                 }
             },
             {
-                "type": "gauge",
-                "title": "CDA Pipeline In-Flight",
-                "description": "Số lượng khối đang được xử lý trong hàng đợi của Publisher (tối đa 32)",
-                "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+                "type": "stat",
+                "title": "Pipeline In-Flight",
+                "description": "Số lượng khối đang nằm trong hàng đợi xử lý của CDA Publisher pipeline",
+                "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
                 "targets": [
-                    {"expr": "cda_publisher_in_flight_blocks or vector(0)", "legendFormat": "In-Flight"}
+                    {"expr": "max(cda_publisher_in_flight_blocks) or vector(0)", "legendFormat": "In-Flight"}
                 ],
+                "options": {
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "center",
+                    "textMode": "value"
+                },
                 "fieldConfig": {
                     "defaults": {
-                        "min": 0,
-                        "max": 32,
+                        "color": {"mode": "thresholds"},
                         "thresholds": {
                             "mode": "absolute",
                             "steps": [
                                 {"value": None, "color": "green"},
-                                {"value": 16, "color": "orange"},
-                                {"value": 28, "color": "red"}
+                                {"value": 4, "color": "orange"},
+                                {"value": 16, "color": "red"}
                             ]
                         }
                     }
                 }
             },
+            # Row 1: Pipeline Performance & Latency
             {
-                "type": "stat",
-                "title": "Mempool Pending Txns",
-                "description": "Số lượng giao dịch đang chờ trong mempool của CometBFT",
-                "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
-                "targets": [
-                    {"expr": "sum(cometbft_mempool_size) or vector(0)", "legendFormat": "Pending Txns"}
-                ],
-                "options": {
-                    "colorMode": "value",
-                    "graphMode": "none",
-                    "justifyMode": "center",
-                    "textMode": "value"
-                },
-                "fieldConfig": {
-                    "defaults": {
-                        "color": {"mode": "fixed", "fixedColor": "yellow"}
-                    }
-                }
-            },
-            {
-                "type": "stat",
-                "title": "Healthy / Online Nodes",
-                "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
-                "targets": [
-                    {"expr": "sum(up)", "legendFormat": "Nodes Up"}
-                ],
-                "options": {
-                    "colorMode": "value",
-                    "graphMode": "none",
-                    "justifyMode": "center",
-                    "textMode": "value"
-                }
+                "type": "row",
+                "title": "⚡ CDA Pipeline Performance & Latency",
+                "gridPos": {"h": 1, "w": 24, "x": 0, "y": 4},
+                "collapsed": False
             },
             {
                 "type": "graph",
                 "title": "Block Height Progression (Consensus vs CDA BlockReady)",
                 "description": "So sánh tiến độ khối của CometBFT Consensus và tiến độ đạt BlockReady trên CDA",
-                "gridPos": {"h": 7, "w": 12, "x": 0, "y": 4},
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -502,7 +495,7 @@ providers:
                 "type": "graph",
                 "title": "CDA Pipeline Latency (Publish -> BlockReady Duration)",
                 "description": "Thời gian hoàn thành xử lý khối từ khi tiếp nhận đến khi 8 Store nodes custody xong (BlockReady)",
-                "gridPos": {"h": 7, "w": 12, "x": 12, "y": 4},
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -520,81 +513,23 @@ providers:
                 ]
             },
             {
-                "type": "gauge",
-                "title": "DAS Success Rate",
-                "gridPos": {"h": 5, "w": 8, "x": 0, "y": 11},
-                "targets": [
-                    {"expr": "cda_light_das_success_rate", "legendFormat": "{{instance}}"}
-                ],
-                "fieldConfig": {
-                    "defaults": {
-                        "min": 0,
-                        "max": 100,
-                        "unit": "percent",
-                        "thresholds": {
-                            "mode": "absolute",
-                            "steps": [
-                                {"value": None, "color": "red"},
-                                {"value": 90, "color": "orange"},
-                                {"value": 99.9, "color": "green"}
-                            ]
-                        }
-                    }
-                }
-            },
-            {
-                "type": "stat",
-                "title": "Byzantine Forged Pieces Blocked (Security Alerts)",
-                "description": "Số mảnh dữ liệu giả mạo bị phát hiện và ngăn chặn bởi chữ ký / kiểm chứng mật mã KZG (Layer 3)",
-                "gridPos": {"h": 5, "w": 8, "x": 8, "y": 11},
-                "targets": [
-                    {"expr": "sum(cda_store_byzantine_detection_count)", "legendFormat": "Byzantine Detections"}
-                ],
-                "options": {
-                    "colorMode": "value",
-                    "graphMode": "none",
-                    "justifyMode": "center",
-                    "textMode": "value"
-                },
-                "fieldConfig": {
-                    "defaults": {
-                        "thresholds": {
-                            "mode": "absolute",
-                            "steps": [
-                                {"value": None, "color": "green"},
-                                {"value": 1, "color": "red"}
-                            ]
-                        }
-                    }
-                }
-            },
-            {
-                "type": "stat",
-                "title": "Publisher Throughput (1m Avg)",
-                "description": "Lưu lượng phát hành trung bình động 1 phút",
-                "gridPos": {"h": 5, "w": 8, "x": 16, "y": 11},
-                "targets": [
-                    {"expr": "sum(rate(cda_publisher_throughput_bytes_total[1m]))", "legendFormat": "Bytes/sec (Avg)"}
-                ],
-                "fieldConfig": {
-                    "defaults": {
-                        "unit": "Bps"
-                    }
-                }
-            },
-            {
                 "type": "graph",
-                "title": "DAS Sampling Latency (95th vs Average)",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+                "title": "Node Encoding & Proof Durations",
+                "description": "Chi tiết thời gian RS encoding (Publisher), KZG proofs generation (Bootstrap), và Reconstruction (Store)",
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
                 **line_graph_opts(),
                 "targets": [
                     {
-                        "expr": "histogram_quantile(0.95, sum(rate(cda_light_das_sample_latency_seconds_bucket[5s])) by (le))",
-                        "legendFormat": "95th Percentile Latency"
+                        "expr": "sum(rate(cda_publisher_rs_encode_duration_seconds_sum[5s])) / sum(rate(cda_publisher_rs_encode_duration_seconds_count[5s]))",
+                        "legendFormat": "Publisher RS Encode (Avg)"
                     },
                     {
-                        "expr": "sum(rate(cda_light_das_sample_latency_seconds_sum[5s])) / sum(rate(cda_light_das_sample_latency_seconds_count[5s]))",
-                        "legendFormat": "Average Latency"
+                        "expr": "sum(rate(cda_bootstrap_kzg_proof_duration_seconds_sum[5s])) / sum(rate(cda_bootstrap_kzg_proof_duration_seconds_count[5s]))",
+                        "legendFormat": "Bootstrap KZG Proof (Avg)"
+                    },
+                    {
+                        "expr": "sum(rate(cda_store_reconstruct_duration_seconds_sum[5s])) / sum(rate(cda_store_reconstruct_duration_seconds_count[5s]))",
+                        "legendFormat": "Store Reconstruction (Avg)"
                     }
                 ],
                 "yaxes": [
@@ -606,7 +541,7 @@ providers:
                 "type": "graph",
                 "title": "Publisher Throughput Over Time (Moving Average)",
                 "description": "Sơ đồ lưu lượng phát hành trung bình theo thời gian (Moving Average 30s & 1m)",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+                "gridPos": {"h": 8, "w": 8, "x": 12, "y": 13},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -624,9 +559,31 @@ providers:
                 ]
             },
             {
+                "type": "stat",
+                "title": "Publisher Throughput (1m Avg)",
+                "description": "Lưu lượng phát hành trung bình động 1 phút",
+                "gridPos": {"h": 8, "w": 4, "x": 20, "y": 13},
+                "targets": [
+                    {"expr": "sum(rate(cda_publisher_throughput_bytes_total[1m]))", "legendFormat": "Bytes/sec"}
+                ],
+                "fieldConfig": {
+                    "defaults": {
+                        "unit": "Bps"
+                    }
+                }
+            },
+            # Row 2: Store Nodes, Custody & Dissemination
+            {
+                "type": "row",
+                "title": "💾 Store Nodes, Custody Sharding & P2P Dissemination",
+                "gridPos": {"h": 1, "w": 24, "x": 0, "y": 21},
+                "collapsed": False
+            },
+            {
                 "type": "graph",
                 "title": "Total Stored Pieces per Store Node (Custody + Recoded Non-Custody)",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+                "description": "Tổng số mảnh dữ liệu tuyến tính độc lập đã lưu trữ trên mỗi Store Node",
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -642,7 +599,8 @@ providers:
             {
                 "type": "table",
                 "title": "Store Node Total Stored Pieces Table",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+                "description": "Bảng thống kê tức thời số mảnh lưu trữ trên 8 Store Nodes (kiểm chứng cân bằng tải)",
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
                 "targets": [
                     {
                         "expr": "cda_store_linear_independent_pieces_count",
@@ -675,7 +633,7 @@ providers:
                 "type": "graph",
                 "title": "Store Node Database Size (BadgerDB Actual Data Used)",
                 "description": "Dung lượng dữ liệu thực tế đã sử dụng trong BadgerDB (User Key-Value Payload)",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -691,7 +649,8 @@ providers:
             {
                 "type": "graph",
                 "title": "Store Node Network Rates (P2P Queries & GossipSub Propagation)",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+                "description": "Tần suất truy vấn P2P và tốc độ lan truyền mảnh qua GossipSub",
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 30},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -704,23 +663,77 @@ providers:
                     }
                 ]
             },
+            # Row 3: DAS & Security
+            {
+                "type": "row",
+                "title": "🛡️ Data Availability Sampling (DAS) & Security",
+                "gridPos": {"h": 1, "w": 24, "x": 0, "y": 38},
+                "collapsed": False
+            },
+            {
+                "type": "gauge",
+                "title": "DAS Success Rate",
+                "description": "Tỷ lệ lấy mẫu DAS thành công của các Light Clients",
+                "gridPos": {"h": 7, "w": 6, "x": 0, "y": 39},
+                "targets": [
+                    {"expr": "cda_light_das_success_rate", "legendFormat": "{{instance}}"}
+                ],
+                "fieldConfig": {
+                    "defaults": {
+                        "min": 0,
+                        "max": 100,
+                        "unit": "percent",
+                        "thresholds": {
+                            "mode": "absolute",
+                            "steps": [
+                                {"value": None, "color": "red"},
+                                {"value": 90, "color": "orange"},
+                                {"value": 99.9, "color": "green"}
+                            ]
+                        }
+                    }
+                }
+            },
+            {
+                "type": "stat",
+                "title": "Byzantine Forged Pieces Blocked",
+                "description": "Số mảnh dữ liệu giả mạo bị phát hiện và ngăn chặn bởi chữ ký / kiểm chứng mật mã KZG (Layer 3)",
+                "gridPos": {"h": 7, "w": 6, "x": 6, "y": 39},
+                "targets": [
+                    {"expr": "sum(cda_store_byzantine_detection_count) or vector(0)", "legendFormat": "Byzantine Detections"}
+                ],
+                "options": {
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "center",
+                    "textMode": "value"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "thresholds": {
+                            "mode": "absolute",
+                            "steps": [
+                                {"value": None, "color": "green"},
+                                {"value": 1, "color": "red"}
+                            ]
+                        }
+                    }
+                }
+            },
             {
                 "type": "graph",
-                "title": "Node Encoding & Proof Durations",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
+                "title": "DAS Sampling Latency (95th vs Average)",
+                "description": "Độ trễ truy vấn lấy mẫu DAS của Light Client (P95 và Trung bình)",
+                "gridPos": {"h": 7, "w": 12, "x": 12, "y": 39},
                 **line_graph_opts(),
                 "targets": [
                     {
-                        "expr": "sum(rate(cda_publisher_rs_encode_duration_seconds_sum[5s])) / sum(rate(cda_publisher_rs_encode_duration_seconds_count[5s]))",
-                        "legendFormat": "Publisher RS Encode (Avg)"
+                        "expr": "histogram_quantile(0.95, sum(rate(cda_light_das_sample_latency_seconds_bucket[5s])) by (le))",
+                        "legendFormat": "95th Percentile Latency"
                     },
                     {
-                        "expr": "sum(rate(cda_bootstrap_kzg_proof_duration_seconds_sum[5s])) / sum(rate(cda_bootstrap_kzg_proof_duration_seconds_count[5s]))",
-                        "legendFormat": "Bootstrap KZG Proof (Avg)"
-                    },
-                    {
-                        "expr": "sum(rate(cda_store_reconstruct_duration_seconds_sum[5s])) / sum(rate(cda_store_reconstruct_duration_seconds_count[5s]))",
-                        "legendFormat": "Store Reconstruction (Avg)"
+                        "expr": "sum(rate(cda_light_das_sample_latency_seconds_sum[5s])) / sum(rate(cda_light_das_sample_latency_seconds_count[5s]))",
+                        "legendFormat": "Average Latency"
                     }
                 ],
                 "yaxes": [
@@ -728,11 +741,18 @@ providers:
                     {"format": "short", "show": False}
                 ]
             },
+            # Row 4: Cluster Infrastructure & Mempool
+            {
+                "type": "row",
+                "title": "🖥️ Cluster Infrastructure & Mempool",
+                "gridPos": {"h": 1, "w": 24, "x": 0, "y": 46},
+                "collapsed": False
+            },
             {
                 "type": "graph",
                 "title": "System CPU Usage (Cores)",
                 "description": "Số lượng CPU Cores thực tế được sử dụng (1.0 = 1 full core)",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
+                "gridPos": {"h": 6, "w": 12, "x": 0, "y": 47},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -744,6 +764,46 @@ providers:
                     {"format": "short", "label": "Cores", "show": True},
                     {"format": "short", "show": False}
                 ]
+            },
+            {
+                "type": "stat",
+                "title": "Mempool Pending Txns",
+                "description": "Số lượng giao dịch đang chờ trong mempool của CometBFT",
+                "gridPos": {"h": 6, "w": 6, "x": 12, "y": 47},
+                "targets": [
+                    {"expr": "sum(cometbft_mempool_size) or vector(0)", "legendFormat": "Pending Txns"}
+                ],
+                "options": {
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "center",
+                    "textMode": "value"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {"mode": "fixed", "fixedColor": "yellow"}
+                    }
+                }
+            },
+            {
+                "type": "stat",
+                "title": "Healthy / Online Nodes",
+                "description": "Tổng số node và dịch vụ đang online trong mạng CDA",
+                "gridPos": {"h": 6, "w": 6, "x": 18, "y": 47},
+                "targets": [
+                    {"expr": "sum(up)", "legendFormat": "Nodes Up"}
+                ],
+                "options": {
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "center",
+                    "textMode": "value"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {"mode": "fixed", "fixedColor": "green"}
+                    }
+                }
             }
         ]
     }

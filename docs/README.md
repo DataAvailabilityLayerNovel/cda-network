@@ -1,5 +1,9 @@
 # CDA Network Documentation Hub
 
+> 📖 **[Tài Liệu Hướng Dẫn Vận Hành & Thao Tác Hệ Thống (Operations Guide)](file:///home/ubuntu/cda-network/docs/OPERATIONS_GUIDE.md)**: Hướng dẫn thực hành toàn diện về khởi tạo cụm Docker, nộp giao dịch (batch, single large tx), giám sát Grafana/Prometheus/CLI, và xử lý sự cố thường gặp.
+
+---
+
 ## 1. Tài Liệu Hệ Thống (System Documentation - [docs/system](file:///home/ubuntu/cda-network/docs/system/README.md))
 
 Tài liệu mô tả kiến trúc, giao thức truyền thông, thuật toán toán học, đặc tả kỹ thuật và các giao diện CLI/curl API, được chia thành 3 đầu mục:

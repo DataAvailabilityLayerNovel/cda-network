@@ -72,16 +72,36 @@ python3 scripts/monitor/cda_network_monitor.py --mode dashboard --interval 1.0
 - **Tài khoản**: `admin` / **Mật khẩu**: `admin`
 - **Tên Dashboard**: **CDA Network Performance Dashboard**
 
-#### Ý Nghĩa Các Panel Trọng Tâm (19 Panels):
-1. **CometBFT Block Height**: Chiều cao block đồng thuận mới nhất của CometBFT.
-2. **CDA BlockReady Height**: Chiều cao block đã hoàn thành 100% bảo chứng lưu trữ tại CDA layer.
-3. **CDA Dimension K (ODS Matrix)**: Kích thước ma trận $K$ hiện tại ($8$ khi block trống, $16, 32, 64$ khi có payload).
-4. **CDA Pipeline In-Flight**: Số block đang được xử lý đồng thời trong hàng đợi của Publisher (ngưỡng tối đa 32).
-5. **Mempool Pending Txns**: Số lượng giao dịch chưa xử lý đang chờ trong mempool.
-6. **Block Height Progression**: Biểu đồ đường so sánh giữa Consensus Height và BlockReady Height để phát hiện độ trễ (pipeline lag).
-7. **CDA Pipeline Latency**: Biểu đồ độ trễ xử lý (từ khi Publisher nhận khối đến khi phát tín hiệu `BlockReady`).
-8. **DAS Success Rate & Latency**: Tỷ lệ lấy mẫu thành công và thời gian phản hồi của các Light nodes.
-9. **Total Stored Pieces per Store Node**: Số lượng mảnh dữ liệu (Custody + Recoded) phân bổ đều trên 8 Store nodes.
+#### Bố Cục Dashboard & Các Panel Trọng Tâm:
+Dashboard được tái thiết kế tinh gọn theo 4 khu vực chức năng với hàng tiêu đề (Row) trực quan:
+
+- **🌐 Hàng Tổng Quan Hệ Thống (Top Overview Stat Cards)**:
+  1. **CometBFT Consensus Height**: Chiều cao khối đồng thuận CometBFT mới nhất.
+  2. **CDA BlockReady Height**: Chiều cao khối đã hoàn thành 100% bảo chứng lưu trữ tại CDA layer.
+  3. **ODS Matrix Dimension**: Hiển thị kích thước ODS thực tế ($K \times K$ cells, ví dụ: `64 × 64 (4,096 cells)`).
+  4. **Pipeline In-Flight**: Số lượng khối đang nằm trong pipeline xử lý của Publisher (biểu thị số đơn thuần).
+
+- **⚡ CDA Pipeline Performance & Latency**:
+  - **Block Height Progression**: Biểu đồ so sánh thời gian thực giữa Consensus Height và BlockReady Height.
+  - **CDA Pipeline Latency**: Độ trễ toàn trình từ Publisher đến khi phát tín hiệu `BlockReady` (Avg & P95).
+  - **Node Encoding & Proof Durations**: Đo đạc chi tiết RS Encode, FK20 KZG Proofs và Store Reconstruction.
+  - **Publisher Throughput Over Time & 1m Avg**: Lưu lượng phát hành dữ liệu thực tế.
+
+- **💾 Store Nodes, Custody Sharding & P2P Dissemination**:
+  - **Total Stored Pieces per Store Node**: Số mảnh lưu trữ trên từng node trong 8 Store nodes.
+  - **Store Node Pieces Breakdown Table**: Bảng đối soát cân bằng tải tức thời giữa 8 Store nodes.
+  - **Store Node Database Size**: Dung lượng lưu trữ BadgerDB trên đĩa.
+  - **Store Node Network Rates**: Tần suất truy vấn P2P Request và GossipSub propagation.
+
+- **🛡️ Data Availability Sampling (DAS) & Security**:
+  - **DAS Success Rate**: Tỷ lệ lấy mẫu thành công của các Light nodes (100%).
+  - **Byzantine Forged Pieces Blocked**: Số mảnh giả mạo bị phát hiện và ngăn chặn bởi chữ ký KZG.
+  - **DAS Sampling Latency**: Độ trễ truy vấn mẫu DAS (P95 vs Average).
+
+- **🖥️ Cluster Infrastructure & Mempool**:
+  - **System CPU Usage**: Số core CPU thực tế được sử dụng.
+  - **Mempool Pending Txns**: Số giao dịch đang chờ trong mempool.
+  - **Healthy / Online Nodes**: Tổng số container/tiến trình đang online.
 
 ---
 
