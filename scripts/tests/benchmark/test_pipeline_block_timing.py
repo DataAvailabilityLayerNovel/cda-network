@@ -23,14 +23,14 @@ import urllib.request
 import urllib.error
 
 
-def generate_ods_data(k, cell_size=64):
+def generate_ods_data(k, cell_size=512):
     """Generates k*k dummy cell field elements as hex strings (cell_size*2 hex chars)."""
     hex_len = cell_size * 2
     fmt = f'%0{hex_len}x'
     return [fmt % random.randint(1, 1_000_000) for _ in range(k * k)]
 
 
-def publish_block(publish_url, block_id, height, k, timeout=60, cell_size=64):
+def publish_block(publish_url, block_id, height, k, timeout=60, cell_size=512):
     """Publish a single block to the Publisher Node. Returns (success, http_latency_seconds, error_msg)."""
     data = generate_ods_data(k, cell_size=cell_size)
     payload = {
@@ -256,7 +256,7 @@ if __name__ == "__main__":
     parser.add_argument("--k", type=int, default=8, help="ODS matrix dimension K (default: 8)")
     parser.add_argument("--count", type=int, default=3, help="Number of blocks to test (default: 3)")
     parser.add_argument("--timeout", type=float, default=120.0, help="Timeout per block in seconds (default: 120s)")
-    parser.add_argument("--cell-size", type=int, default=64, help="Cell size in bytes (default: 64)")
+    parser.add_argument("--cell-size", type=int, default=512, help="Cell size in bytes (default: 512)")
     parser.add_argument("--prune-enable", action="store_true", help="Enable pruning flag")
     args = parser.parse_args()
 

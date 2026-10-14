@@ -14,6 +14,7 @@ import argparse
 import base64
 import concurrent.futures
 import json
+import os
 import random
 import sys
 import time
@@ -47,11 +48,15 @@ def submit_tx_to_cometbft(cometbft_rpc, tx_bytes, timeout=30):
         data=req_data,
         headers={'Content-Type': 'application/json'}
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        res = json.loads(resp.read().decode('utf-8'))
-        if "error" in res:
-            raise RuntimeError(f"CometBFT RPC Error: {res['error']}")
-        return res
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            res = json.loads(resp.read().decode('utf-8'))
+            if "error" in res:
+                raise RuntimeError(f"CometBFT RPC Error: {res['error']}")
+            return res
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode('utf-8', errors='ignore').strip()
+        raise RuntimeError(f"CometBFT HTTP {e.code}: {err_body if err_body else e.reason}")
 
 
 def broadcast_tx_batch(cometbft_rpc, txs, max_workers=32, timeout=30):
@@ -103,10 +108,10 @@ def estimate_k(total_cells, min_k=8, max_k=64):
     return k
 
 
-def count_cells_for_txs(txs, cell_size=64):
+def count_cells_for_txs(txs, cell_size=512):
     count = 0
     for tx in txs:
-        if len(tx) == 128:
+        if len(tx) == 2 * cell_size or len(tx) == 128:
             try:
                 bytes.fromhex(tx.decode('ascii'))
                 count += 1
@@ -118,20 +123,20 @@ def count_cells_for_txs(txs, cell_size=64):
     return count
 
 
-def generate_transactions(count, payload_size=64, tx_format="kv", cell_size=64):
+def generate_transactions(count, payload_size=512, tx_format="kv", cell_size=512):
     txs = []
     batch_prefix = uuid.uuid4().hex[:8]
 
     if tx_format == "raw_hex":
         for _ in range(count):
-            hex_data = "".join([f"{random.randint(0, 255):02x}" for _ in range(cell_size)])
+            hex_data = os.urandom(payload_size).hex()
             txs.append(hex_data.encode('ascii'))
         return txs
 
     # Default 'kv' format: tx_<prefix>_<i>=<payload_hex>
     for i in range(count):
         key = f"tx_{batch_prefix}_{i}"
-        payload = bytes([random.randint(0, 255) for _ in range(payload_size)])
+        payload = os.urandom(payload_size)
         tx_str = f"{key}={payload.hex()}"
         txs.append(tx_str.encode('utf-8'))
     return txs
@@ -189,8 +194,9 @@ def main():
     parser.add_argument("--publisher", type=str, default="http://localhost:8080", help="CDA Publisher API endpoint")
     parser.add_argument("--bootstrap", type=str, default="http://localhost:9200", help="CDA Bootstrap API endpoint")
     parser.add_argument("--tx-count", type=int, default=64, help="Number of transactions per batch (default: 64)")
-    parser.add_argument("--payload-size", type=int, default=64, help="Payload data bytes per transaction (default: 64)")
-    parser.add_argument("--tx-format", type=str, default="kv", choices=["kv", "raw_hex"], help="Tx format: 'kv' (key=value) or 'raw_hex' (64B cell)")
+    parser.add_argument("--payload-size", type=int, default=512, help="Payload data bytes per transaction (default: 512)")
+    parser.add_argument("--cell-size", type=int, default=512, help="Cell size in bytes (default: 512)")
+    parser.add_argument("--tx-format", type=str, default="kv", choices=["kv", "raw_hex"], help="Tx format: 'kv' (key=value) or 'raw_hex' (512B cell)")
     parser.add_argument("--interval", type=float, default=2.0, help="Interval between batches in seconds (default: 2.0)")
     parser.add_argument("--batches", type=int, default=0, help="Number of batches to submit (0 = continuous, default: 0)")
     parser.add_argument("--workers", type=int, default=32, help="Concurrency workers for broadcasting (default: 32)")
@@ -204,6 +210,7 @@ def main():
     print(f"CDA Bootstrap   : {args.bootstrap}")
     print(f"Tx Count / Batch: {args.tx_count}")
     print(f"Payload / Tx    : {args.payload_size} bytes ({args.tx_format} format)")
+    print(f"Cell Size       : {args.cell_size} bytes")
     print(f"Batch Interval  : {args.interval}s")
     print(f"Total Batches   : {'Continuous (Infinite)' if args.batches == 0 else args.batches}")
     print("=" * 80)
@@ -229,9 +236,9 @@ def main():
                 break
 
             t_batch_start = time.time()
-            txs = generate_transactions(args.tx_count, payload_size=args.payload_size, tx_format=args.tx_format)
+            txs = generate_transactions(args.tx_count, payload_size=args.payload_size, tx_format=args.tx_format, cell_size=args.cell_size)
             total_bytes = sum(len(tx) for tx in txs)
-            cell_count = count_cells_for_txs(txs)
+            cell_count = count_cells_for_txs(txs, cell_size=args.cell_size)
             expected_k = estimate_k(cell_count)
             print(f"\n[Batch #{batch_idx:03d}] Submitting {len(txs)} txs | Total Data: {total_bytes / 1024:.2f} KB | Cells: {cell_count} | Expected K: {expected_k} ({expected_k}x{expected_k}={expected_k*expected_k} cells)...")
 

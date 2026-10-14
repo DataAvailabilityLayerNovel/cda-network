@@ -112,6 +112,13 @@ def init_cometbft_cluster(num_validators=4, output_dir="./data/cometbft",
             content
         )
 
+        # Increase RPC max_body_bytes to 10MB to support large single transactions
+        content = re.sub(
+            r'max_body_bytes\s*=\s*\d+',
+            'max_body_bytes = 10000000',
+            content
+        )
+
         with open(config_path, "w", encoding="utf-8") as f:
             f.write(content)
 

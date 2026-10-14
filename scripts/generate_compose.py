@@ -9,7 +9,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                      bootstrap_proof_gen_sem=None, bootstrap_seeding_sem=None, bootstrap_batch_chunk_size=None,
                      bootstrap_encode_workers=None,
                      publisher_max_in_flight=None, gomaxprocs=None, cpus=None,
-                     cometbft_validators=0):
+                     cometbft_validators=0, cell_size=512):
     if active_cols is None:
         active_cols = cols
     crash_arg = ["-crash-on-fail=true"] if crash_on_fail else []
@@ -185,6 +185,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                 f'CDA_K={k}',
                 'CDA_MAX_K=64',
                 f'CDA_K_PIECE={k_piece}',
+                f'CDA_CELL_SIZE={cell_size}',
                 f'DISABLE_AUTO_PUBLISHER_PUSH={"false" if v == 0 else "true"}'
             ]
             if gomaxprocs is not None:
@@ -796,6 +797,7 @@ if __name__ == '__main__':
     parser.add_argument('--bootstrap-batch-chunk-size', type=int, default=64, help='Bootstrap P2P batch chunk size (default: 64)')
     parser.add_argument('--publisher-max-in-flight', type=int, default=None, help='Publisher max in-flight blocks')
     parser.add_argument('--cometbft-validators', type=int, default=0, help='Number of CometBFT validator nodes (default: 0)')
+    parser.add_argument('--cell-size', type=int, default=512, help='Cell size in bytes for CDA (default: 512)')
     parser.add_argument('--gomaxprocs', type=int, default=4, help='GOMAXPROCS for Go runtime (default: 4)')
     parser.add_argument('--cpus', type=str, default=None, help='Docker container CPU limit (e.g. 4, 8, 12)')
     parser.add_argument('--out', type=str, default='docker-compose.json', help='Output file')
@@ -836,7 +838,8 @@ if __name__ == '__main__':
         publisher_max_in_flight=args.publisher_max_in_flight,
         gomaxprocs=args.gomaxprocs,
         cpus=args.cpus,
-        cometbft_validators=args.cometbft_validators
+        cometbft_validators=args.cometbft_validators,
+        cell_size=args.cell_size
     )
     
     n = 2 * args.k

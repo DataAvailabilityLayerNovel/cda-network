@@ -284,7 +284,13 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 
 		// Encode RLNC pieces and pre-compute all seeds in memory buffer for active Store Nodes
 		n := len(columnData)
-		totalSeeds := n
+		totalSeeds := getEnvInt("BOOTSTRAP_TOTAL_SEEDS_PER_ROW", 2*rcv.k)
+		if totalSeeds <= 0 {
+			totalSeeds = 2 * rcv.k
+		}
+		if totalSeeds <= 0 {
+			totalSeeds = 8
+		}
 
 		type precomputedPiece struct {
 			row      int

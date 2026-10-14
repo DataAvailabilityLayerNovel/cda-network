@@ -533,8 +533,12 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	// Dynamic ODS sizing: find smallest power-of-2 K (>= 8) such that K*K >= len(decodedData)
 	kBlock := cda.ComputeOptimalODSK(len(decodedData), cda.DefaultMinODSK, 64)
 	targetCells := kBlock * kBlock
+	cellSize := 512
+	if len(decodedData) > 0 && len(decodedData[0]) > 0 {
+		cellSize = len(decodedData[0])
+	}
 	for i := len(decodedData); i < targetCells; i++ {
-		padCell := make([]byte, 64)
+		padCell := make([]byte, cellSize)
 		padCell[0] = byte(i >> 24)
 		padCell[1] = byte(i >> 16)
 		padCell[2] = byte(i >> 8)
