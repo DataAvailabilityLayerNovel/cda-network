@@ -130,6 +130,10 @@ type Receiver struct {
 	fallbackMu      sync.Mutex
 	activeFallbacks map[string]bool
 
+	// Dynamic block dimension tracking: blockID -> N (2*K)
+	blockNMu sync.RWMutex
+	blockN   map[string]int
+
 	// Debounced block completion checker
 	completionCheckChan chan string
 
@@ -228,6 +232,7 @@ func NewReceiver(
 		gossipBatchStop:     make(chan struct{}),
 		completionCheckChan: make(chan string, 1024),
 		disseminationSem:    make(chan struct{}, getEnvInt("STORE_DISSEMINATION_SEM", 16)),
+		blockN:              make(map[string]int),
 	}
 }
 
@@ -250,6 +255,26 @@ func (rcv *Receiver) SetPeers(rowPeers, colPeers []p2pcommon.PeerInfo) {
 	if rcv.ctx != nil {
 		go rcv.subscribeToNonCustodyCells(rcv.ctx, colPeers)
 	}
+}
+
+func (rcv *Receiver) getNetColIdx() int {
+	numCols := rcv.numCols
+	if numCols <= 0 {
+		numCols = 8
+	}
+	baseK := rcv.kBlock
+	if baseK <= 0 {
+		baseK = 16
+	}
+	baseColsPerNetCol := (2 * baseK) / numCols
+	if baseColsPerNetCol <= 0 {
+		baseColsPerNetCol = 1
+	}
+	netCol := rcv.colIdx
+	if rcv.colIdx >= numCols || (baseColsPerNetCol > 1 && rcv.colIdx%baseColsPerNetCol == 0 && rcv.colIdx >= baseColsPerNetCol) {
+		netCol = rcv.colIdx / baseColsPerNetCol
+	}
+	return netCol
 }
 
 func (rcv *Receiver) Start(ctx context.Context) {
@@ -368,7 +393,7 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	if colsPerNetCol == 0 {
 		colsPerNetCol = 1
 	}
-	netColIdx := rcv.colIdx / colsPerNetCol
+	netColIdx := rcv.getNetColIdx()
 	startCol := netColIdx * colsPerNetCol
 	endCol := startCol + colsPerNetCol
 
@@ -663,14 +688,25 @@ func (rcv *Receiver) verifyAndProcessBinaryGossipBatch(items []*p2pcommon.Binary
 	}
 
 	if len(batchItems) > 0 {
-		if rcv.kzg.BatchVerify(batchItems) {
-			for _, item := range candidates {
-				_ = rcv.processVerifiedPiece(item.blockID, item.row, item.col, item.piece, item.coeffs, item.senderPeerID)
-			}
-		} else {
-			for _, item := range candidates {
-				if rcv.kzg.Verify(item.combinedComm, item.row, item.piece.Data.Data, item.piece.Proof) {
+		blockCandidates := make(map[string][]candidateItem)
+		blockBatchItems := make(map[string][]cda.BatchVerifyItem)
+		for i, item := range candidates {
+			blockCandidates[item.blockID] = append(blockCandidates[item.blockID], item)
+			blockBatchItems[item.blockID] = append(blockBatchItems[item.blockID], batchItems[i])
+		}
+
+		for bID, bItems := range blockBatchItems {
+			bCands := blockCandidates[bID]
+			n := rcv.getBlockN(bID)
+			if rcv.kzg.BatchVerifyForDomain(bItems, n) {
+				for _, item := range bCands {
 					_ = rcv.processVerifiedPiece(item.blockID, item.row, item.col, item.piece, item.coeffs, item.senderPeerID)
+				}
+			} else {
+				for _, item := range bCands {
+					if rcv.kzg.VerifyForDomain(item.combinedComm, item.row, item.piece.Data.Data, item.piece.Proof, n) {
+						_ = rcv.processVerifiedPiece(item.blockID, item.row, item.col, item.piece, item.coeffs, item.senderPeerID)
+					}
 				}
 			}
 		}
@@ -714,6 +750,9 @@ func (rcv *Receiver) processAnchor(blockID string, colIdx int, commitsStr []stri
 	if err != nil {
 		log.Printf("[StoreNode] Failed to fetch block header from publisher: %v", err)
 		return
+	}
+	if header != nil && len(header.ColumnComm) > 0 {
+		rcv.setBlockN(blockID, len(header.ColumnComm))
 	}
 
 	// 2. Decode piece commitments
@@ -976,14 +1015,15 @@ func (rcv *Receiver) verifyAndProcessBinaryBatch(payload *p2pcommon.BinaryBatchS
 	}
 
 	if len(batchItems) > 0 {
-		if rcv.kzg.BatchVerify(batchItems) {
+		n := rcv.getBlockN(blockID)
+		if rcv.kzg.BatchVerifyForDomain(batchItems, n) {
 			for _, item := range candidates {
 				_ = rcv.processVerifiedPiece(blockID, item.row, item.col, item.piece, item.coeffs, payload.SenderPeerID)
 			}
 		} else {
 			for _, item := range candidates {
 				combinedCommit, _ := rcv.kzg.Combine(pieceCommitsTyped, item.coeffs)
-				if rcv.kzg.Verify(combinedCommit, item.row, item.piece.Data.Data, item.piece.Proof) {
+				if rcv.kzg.VerifyForDomain(combinedCommit, item.row, item.piece.Data.Data, item.piece.Proof, n) {
 					_ = rcv.processVerifiedPiece(blockID, item.row, item.col, item.piece, item.coeffs, payload.SenderPeerID)
 				}
 			}
@@ -1099,15 +1139,26 @@ func (rcv *Receiver) verifyAndProcessBatch(seeds []p2pcommon.SeedCellRequest) {
 
 	// Batch KZG Verification using RLC (only 2 pairings for the whole batch!)
 	if len(batchItems) > 0 {
-		if rcv.kzg.BatchVerify(batchItems) {
-			for _, item := range candidates {
-				_ = rcv.processVerifiedPiece(item.blockID, item.row, item.col, item.piece, item.decodedCoeffs, item.senderPeerID)
-			}
-		} else {
-			// Fallback: verify individually to isolate any corrupted piece
-			for _, item := range candidates {
-				if rcv.kzg.Verify(item.combinedComm, item.row, item.piece.Data.Data, item.piece.Proof) {
+		blockCandidates := make(map[string][]candidateItem)
+		blockBatchItems := make(map[string][]cda.BatchVerifyItem)
+		for i, item := range candidates {
+			blockCandidates[item.blockID] = append(blockCandidates[item.blockID], item)
+			blockBatchItems[item.blockID] = append(blockBatchItems[item.blockID], batchItems[i])
+		}
+
+		for bID, bItems := range blockBatchItems {
+			bCands := blockCandidates[bID]
+			n := rcv.getBlockN(bID)
+			if rcv.kzg.BatchVerifyForDomain(bItems, n) {
+				for _, item := range bCands {
 					_ = rcv.processVerifiedPiece(item.blockID, item.row, item.col, item.piece, item.decodedCoeffs, item.senderPeerID)
+				}
+			} else {
+				// Fallback: verify individually to isolate any corrupted piece
+				for _, item := range bCands {
+					if rcv.kzg.VerifyForDomain(item.combinedComm, item.row, item.piece.Data.Data, item.piece.Proof, n) {
+						_ = rcv.processVerifiedPiece(item.blockID, item.row, item.col, item.piece, item.decodedCoeffs, item.senderPeerID)
+					}
 				}
 			}
 		}
@@ -1179,9 +1230,12 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 		// Fallback: fetch header and anchor commitments
 		height := p2pcommon.ParseHeightFromBlockID(blockID)
 		log.Printf("[Height: %d] [StoreNode] Anchored commitments not found in cache for block %s. Fetching from publisher...", height, blockID)
-		_, err := verifier.FetchBlockHeader(rcv.publisherAddr, blockID)
+		h, err := verifier.FetchBlockHeader(rcv.publisherAddr, blockID)
 		if err != nil {
 			return fmt.Errorf("failed to fetch header: %w", err)
+		}
+		if h != nil && len(h.ColumnComm) > 0 {
+			rcv.setBlockN(blockID, len(h.ColumnComm))
 		}
 
 		if len(pieceCommitsStr) == 0 {
@@ -1210,7 +1264,8 @@ func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsS
 		return fmt.Errorf("failed to compute combined commitment: %w", err)
 	}
 
-	if !rcv.kzg.Verify(combinedCommit, rowIdx, piece.Data.Data, combinedProof) {
+	n := rcv.getBlockN(blockID)
+	if !rcv.kzg.VerifyForDomain(combinedCommit, rowIdx, piece.Data.Data, combinedProof, n) {
 		ByzantineDetectionsTotal.Inc()
 		if rcv.crashOnFail {
 			log.Fatalf("Layer 3 verification failed (CRASH): Piece [%d, %d] does not match combined column commitment", rowIdx, col)
@@ -1590,7 +1645,7 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string, attempt int) {
 		return
 	}
 
-	n := 2 * rcv.kBlock
+	n := rcv.getBlockN(blockID)
 	numCols := rcv.numCols
 	if numCols <= 0 {
 		numCols = 8
@@ -1600,9 +1655,12 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string, attempt int) {
 		colsPerNetCol = 1
 	}
 
-	netColIdx := rcv.colIdx / colsPerNetCol
+	netColIdx := rcv.getNetColIdx()
 	startCol := netColIdx * colsPerNetCol
 	endCol := startCol + colsPerNetCol
+	if endCol > n {
+		endCol = n
+	}
 	storesPerCol := rcv.storesPerCol
 	if storesPerCol <= 0 {
 		storesPerCol = 8
@@ -2668,8 +2726,38 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 	json.NewEncoder(stream).Encode(resp)
 }
 
+func (rcv *Receiver) setBlockN(blockID string, n int) {
+	if n <= 0 {
+		return
+	}
+	rcv.blockNMu.Lock()
+	if rcv.blockN == nil {
+		rcv.blockN = make(map[string]int)
+	}
+	rcv.blockN[blockID] = n
+	rcv.blockNMu.Unlock()
+}
+
+func (rcv *Receiver) getBlockN(blockID string) int {
+	rcv.blockNMu.RLock()
+	if n, ok := rcv.blockN[blockID]; ok && n > 0 {
+		rcv.blockNMu.RUnlock()
+		return n
+	}
+	rcv.blockNMu.RUnlock()
+
+	header, err := verifier.FetchBlockHeader(rcv.publisherAddr, blockID)
+	if err == nil && header != nil && len(header.ColumnComm) > 0 {
+		n := len(header.ColumnComm)
+		rcv.setBlockN(blockID, n)
+		return n
+	}
+
+	return 2 * rcv.kBlock
+}
+
 func (rcv *Receiver) DiagnoseCompletion(blockID string) (bool, map[string]interface{}) {
-	n := 2 * rcv.kBlock
+	n := rcv.getBlockN(blockID)
 	numCols := rcv.numCols
 	if numCols <= 0 {
 		numCols = 8
@@ -2679,9 +2767,12 @@ func (rcv *Receiver) DiagnoseCompletion(blockID string) (bool, map[string]interf
 		colsPerNetCol = 1
 	}
 
-	netColIdx := rcv.colIdx / colsPerNetCol
+	netColIdx := rcv.getNetColIdx()
 	startCol := netColIdx * colsPerNetCol
 	endCol := startCol + colsPerNetCol
+	if endCol > n {
+		endCol = n
+	}
 
 	storesPerCol := rcv.storesPerCol
 	if storesPerCol <= 0 {
@@ -2850,7 +2941,7 @@ func (rcv *Receiver) doCheckAndLogCompletion(blockID string) {
 		// Final Block Cleanup: Prune all raw pieces for Backup and Non-Custody cells,
 		// and delete any errant recoded pieces for Primary cells to guarantee strict steady-state piece counts.
 		go func(bID string) {
-			n := 2 * rcv.kBlock
+			n := rcv.getBlockN(bID)
 			numCols := rcv.numCols
 			if numCols <= 0 {
 				numCols = 8
@@ -2859,9 +2950,12 @@ func (rcv *Receiver) doCheckAndLogCompletion(blockID string) {
 			if colsPerNetCol == 0 {
 				colsPerNetCol = 1
 			}
-			netColIdx := rcv.colIdx / colsPerNetCol
+			netColIdx := rcv.getNetColIdx()
 			startCol := netColIdx * colsPerNetCol
 			endCol := startCol + colsPerNetCol
+			if endCol > n {
+				endCol = n
+			}
 			storesPerCol := rcv.storesPerCol
 			if storesPerCol <= 0 {
 				storesPerCol = 8

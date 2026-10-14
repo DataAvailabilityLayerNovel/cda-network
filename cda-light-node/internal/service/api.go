@@ -909,7 +909,7 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 
 	// Perform local algebraic verification using block header
 	columnCommitment := header.ColumnComm[col]
-	recoveredCell, verified, err := s.verifier.VerifyReconstructedCell(recvPieces, columnCommitment, header.Coeffs, row)
+	recoveredCell, verified, err := s.verifier.VerifyReconstructedCell(recvPieces, columnCommitment, header.Coeffs, row, len(header.ColumnComm))
 	if err != nil {
 		recordDASAttempt(false)
 		ByzantineDetectionsTotal.Inc()

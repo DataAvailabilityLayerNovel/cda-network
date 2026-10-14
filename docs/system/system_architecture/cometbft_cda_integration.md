@@ -1,245 +1,260 @@
-# Tài Liệu Hiện Trạng & Kế Hoạch Tích Hợp Đồng Thuận CometBFT Vào CDA Network
+# Kiến Trúc Tích Hợp Đồng Thuận CometBFT & CDA Network Data Availability
 
-Tài liệu này trình bày chi tiết hiện trạng hiện thực, kiến trúc tùy biến khối dữ liệu BFT và kế hoạch tích hợp chuyển đổi từ cơ chế tạo khối giả lập (Simulated Publishing) sang **Lớp Đồng Thuận CometBFT Thực Tế (Real BFT Block Production)** cho hệ thống **CDA Network (Data Availability Layer)**.
-
----
-
-## 1. Tổng Quan & Mục Tiêu Architecture Integration
-
-### 1.1. Hiện Trạng Trước Khi Tích Hợp
-Trước đây, hệ thống CDA Network sử dụng service **Publisher Node** kết hợp cùng các công cụ giả lập (`publish.sh`, `block_publisher_bot.py`) để tạo khối:
-- Client bên ngoài gửi dữ liệu trực tiếp tới REST API `POST /publish` của Publisher Node.
-- Publisher Node tự sinh mã khối `BlockID` (dạng `manual-block-1`, `block-X`) không qua đồng thuận BFT.
-- Chưa có cơ chế đồng thuận phân tán giữa các validator để chốt thứ tự khối và xác thực cryptographic gốc (Root of Trust) trước khi lưu trữ.
-
-### 1.2. Mục Tiêu Tích Hợp Mới
-Thay thế toàn bộ quy trình giả lập bằng **CometBFT Consensus Engine**:
-- **CometBFT (Layer BFT Consensus)**: Đóng vai trò là mạng lưới các Node Validator chạy thuật toán đồng thuận Tendermint/CometBFT BFT. Tiếp nhận giao dịch/ODS cells, đóng gói vào Block BFT, tính toán và xác thực các cam kết mã hóa CDA (CommitsRoot, ColumnComm, Coeffs), sau đó chốt khối (BFT Finality).
-- **PublisherPusher Bridge**: Ngay khi block được chốt đồng thuận BFT, CometBFT tự động chuyển giao (push) khối dữ liệu finalized kèm toàn bộ cam kết BFT Header sang Publisher Node.
-- **Publisher Node (Layer DA Distribution & Active Verification)**: Tiếp nhận khối dữ liệu và cam kết Root of Trust từ CometBFT. Trước khi phân tán, Publisher **thực hiện bước kiểm tra xác thực Header (Verify Header)** đối chiếu với các cam kết mật mã (`CommitsRoot`, `ColumnComm`, `Coeffs`) tương tự như quy trình xác thực đồng thuận của các Validator Node. Khi và chỉ khi xác thực thành công, Publisher mới tiến hành phát tán Block Header tới Light Nodes qua GossipSub và phân tán các cột dữ liệu tới Store Nodes qua P2P stream.
+Tài liệu này đặc tả toàn diện kiến trúc kỹ thuật của hệ thống **CDA Network (Data Availability Layer)** khi tích hợp với lớp đồng thuận **CometBFT Consensus Engine**, bao gồm mô hình phân tầng, cấu trúc dữ liệu mật mã, giao thức tương tác giữa các thành phần và cơ chế xác thực đa tầng (Multi-tier Verification).
 
 ---
 
-## 2. Phân Tích Hiện Trạng Tùy Biến Cấu Trúc Khối Trong CometBFT (`cometbft/`)
+## 1. Tổng Quan Kiến Trúc (Architecture Overview)
 
-Mã nguồn CometBFT nằm tại thư mục `cometbft/` đã được tùy biến chuyên sâu để hỗ trợ giao thức CDA Network:
+### 1.1. Bối cảnh & Vai trò của CometBFT trong Hệ Sinh Thái CDA
+Trong mô hình Modular Blockchain, **CDA Network** chịu trách nhiệm cung cấp tính sẵn sàng dữ liệu (Data Availability - DA) với thông lượng cao và độ trễ thấp thông qua mã hóa xóa 2D (RSMT-2D), cam kết KZG Kate và mã hóa mạng ngẫu nhiên (RLNC).
+
+Để chuyển đổi từ hệ thống độc lập dựa trên việc tạo khối giả lập sang mạng lưới sản xuất khối phi tập trung thực tế, **CometBFT** được tích hợp làm lớp đồng thuận chính:
+- **CometBFT (Tầng Đồng Thuận - Consensus Layer)**: Tập hợp các Validator Node chạy thuật toán đồng thuận Byzantine Fault Tolerant (BFT Tendermint/CometBFT). Chịu trách nhiệm tiếp nhận giao dịch từ Client/Rollup, sắp xếp thứ tự khối, đóng gói ma trận dữ liệu gốc $K \times K$ (ODS), tính toán và xác thực các cam kết mật mã CDA (`CommitsRoot`, `ColumnComm`, `Coeffs`) trực tiếp trong chu trình đồng thuận trước khi chốt khối (BFT Finality).
+- **Publisher Node (Tầng Phân Tán & Cầu Nối - DA Ingestion & Dissemination Layer)**: Đóng vai trò là cầu nối Zero-Trust tiếp nhận khối đã chốt từ CometBFT, đối soát xác thực lại toàn bộ BFT Header với cam kết độc lập, sau đó phân tách dữ liệu thành các cột và phát tán ra mạng P2P libp2p.
+- **Bootstrap & Store Nodes (Tầng Lưu Trữ Bảo Chứng - Custody Storage Layer)**: Lưu trữ các mảnh mã hóa theo cơ chế Custody đa nhóm cột, đảm bảo trạng thái steady-state (ví dụ $3,840$ mảnh với $K=64$).
+- **Light Nodes (Tầng Kiểm Chứng Khách Nhẹ - DAS Sampling Layer)**: Tiến hành lấy mẫu ngẫu nhiên (Data Availability Sampling - DAS) để xác thực tính sẵn sàng dữ liệu mà không cần tải toàn bộ block.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        CLIENT / ROLLUP LAYER                           │
+│              (Giao dịch L2 / Dữ liệu ODS Cells nộp qua RPC)             │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ CometBFT RPC: 26657
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                  COMETBFT BFT CONSENSUS LAYER                          │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────┐ │
+│  │ Validator 0  │───│ Validator 1  │───│ Validator 2  │───│ ... (V)  │ │
+│  └──────┬───────┘   └──────────────┘   └──────────────┘   └──────────┘ │
+│         │ (Mempool -> Propose -> BFT Consensus 3f+1 -> Commit)         │
+│         │ Tính toán & Bỏ phiếu cam kết CDA Header                      │
+└─────────┼──────────────────────────────────────────────────────────────┘
+          │ PublisherPusher (HTTP POST /publish + BFT Header Payload)
+          ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   CDA PUBLISHER NODE (ZERO-TRUST)                      │
+│   (Xác thực BFT Header -> Mở rộng EDS 2Kx2K -> Phân tán P2P)          │
+└─────────┬──────────────────────────────────────────────────────────────┘
+          │
+    ┌─────┴──────────────────────────────────────────┐
+    │ P2P Column Chunks Stream                       │ GossipSub BlockReady (/cda/block-ready)
+    ▼                                                ▼
+┌─────────────────────────────────────┐   ┌──────────────────────────────┐
+│  BOOTSTRAP & STORE NODES (CUSTODY)  │   │   LIGHT NODES (AUTO-DAS)     │
+│  - Bootstrap Node: KZG & RLNC Seed  │   │   - Lấy mẫu ngẫu nhiên DAS   │
+│  - Store Nodes: Lưu trữ Custody     │   │   - Xác thực Kate Commitment │
+└─────────────────────────────────────┘   └──────────────────────────────┘
+```
+
+---
+
+## 2. Đặc Tả Cấu Trúc Dữ Liệu & Cryptographic Primitives
 
 ### 2.1. Mở Rộng Block Header (`cometbft/types/block.go`, `cometbft/proto/tendermint/types/types.proto`)
-Cấu trúc `Header` của CometBFT đã được bổ sung 3 trường cam kết Root of Trust của CDA:
-- `CommitsRoot` (`cmtbytes.HexBytes`): Gốc cây Merkle (Merkle Root) của mảng các KZG piece commitments.
-- `ColumnComm` (`[][]byte`): Mảng các cam kết KZG Kate theo từng cột của ma trận EDS.
-- `Coeffs` (`[]byte`): Vector chứa các hệ số mã hóa mạng tuyến tính RLNC (Random Linear Network Coding).
+Để gắn kết tính toàn vẹn của dữ liệu DA vào tính hữu hiệu của khối BFT, cấu trúc `Header` của CometBFT được mở rộng 3 trường cam kết mật mã gốc (Root of Trust):
 
 ```go
 type Header struct {
     // ... Các trường tiêu chuẩn của CometBFT (Version, ChainID, Height, Time, LastBlockID, DataHash, ...)
     
     // CDA Root of Trust fields
-    CommitsRoot cmtbytes.HexBytes `json:"commits_root"`
-    ColumnComm  [][]byte          `json:"column_comm"`
-    Coeffs      []byte            `json:"coeffs"`
+    CommitsRoot cmtbytes.HexBytes `json:"commits_root"` // Merkle Root của tất cả piece commitments
+    ColumnComm  [][]byte          `json:"column_comm"`  // Cam kết KZG Kate của 2K cột trong EDS
+    Coeffs      []byte            `json:"coeffs"`       // Hệ số mã hóa RLNC tạo ra bởi Fiat-Shamir
 }
 ```
 
+- **`CommitsRoot`**: Giá trị băm 32 bytes của gốc cây Merkle xây dựng trên mảng các cam kết KZG piece commitments của ma trận EDS.
+- **`ColumnComm`**: Mảng $2K$ cam kết điểm trên đường cong elliptic BLS12-381 (G1 point, 48 bytes nén), đại diện cho từng cột của ma trận mở rộng EDS.
+- **`Coeffs`**: Chuỗi bytes chứa vector hệ số ngẫu nhiên phục vụ mã hóa mạng tuyến tính RLNC.
+
 ### 2.2. Mở Rộng Block Data (`cometbft/types/block.go`)
-Cấu trúc `Data` chứa thông tin ODS matrix của khối:
-- `Data.ODS` (`ODSData`): Lưu trữ mảng các tế bào $K \times K$ (Original Data Square cells) trực tiếp bên trong block BFT.
+Dữ liệu khối của CometBFT hỗ trợ ma trận dữ liệu gốc ODS (Original Data Square):
 
 ```go
 type ODSData struct {
-    K     int      `json:"k"`
-    Cells [][]byte `json:"cells"`
+    K     int      `json:"k"`     // Kích thước ma trận gốc (K x K)
+    Cells [][]byte `json:"cells"` // Mảng K*K ô dữ liệu (mỗi ô kích thước chuẩn, ví dụ 512 bytes)
+}
+
+type Data struct {
+    Txs  Txs      `json:"txs"`
+    ODS  ODSData  `json:"ods"`   // Lưu trữ trực tiếp ODS cells
 }
 ```
 
-### 2.3. Đối Chiếu Thực Tế Các Hàm Từ Thư Viện Core `rlnc-rsmt2d` Trong Toàn Bộ Hệ Thống CDA
+Khi đóng khối, nếu block có giao dịch `Txs`, hàm `BuildODSFromTxs` sẽ tự động gom các giao dịch thành ma trận ODS $K \times K$.
 
-Kết quả rà soát mã nguồn thực tế ghi nhận các hàm thuộc repository core `rlnc-rsmt2d` (`github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d`) đang được gọi trực tiếp tại các module trong hệ thống CDA như sau:
+### 2.3. Đối Chiếu Các Hàm Thư Viện Lõi `rlnc-rsmt2d`
 
-| Gói Core `rlnc-rsmt2d` | Hàm / Cấu trúc | Vị trí gọi trong hệ thống CDA | Mục đích trong luồng thực tế |
+Bảng đối chiếu việc sử dụng thư viện mật mã lõi [`rlnc-rsmt2d`](file:///home/ubuntu/cda-network/rlnc-rsmt2d) xuyên suốt hệ thống:
+
+| Gói Core `rlnc-rsmt2d` | Hàm / Cấu trúc | Vị trí gọi trong hệ thống CDA | Vai trò kiến trúc |
 | :--- | :--- | :--- | :--- |
-| **`cda`** | `cda.ComputeExtendedDataSquareWithLeopard(odsData)` | • `cda-publisher-node/internal/engine/pipeline.go` (Line 38)<br>• `cometbft/state/cda_engine.go` (Line 65) | Mở rộng ma trận ODS $K \times K$ thành ma trận 2D `rsmt2d.ExtendedDataSquare` ($2K \times 2K$) bằng RS Leopard codec. |
-| **`cda`** | `cda.ComputeAndSetKateCommitments(codec, &eds, kzg, seed)` | • `cda-publisher-node/internal/engine/pipeline.go` (Line 45)<br>• `cometbft/state/cda_engine.go` (Line 72) | Tính mảng cam kết cột `ColumnComm` và piece commitments qua thuật toán Fiat-Shamir. |
-| **`cda`** | `cda.BuildMerkleTree(pieceCommitsBytes)` | • `cda-publisher-node/internal/engine/pipeline.go` (Line 55)<br>• `cometbft/state/cda_engine.go` (Line 82) | Xây dựng Merkle tree của piece commitments, sinh ra `CommitsRoot` và Merkle proofs. |
-| **`cda`** | `cda.NewGnarkKZG(srs)` | • `cda-publisher-node/internal/engine/pipeline.go` (Line 32)<br>• `cometbft/state/cda_engine.go` (Line 30)<br>• `cda-light-node/cmd/light/main.go` | Khởi tạo KZG commitment provider trên đường cong elliptic BLS12-381. |
-| **`cda`** | `cda.VerifyMerkleProof(root, leaf, proof)` | • `cda-store-node/internal/verifier/piece_verify.go` (Line 64) | Store Node xác thực Layer 1 (Merkle Root) cho các piece commitments của cột custody được phân tán. |
-| **`cda`** | `kzg.Combine` & `kzg.Verify` | • `cda-store-node/internal/verifier/piece_verify.go` (Line 74)<br>• `cda-light-node/internal/verifier/das_verifier.go` (Line 224) | Store Node & Light Node kiểm tra tính nhất quán Layer 2 giữa các mảnh dữ liệu và `ColumnComm`. |
-| **`rlnc`** | `rlnc.NewRLNCCodec(k)` & `rlnc.SolveGaussian(A, B)` | • `cda-publisher-node/internal/engine/pipeline.go` (Line 44)<br>• `cometbft/state/cda_engine.go` (Line 71)<br>• `cda-light-node/internal/verifier/das_verifier.go` (Line 25, 58, 86) | Quản lý tham số mã hóa mạng RLNC, giải hệ phương trình tuyến tính Gauss để khôi phục dữ liệu ô cell khi lấy mẫu DAS. |
-| **`rsmt2d`** | `rsmt2d.ExtendedDataSquare` & `datasquare.go` | • `cda-publisher-node/internal/engine/pipeline.go` (Line 36)<br>• `cometbft/state/cda_engine.go` (Line 65) | Đối tượng lưu trữ ma trận 2D chứa dữ liệu hàng/cột và thông tin mã hóa gốc. |
+| **`cda`** | `cda.ComputeExtendedDataSquareWithLeopard(odsData)` | • `cda-publisher-node/internal/engine/pipeline.go`<br>• `cometbft/state/cda_engine.go` | Mở rộng ma trận ODS $K \times K$ thành ma trận 2D EDS ($2K \times 2K$) bằng thuật toán Leopard Reed-Solomon. |
+| **`cda`** | `cda.ComputeAndSetKateCommitments(codec, &eds, kzg, seed)` | • `cda-publisher-node/internal/engine/pipeline.go`<br>• `cometbft/state/cda_engine.go` | Tính mảng cam kết cột `ColumnComm` và piece commitments thông qua biến đổi Fiat-Shamir. |
+| **`cda`** | `cda.BuildMerkleTree(pieceCommitsBytes)` | • `cda-publisher-node/internal/engine/pipeline.go`<br>• `cometbft/state/cda_engine.go` | Xây dựng Merkle Tree từ piece commitments, tạo ra `CommitsRoot` và các bằng chứng Merkle cột. |
+| **`cda`** | `cda.NewGnarkKZG(srs)` | • `cda-publisher-node/internal/engine/pipeline.go`<br>• `cometbft/state/cda_engine.go`<br>• `cda-light-node/cmd/light/main.go` | Khởi tạo engine KZG Commitment trên đường cong BLS12-381 với Structured Reference String (SRS). |
+| **`cda`** | `cda.VerifyMerkleProof(root, leaf, proof)` | • `cda-store-node/internal/verifier/piece_verify.go` | Store Node xác thực Layer 1 (Merkle Root) cho các piece commitments của cột custody. |
+| **`cda`** | `kzg.Combine` & `kzg.Verify` | • `cda-store-node/internal/verifier/piece_verify.go`<br>• `cda-light-node/internal/verifier/das_verifier.go` | Xác thực tính hợp lệ của mảnh dữ liệu so với `ColumnComm` (Layer 2 KZG Evaluation Proof). |
+| **`rlnc`** | `rlnc.NewRLNCCodec(k)` & `rlnc.SolveGaussian(A, B)` | • `cda-publisher-node/internal/engine/pipeline.go`<br>• `cometbft/state/cda_engine.go`<br>• `cda-light-node/internal/verifier/das_verifier.go` | Khởi tạo codec RLNC và giải hệ phương trình tuyến tính khử Gauss trên trường hữu hạn $F_r$. |
+| **`rsmt2d`** | `rsmt2d.ExtendedDataSquare` | • `cda-publisher-node/internal/engine/pipeline.go`<br>• `cometbft/state/cda_engine.go` | Cấu trúc dữ liệu biểu diễn ma trận 2D đã mã hóa xóa. |
 
-### 2.4. Đóng Gói Tự Động Đẩy Khối Sang Publisher Kèm BFT Header Commitments (`cometbft/state/publisher_pusher.go`, `execution.go`)
-Trong hàm `BlockExecutor.ApplyBlock()`, ngay khi khối hoàn tất đồng thuận và commit vào State Store, một goroutine bất đồng bộ được kích hoạt:
-
-```go
-// Push committed block to Publisher Node
-go func(b *types.Block) {
-    pusher := NewPublisherPusher("")
-    _ = pusher.PushCommittedBlock(b)
-}(block)
-```
-
-`PublisherPusher.PushCommittedBlock` trích xuất `BlockID` (BFT Hash), mảng cell ODS và **toàn bộ các cam kết BFT Header đã đạt đồng thuận** (`CommitsRoot`, `ColumnComm`, `Coeffs`), gửi HTTP POST sang REST API `/publish` của Publisher Node:
+### 2.4. Giao Thức Chuyển Giao BFT Bridge (`PublisherPusher`)
+Khi một khối đạt đồng thuận BFT và commit vào StateDB của CometBFT, thành phần [`PublisherPusher`](file:///home/ubuntu/cda-network/cometbft/state/publisher_pusher.go) tự động đóng gói payload và gửi sang Publisher Node qua HTTP REST API:
 
 ```go
 type HeaderPayload struct {
-    CommitsRoot string   `json:"commits_root"`
-    ColumnComm  []string `json:"column_comm"`
-    Coeffs      string   `json:"coeffs"`
+    CommitsRoot string   `json:"commits_root,omitempty"`
+    ColumnComm  []string `json:"column_comm,omitempty"`
+    Coeffs      string   `json:"coeffs,omitempty"`
 }
 
 type PublishRequest struct {
     BlockID   string         `json:"block_id"`
-    Data      []string       `json:"data"`
+    Height    int64          `json:"height,omitempty"`
+    Data      []string       `json:"data"`   // Mảng hex của K*K ODS cells
     Header    *HeaderPayload `json:"header,omitempty"`
     Signature string         `json:"signature,omitempty"`
 }
 ```
 
-Cấu trúc `HeaderPayload` này cung cấp chứng cứ cryptographic đầy đủ giúp Publisher Node thực hiện bước **Verify Header** trước khi phân tán dữ liệu ra mạng lưới.
-
 ---
 
-## 3. Luồng Chuyển Giao Dữ Liệu Hệ Thống (End-to-End Data Flow Lifecycle)
-
-Sơ đồ trình bày chi tiết toàn bộ chu trình xử lý dữ liệu từ lúc client phát hành giao dịch cho tới khi dữ liệu được lưu trữ phân tán an toàn, trong đó **Publisher Node thực hiện thêm bước Verify Header tương tự Validator Node**:
+## 3. Luồng Vòng Đời Dữ Liệu Toàn Trình (End-to-End Data Lifecycle)
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Client as User / L2 Client
+    actor Client as User / L2 Rollup Client
     participant Mempool as CometBFT Mempool
     participant Proposer as CometBFT Proposer Node
-    participant Validators as CometBFT Validator Set
+    participant Validators as CometBFT Validator Set (3f+1)
     participant Publisher as CDA Publisher Node
-    participant Stores as CDA Store Nodes (Columns)
-    participant Lights as CDA Light Nodes (DAS)
+    participant Stores as CDA Store Nodes (Custody)
+    participant Lights as CDA Light Nodes (Auto-DAS)
 
-    Client->>Mempool: 1. Nộp Giao dịch / ODS Cells qua CometBFT RPC
+    Note over Client,Validators: GIAI ĐOẠN 1: BFT CONSENSUS & CDA COMMITMENT
+    Client->>Mempool: 1. Nộp giao dịch / ODS Cells qua RPC (broadcast_tx_sync)
     Proposer->>Proposer: 2. Gom Txs & Tính CDA Header (ComputeCDAHeader: CommitsRoot, ColumnComm, Coeffs)
-    Proposer->>Validators: 3. Phát tán Khối Đề Xuất (Proposal Block: Header + ODS)
-    Validators->>Validators: 4. Xác thực Cam kết Cryptographic (VerifyCDAHeader) & Thực thi BFT Consensus
-    Validators-->>Proposer: 5. Khối Đạt Đồng Thuận (BFT Commit Finality)
-    Proposer->>Publisher: 6. PushCommittedBlock (POST /publish: BlockID, Header Commitments, ODS Cells)
+    Proposer->>Validators: 3. Phát tán Block Proposal (Block Header + ODS Data)
+    Validators->>Validators: 4. VerifyCDAHeader (Tính lại và so khớp cam kết)
+    Validators-->>Proposer: 5. Bỏ phiếu Prevote/Precommit & Chốt khối (BFT Finality)
+    
+    Note over Proposer,Publisher: GIAI ĐOẠN 2: BRIDGE INGESTION & ZERO-TRUST VERIFICATION
+    Proposer->>Publisher: 6. PushCommittedBlock (POST /publish: BlockID, Height, ODS, HeaderPayload)
     Publisher->>Publisher: 7. Mã hóa EDS, Tính toán Piece Commitments & Merkle Column Proofs
-    Publisher->>Publisher: 8. Verify Header: Đối chiếu Commitments vừa tính với BFT Header (Giống quy trình Validator)
-    alt Header Hợp Lệ (Verification Success)
+    Publisher->>Publisher: 8. Verify Header: So khớp Commitments tự tính với BFT Header từ CometBFT
+    
+    alt Header Hợp Lệ (Verification Passed)
+        Note over Publisher,Lights: GIAI ĐOẠN 3: PHÂN TÁN DA & LƯU TRỮ CUSTODY
         Publisher->>Lights: 9. Phát tán BlockHeader qua GossipSub (/cda/header)
-        Publisher->>Stores: 10. Phân tán Column Chunks qua P2P Stream từng Cột
-        Stores-->>Publisher: 11. Tín hiệu StoreReady (Hoàn thành Lưu trữ Custody)
-        Publisher->>Lights: 12. Phát tán Tín hiệu BlockReady (100% Cột Hoàn Thành Lưu Trữ)
-    else Header Không Hợp Lệ (Verification Failed)
-        Publisher->>Publisher: 13. Revert/Reject: Hủy bỏ phân tán, cảnh báo dữ liệu không toàn vẹn (HTTP 422)
+        Publisher->>Stores: 10. Phân tán Column Chunks qua P2P Stream từng cột
+        Stores-->>Publisher: 11. Tín hiệu StoreReady qua GossipSub (Đã đủ mảnh Custody)
+        Publisher->>Lights: 12. Phát tán BlockReady (100% cột đã bảo chứng lưu trữ)
+        
+        Note over Lights,Stores: GIAI ĐOẠN 4: DATA AVAILABILITY SAMPLING (DAS)
+        Lights->>Stores: 13. Lấy mẫu ngẫu nhiên 16 cells qua P2P Stream
+        Stores-->>Lights: 14. Trả về Cell Data + Opening Proof
+        Lights->>Lights: 15. Xác thực KZG Proof với ColumnComm -> Kết luận DA Thành Công
+    else Header Không Hợp Lệ (Verification Failed / Tampered)
+        Publisher->>Publisher: 16. Revert/Reject: Hủy bỏ phân tán, từ chối với HTTP 422 Unprocessable Entity
     end
 ```
 
-### 3.1. Phân Tích Cơ Chế Verify Header Tại Publisher Node
+---
 
-#### 3.1.1. Mục Tiêu & Nguyên Lý Thiết Kế (Zero-Trust Data Ingestion)
-Trong kiến trúc phân tầng của CDA Network, Publisher Node không chỉ là một kênh trung chuyển thụ động:
-- **Ngăn chặn dữ liệu giả mạo/lỗi đường truyền**: Dù khối đã được Validator Set xác thực trong pha đồng thuận, kênh chuyển tiếp (Bridge HTTP/RPC) từ CometBFT sang Publisher có thể gặp trục trặc mạng, lỗi giải mã hoặc can thiệp từ bên ngoài.
-- **Tính nhất quán đa tầng (Multi-tier Cryptographic Consistency)**: Đảm bảo dữ liệu mà Publisher dùng để mở rộng EDS và phân tán cho Store Nodes/Light Nodes có nguồn gốc mật mã đồng nhất 100% với Root of Trust mà mạng lưới Validator BFT đã đồng thuận và ghi vào Block Header.
-- **Bảo vệ Store Nodes và Light Nodes**: Ngăn ngừa phát tán các cột dữ liệu rác, cam kết sai lệch dẫn tới việc Store Nodes bị quá tải xác thực hoặc Light Nodes phát hiện sai sót trong quá trình Data Availability Sampling (DAS).
+## 4. Mô Hình Xác Thực Mật Mã Đa Tầng (Multi-Tier Verification Model)
 
-#### 3.1.2. Thuật Toán Verify Header (Tương Đương Quy Trình Consensus Của Validator)
-Quy trình xác thực Header tại Publisher Node tái hiện chính xác logic của `VerifyCDAHeader(block)` trong CometBFT:
+Hệ thống thiết lập nguyên lý **Zero-Trust** xuyên suốt từ khâu đồng thuận đến khâu người dùng cuối:
 
-1. **Nhận Dữ Liệu**: Tiếp nhận `ODSData` và `BFTHeader` (`CommitsRoot`, `ColumnComm`, `Coeffs`) từ payload `PublishRequest`.
-2. **Tái Lập & Tính Toán Độc Lập**:
-   - Mở rộng ma trận ODS thành EDS bằng Leopard Reed-Solomon Codec:
-     $$\text{EDS} = \text{cda.ComputeExtendedDataSquareWithLeopard}(\text{ODS})$$
-   - Tính toán mảng Kate Column Commitments qua Fiat-Shamir RLNC:
-     $$\text{pubData} = \text{cda.ComputeAndSetKateCommitments}(\text{codec}, \text{EDS}, \text{KZG}, 0)$$
-   - Xây dựng Merkle Tree từ piece commitments để tìm Root:
-     $$\text{computedRoot}, \text{proofs} = \text{cda.BuildMerkleTree}(\text{pieceCommits})$$
-3. **Đối Chiếu Mật Mã (Cryptographic Equivalence Check)**:
-   - **Xác thực Merkle Root**:
-     $$\text{hex}(\text{computedRoot}) \stackrel{?}{=} \text{hex}(\text{BFTHeader.CommitsRoot})$$
-   - **Xác thực KZG Column Commitments**:
-     $$\text{pubData.ColumnComm}[i] \stackrel{?}{=} \text{BFTHeader.ColumnComm}[i], \quad \forall i \in [0, 2K)$$
-   - **Xác thực Hệ số RLNC (Coeffs)**:
-     $$\text{pubData.Coeffs}[0] \stackrel{?}{=} \text{BFTHeader.Coeffs}$$
-4. **Quyết Định Xử Lý**:
-   - **Hợp lệ (Pass)**: Publisher lưu Header vào BadgerDB (`header_<BlockID>`), phát tán `BlockHeader` lên GossipSub topic `/cda/header`, và kích hoạt song song $2K$ luồng phân tán cột tới các Store Nodes.
-   - **Không hợp lệ (Fail)**: Trả mã lỗi `HTTP 422 Unprocessable Entity`, ghi nhận log lỗi chi tiết sai lệch cam kết (mismatched root / column count / coeffs), lập tức ngừng toàn bộ luồng phát tán nhằm bảo vệ an toàn cho Store Nodes và Light Nodes.
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ Layer 0: BFT Consensus Finality                                       │
+│ Thuật toán BFT CometBFT: Chống lỗi Byzantine lên tới f < N/3           │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+┌───────────────────────────────────▼────────────────────────────────────┐
+│ Layer 1: Consensus CDA Verification (CometBFT Validators)             │
+│ Hàm: VerifyCDAHeader(block) trong pha ProcessProposal                   │
+│ Đảm bảo Proposer không đề xuất khối chứa cam kết Header sai lệch      │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+┌───────────────────────────────────▼────────────────────────────────────┐
+│ Layer 2: Ingestion Active Verification (CDA Publisher Node)           │
+│ Hàm: VerifyCDAHeader(computedHeader, bftHeader) trong handlePublish    │
+│ Chống giả mạo đường truyền/tấn công MITM giữa CometBFT và Publisher    │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+┌───────────────────────────────────▼────────────────────────────────────┐
+│ Layer 3: Custody Storage Verification (CDA Store Nodes)               │
+│ - Sub-tier 3.1: Layer 1 Merkle Root Check (cda.VerifyMerkleProof)     │
+│ - Sub-tier 3.2: Layer 2 KZG Kate Commitment Check (kzg.Verify)        │
+│ Đảm bảo Store Node chỉ nhận và lưu các mảnh hợp lệ từ Bootstrap        │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+┌───────────────────────────────────▼────────────────────────────────────┐
+│ Layer 4: Client Sampling Verification (CDA Light Nodes Auto-DAS)      │
+│ Khách nhẹ lấy mẫu 16 ô ngẫu nhiên và đối chiếu với BlockHeader công khai│
+│ Đảm bảo xác suất phát hiện khối bị giấu dữ liệu đạt > 99.99%           │
+└────────────────────────────────────────────────────────────────────────┘
+```
 
-#### 3.1.3. Bảng So Sánh Cơ Chế Xác Thực Giữa Validator Node và Publisher Node
+### Bảng So Sánh Cơ Chế Xác Thực Giữa Validator Node và Publisher Node
 
 | Đặc Tính Xác Thực | Validator Node (`VerifyCDAHeader`) | Publisher Node (`Verify Header`) |
 | :--- | :--- | :--- |
-| **Giai đoạn thực thi** | Trong vòng đồng thuận BFT (`ProcessProposal`) | Ngay khi nhận khối committed từ CometBFT (`handlePublish`) |
+| **Thời điểm thực thi** | Trong vòng đồng thuận BFT (`ProcessProposal`) | Ngay khi nhận khối committed từ CometBFT (`handlePublish`) |
 | **Dữ liệu đầu vào** | `types.Block` (ODS Data + Proposed Header) | `PublishRequest` (ODS Data + Finalized BFT Header Commitments) |
-| **Mục đích** | Quyết định bỏ phiếu Prevote/Precommit chấp thuận khối | Quyết định chấp thuận phân tán DA tới Store Nodes và Light Nodes |
+| **Mục đích** | Quyết định bỏ phiếu Prevote/Precommit chấp thuận khối | Quyết định chấp thuận phát tán DA tới Store Nodes và Light Nodes |
 | **Thuật toán đối soát** | Tính EDS, Kate commitments, Merkle Root và so khớp với Header | Tính EDS, Kate commitments, Merkle Root và so khớp với BFT Header |
-| **Hành vi khi vi phạm** | Bác bỏ proposal, vote `nil` / Reject proposal | Từ chối HTTP request (422), hủy phân tán, cảnh báo vi phạm tính toàn vẹn |
+| **Hành vi khi vi phạm** | Bác bỏ proposal, vote `nil` / Reject proposal | Từ chối HTTP request (422), hủy phân tán, bảo vệ Store & Light Nodes |
 
 ---
 
-## 4. Kết Quả Kiểm Thử Mã Nguồn Hiện Tại
+## 5. Đặc Tả Giao Diện & Kênh Truyền Thông (Interface Specifications)
 
-Hệ thống đã cập nhật tập tin `go.work` hỗ trợ workspace đa module với `./cometbft`. Toàn bộ bộ kiểm thử đơn vị và tích hợp trong CometBFT đều vượt qua thành công:
-
-```bash
-go test -v ./cometbft/state -run "TestCDA"
-```
-
-**Kết quả thực thi:**
-```text
-=== RUN   TestCDAHeaderComputeAndVerify
-    cda_engine_test.go:36: Computed CommitsRoot: 966273f447f36b80d64b61c4c16245f71bdf2f36f899dacda4f88f0bf3b62f8f, ColumnComm count: 64, Coeffs len: 1024
---- PASS: TestCDAHeaderComputeAndVerify (1.09s)
-=== RUN   TestCDABlockProcessingAndPublishingLifecycle
-    cda_integration_test.go:59: [Proposer] Selected Proposer Address: 576585A00DD4D58318255611D8AAC60E8E77CB32
-    cda_integration_test.go:74: [Proposer 576585A00DD4D58318255611D8AAC60E8E77CB32] Computed CDA Header -> CommitsRoot: 966273f447f36b80d64b61c4c16245f71bdf2f36f899dacda4f88f0bf3b62f8f, ColumnComm count: 64
-    cda_integration_test.go:84: [Validator] Verifying proposed block height 1, block_id 545C8EDDE207B9AC564E62FD93B3715ED3379DB4EDBBF26E3BF4F78EFA3DAD16...
-    cda_integration_test.go:87: [Validator] SUCCESS: Block header and CDA KZG/Merkle commitments verified successfully!
-    cda_integration_test.go:114: [Consensus Engine] Block 1 committed to state store successfully!
-    cda_integration_test.go:126: [Publisher Node] RECEIVED BLOCK 545C8EDDE207B9AC564E62FD93B3715ED3379DB4EDBBF26E3BF4F78EFA3DAD16 with 1024 ODS cells!
---- PASS: TestCDABlockProcessingAndPublishingLifecycle (1.12s)
-PASS
-ok      github.com/cometbft/cometbft/state      2.228s
-```
+| Kênh Giao Tiếp | Giao Thức | Endpoint / Topic | Chi Tiết Dữ Liệu |
+| :--- | :--- | :--- | :--- |
+| **Client $\to$ CometBFT** | HTTP / JSON-RPC | `POST /broadcast_tx_sync`<br>`POST /broadcast_tx_commit` | Payload giao dịch ODS cells |
+| **CometBFT $\leftrightarrow$ CometBFT** | P2P TCP (MConn) | Port `26656` | Thông điệp đồng thuận Tendermint (Propose, Prevote, Precommit) |
+| **CometBFT $\to$ Publisher** | HTTP REST | `POST /publish` | `PublishRequest` (ODS cells + `HeaderPayload`) |
+| **Publisher $\leftrightarrow$ Bootstrap** | Libp2p Stream | Protocol `/cda/chunk/1.0.0` | Column Chunks + Piece Commitments + Merkle Proofs |
+| **Bootstrap $\to$ Store** | Libp2p Stream | Protocol `/cda/seed/1.0.0`<br>`/cda/binary-batch/1.0.0` | RLNC Seed Pieces và KZG opening proofs theo từng hàng |
+| **Store $\to$ Publisher** | Libp2p GossipSub | Topic `/cda/store-ready` | Tín hiệu hoàn thành lưu trữ Custody theo cột |
+| **Publisher $\to$ Light** | Libp2p GossipSub | Topic `/cda/header`<br>`Topic /cda/block-ready` | Block Header công khai và tín hiệu khối sẵn sàng DAS |
+| **Light $\to$ Store** | Libp2p Stream | Protocol `/cda/sample/1.0.0` | Truy vấn lấy mẫu DAS và phản hồi kèm bằng chứng KZG |
 
 ---
 
-## 5. Kế Hoạch Tích Hợp Chi Tiết (Phase-by-Phase Implementation Roadmap)
+## 6. Cơ Chế Kháng Lỗi, Liveness & An Toàn Mạng Lưới
 
-### Phase 1: Đồng Bộ BFT Header Commitments & Cơ Chế Verify Header Tại Publisher
-- **Mở rộng `PublishRequest` & `PublisherPusher`**: Cập nhật `cometbft/state/publisher_pusher.go` đóng gói kèm `HeaderPayload` (CommitsRoot, ColumnComm, Coeffs).
-- **Hiện thực hàm `verifyCDAHeader` tại Publisher**: Bổ sung hàm kiểm tra tính toàn vẹn vào `cda-publisher-node/internal/service/api.go`. Sau khi tính toán ma trận EDS và commitments, Publisher đối chiếu trực tiếp với `HeaderPayload` nhận từ CometBFT trước khi phát tán GossipSub / P2P stream.
-- **Tùy biến `PUBLISHER_URL`**: Hỗ trợ đọc địa chỉ Publisher từ biến môi trường `PUBLISHER_URL` (nếu không khai báo thì mặc định `http://localhost:8080/publish`).
-- **Thêm Cơ chế Retry & Circuit Breaker**: Đảm bảo khi Publisher Node khởi động chậm hơn CometBFT, CometBFT vẫn duy trì đẩy lại khối mà không làm treo tiến trình đồng thuận.
+### 6.1. Phòng Thủ Chống Gian Lận (Byzantine Fault Defense)
+- **Nếu Proposer gửi sai ODS hoặc sai Header**: Các Validator khác trong cụm CometBFT sẽ phát hiện sai lệch khi gọi `VerifyCDAHeader(block)` $\to$ Block proposal bị từ chối $\to$ Proposer khác được chọn trong round tiếp theo.
+- **Nếu Bridge hoặc dữ liệu nộp sang Publisher bị lỗi**: Publisher chạy hàm `VerifyCDAHeader` đối chiếu độc lập. Nếu không khớp `CommitsRoot`, `ColumnComm` hoặc `Coeffs`, Publisher lập tức phản hồi `HTTP 422 Unprocessable Entity` và từ chối phát tán, ngăn chặn ô nhiễm dữ liệu trên toàn mạng DA.
 
-### Phase 2: Cập Nhật Bộ Script Kiểm Thử E2E Tự Động & Unit Tests (E2E Integration Test Script)
-- **Kiểm thử đơn vị Publisher Verify Header**: Viết test cases kiểm tra Publisher chấp thuận khi header khớp và bác bỏ (trả về lỗi 422) khi header bị can thiệp sai lệch.
-- **Xây dựng script `scripts/tests/test_cometbft_cda_integration.sh`**:
-  1. Khởi chạy Publisher Node (`bin/publisher`).
-  2. Khởi chạy Bootstrap Node (`bin/bootstrap`) và 8 Column Store Nodes (`bin/store`).
-  3. Khởi tạo cấu hình và chạy CometBFT Node (`cometbft start --proxy_app=kvstore`).
-  4. Gửi giao dịch nộp ODS cell thực tế vào CometBFT RPC (`http://localhost:26657/broadcast_tx_commit`).
-  5. Theo dõi log xác nhận:
-     - CometBFT chốt khối BFT height $H$.
-     - Publisher nhận khối $H$ qua `/publish`, thực hiện **Verify Header THÀNH CÔNG**.
-     - Store Nodes nhận các cột dữ liệu tương ứng.
-     - Light Client nhận tín hiệu `BlockReady`.
-
-### Phase 3: Tích Hợp Vào Cụm Docker Compose & Kịch Bản Sản Phẩm (Docker & System Migration)
-- **Cập nhật `scripts/generate_compose.py` & `docker-compose.json`**:
-  - Thêm service `cometbft-validator` chạy container `cometbft`.
-  - Thiết lập biến môi trường `PUBLISHER_URL=http://publisher:8080/publish` kết nối tới service `publisher`.
-- **Thay thế hoàn toàn bot tạo khối giả lập (`block_publisher_bot.py`)**:
-  - Chuyển toàn bộ kịch bản đo lường hiệu năng (`run_docker_test.sh`, `test_store_join_leave_lifecycle.sh`) sang sử dụng CometBFT làm nguồn phát sinh block BFT thực tế.
+### 6.2. Pipeline Queue & Độc Lập Luồng Đồng Thuận
+- Để đảm bảo CometBFT không bị nghẽn (block) nếu tầng DA phân tán chậm, goroutine trong `execution.go` đẩy khối sang Publisher chạy **bất đồng bộ** (`go pusher.PushCommittedBlock(b)`).
+- Phía Publisher áp dụng cơ chế **Pipeline Sequential Gate** (`PUBLISHER_MAX_IN_FLIGHT=2`, `PUBLISHER_QUEUE_TIMEOUT=300s`) cho phép nạp trước khối tiếp theo để tính toán trước (pre-computation) trong khi khối trước đó đang đợi StoreReady.
 
 ---
 
-## 6. Tổng Kết Danh Mục File Liên Quan (Reference Directory Map)
+## 7. Ánh Xạ Thành Phần Mã Nguồn (Architecture Component Mapping)
 
-| Component | Đường dẫn File | Chức năng |
+| Thành Phần Kiến Trúc | Đường Dẫn Mã Nguồn | Trách Nhiệm Chính |
 | :--- | :--- | :--- |
-| **Block Header & Data** | [cometbft/types/block.go](file:///home/ubuntu/cda-network/cometbft/types/block.go) | Định nghĩa cấu trúc `Header` (CommitsRoot, ColumnComm, Coeffs) và `ODSData`. |
-| **CDA Engine** | [cometbft/state/cda_engine.go](file:///home/ubuntu/cda-network/cometbft/state/cda_engine.go) | Thư viện tính toán EDS, KZG commitments và Merkle root cho ODS. |
-| **Consensus Validation** | [cometbft/state/validation.go](file:///home/ubuntu/cda-network/cometbft/state/validation.go) | Hàm `VerifyCDAHeader` xác thực khối trong pha `ProcessProposal` của Validator. |
-| **Block Executor** | [cometbft/state/execution.go](file:///home/ubuntu/cda-network/cometbft/state/execution.go) | Tạo khối đề xuất `MakeBlock` và tự động kích hoạt `PublisherPusher` khi commit. |
-| **Publisher Bridge** | [cometbft/state/publisher_pusher.go](file:///home/ubuntu/cda-network/cometbft/state/publisher_pusher.go) | Đóng gói và chuyển giao dữ liệu block + BFT Header commitments tới HTTP REST API Publisher. |
-| **Publisher API & Verifier** | [cda-publisher-node/internal/service/api.go](file:///home/ubuntu/cda-network/cda-publisher-node/internal/service/api.go) | REST API `/publish` tiếp nhận block, **xác thực BFT Header**, mã hóa EDS và phân tán custody. |
-| **Integration Unit Test**| [cometbft/state/cda_integration_test.go](file:///home/ubuntu/cda-network/cometbft/state/cda_integration_test.go) | Test đơn vị kiểm tra chu trình khép kín CometBFT -> Publisher (kèm BFT header verification). |
+| **Block Header & Data** | [`cometbft/types/block.go`](file:///home/ubuntu/cda-network/cometbft/types/block.go) | Định nghĩa cấu trúc `Header` (CommitsRoot, ColumnComm, Coeffs) và `ODSData`. |
+| **CDA Engine** | [`cometbft/state/cda_engine.go`](file:///home/ubuntu/cda-network/cometbft/state/cda_engine.go) | Thư viện tính toán EDS, KZG commitments và Merkle root cho ODS. |
+| **Consensus Validation** | [`cometbft/state/validation.go`](file:///home/ubuntu/cda-network/cometbft/state/validation.go) | Hàm `VerifyCDAHeader` xác thực khối trong pha `ProcessProposal` của Validator. |
+| **Block Executor** | [`cometbft/state/execution.go`](file:///home/ubuntu/cda-network/cometbft/state/execution.go) | Tạo khối đề xuất `MakeBlock` và tự động kích hoạt `PublisherPusher` khi commit. |
+| **Publisher Bridge** | [`cometbft/state/publisher_pusher.go`](file:///home/ubuntu/cda-network/cometbft/state/publisher_pusher.go) | Đóng gói và chuyển giao dữ liệu block + BFT Header commitments tới HTTP REST API Publisher. |
+| **Publisher API & Verifier** | [`cda-publisher-node/internal/service/api.go`](file:///home/ubuntu/cda-network/cda-publisher-node/internal/service/api.go) | REST API `/publish` tiếp nhận block, **xác thực BFT Header**, mã hóa EDS và phân tán custody. |
+| **Custody Storage** | [`cda-store-node/internal/storage/custody.go`](file:///home/ubuntu/cda-network/cda-store-node/internal/storage/custody.go) | Lưu trữ $3,840$ mảnh bảo chứng, quản lý cache bộ nhớ và cơ chế pruning raw pieces. |
+| **Light Client DAS** | [`cda-light-node/internal/verifier/das_verifier.go`](file:///home/ubuntu/cda-network/cda-light-node/internal/verifier/das_verifier.go) | Thực hiện lấy mẫu ngẫu nhiên DAS và xác thực bằng chứng Kate. |
 
+---
+
+## 8. Tài Liệu Tham Chiếu & Triển Khai
+Kế hoạch chi tiết về việc container hóa và triển khai cụm CometBFT trong Docker Compose được đặc tả tại:
+👉 [`docs/system/deploy/cometbft_docker_cluster_plan.md`](file:///home/ubuntu/cda-network/docs/system/deploy/cometbft_docker_cluster_plan.md)

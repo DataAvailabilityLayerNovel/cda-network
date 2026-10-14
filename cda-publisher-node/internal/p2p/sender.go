@@ -33,9 +33,10 @@ func NewSender(h host.Host, disc *Discovery) *Sender {
 
 // SendColumnChunk transmits column cells, commitments, and Merkle proofs to the bootstrap node over a libp2p stream
 func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, pieceCommits [][]byte, merkleProofs []cda.MerkleProof) error {
-	addr, err := s.disc.FindBootstrapNode(colIdx)
+	n := len(colData)
+	addr, err := s.disc.FindBootstrapNode(colIdx, n)
 	if err != nil {
-		return fmt.Errorf("resolve bootstrap address for column %d: %w", colIdx, err)
+		return fmt.Errorf("resolve bootstrap address for column %d (n %d): %w", colIdx, n, err)
 	}
 
 	// Support HTTP address conversion to multiaddr
@@ -57,7 +58,7 @@ func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, p
 
 	// Append PeerID if not already present
 	if !strings.Contains(addr, "/p2p/") && !strings.Contains(addr, "/ipfs/") {
-		bootColID := s.disc.GetBootstrapColID(colIdx)
+		bootColID := s.disc.GetBootstrapColID(colIdx, n)
 		_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", bootColID))
 		if err != nil {
 			return fmt.Errorf("failed to generate bootstrap PeerID: %w", err)

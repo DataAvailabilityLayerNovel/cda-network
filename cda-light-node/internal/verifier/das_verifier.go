@@ -189,6 +189,7 @@ func (v *DASVerifier) VerifyReconstructedCell(
 	columnCommitment []byte,
 	globalCoeffs []byte, // k * 32 bytes from Block Header
 	row int,
+	domainSize ...int,
 ) (string, bool, error) {
 	if len(pieces) < v.k {
 		return "", false, fmt.Errorf("not enough pieces to reconstruct: got %d, expected %d", len(pieces), v.k)
@@ -250,7 +251,11 @@ func (v *DASVerifier) VerifyReconstructedCell(
 	}
 
 	// 7. Verify combined data and combined proof against the Column Commitment from Block Header
-	verified := v.kzg.Verify(columnCommitment, row, combinedData, finalCombinedProof)
+	n := 0
+	if len(domainSize) > 0 {
+		n = domainSize[0]
+	}
+	verified := v.kzg.VerifyForDomain(columnCommitment, row, combinedData, finalCombinedProof, n)
 	if !verified {
 		return "", false, nil
 	}

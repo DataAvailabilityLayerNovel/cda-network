@@ -8,7 +8,8 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                      store_dissemination_sem=None, store_fallback_pull_sem=None, store_sharded_workers=None,
                      bootstrap_proof_gen_sem=None, bootstrap_seeding_sem=None, bootstrap_batch_chunk_size=None,
                      bootstrap_encode_workers=None,
-                     publisher_max_in_flight=None, gomaxprocs=None, cpus=None):
+                     publisher_max_in_flight=None, gomaxprocs=None, cpus=None,
+                     cometbft_validators=0):
     if active_cols is None:
         active_cols = cols
     crash_arg = ["-crash-on-fail=true"] if crash_on_fail else []
@@ -24,7 +25,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
     # Publisher
     pub_env = [
         'PUBLISHER_QUEUE_TIMEOUT=300s',
-        f'PUBLISHER_MAX_IN_FLIGHT={publisher_max_in_flight if publisher_max_in_flight is not None else 2}'
+        f'PUBLISHER_MAX_IN_FLIGHT={publisher_max_in_flight if publisher_max_in_flight is not None else 32}'
     ]
     if gomaxprocs is not None:
         pub_env.append(f'GOMAXPROCS={gomaxprocs}')
@@ -174,6 +175,42 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
             light_svc['environment'] = light_env
         compose['services'][light_name] = light_svc
 
+    # CometBFT Consensus Cluster
+    if cometbft_validators and cometbft_validators > 0:
+        for v in range(cometbft_validators):
+            cbft_name = f'cometbft-{v}'
+            cbft_env = [
+                f'NODE_ID={v}',
+                'PUBLISHER_URL=http://publisher:8080/publish',
+                f'CDA_K={k}',
+                'CDA_MAX_K=64',
+                f'CDA_K_PIECE={k_piece}',
+                f'DISABLE_AUTO_PUBLISHER_PUSH={"false" if v == 0 else "true"}'
+            ]
+            if gomaxprocs is not None:
+                cbft_env.append(f'GOMAXPROCS={gomaxprocs}')
+
+            rpc_port = 26657 if v == 0 else 27657 + v
+            p2p_port = 26656 if v == 0 else 28656 + v
+            cbft_svc = {
+                'build': {
+                    'context': '.',
+                    'dockerfile': 'Dockerfile.cometbft'
+                },
+                'command': ["node", "--proxy_app", "kvstore"],
+                'ports': [
+                    f"{rpc_port}:26657",
+                    f"{p2p_port}:26656"
+                ],
+                'volumes': [
+                    f"./data/cometbft/node{v}:/cometbft"
+                ],
+                'networks': ['cda-net'],
+                'depends_on': ['publisher'],
+                'environment': cbft_env
+            }
+            compose['services'][cbft_name] = cbft_svc
+
     # Apply CPU quota limits if specified
     if cpus is not None:
         for svc_name in compose['services']:
@@ -208,7 +245,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
 
     return compose, store_ports
 
-def generate_prometheus_config(active_cols, stores_per_col, lights):
+def generate_prometheus_config(active_cols, stores_per_col, lights, cometbft_validators=0):
     os.makedirs('data', exist_ok=True)
     prometheus_yml = """global:
   scrape_interval: 1s
@@ -242,6 +279,15 @@ scrape_configs:
 """
     for l in range(1, lights + 1):
         prometheus_yml += f"          - 'light-{l}:{9400+l}'\n"
+
+    if cometbft_validators > 0:
+        prometheus_yml += """
+  - job_name: 'cometbft'
+    static_configs:
+      - targets:
+"""
+        for v in range(cometbft_validators):
+            prometheus_yml += f"          - 'cometbft-{v}:26660'\n"
 
     with open('data/prometheus.yml', 'w') as f:
         f.write(prometheus_yml)
@@ -315,22 +361,167 @@ providers:
         "panels": [
             {
                 "type": "stat",
+                "title": "CometBFT Block Height",
+                "description": "Chiều cao khối hiện tại được đồng thuận bởi cụm validator CometBFT",
+                "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+                "targets": [
+                    {"expr": "max(cometbft_consensus_height) or vector(0)", "legendFormat": "Height"}
+                ],
+                "options": {
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "center",
+                    "textMode": "value"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {"mode": "fixed", "fixedColor": "light-blue"}
+                    }
+                }
+            },
+            {
+                "type": "stat",
+                "title": "CDA BlockReady Height",
+                "description": "Chiều cao khối mới nhất đã hoàn tất lưu trữ trên 8 Store Nodes và phát tín hiệu BlockReady",
+                "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+                "targets": [
+                    {"expr": "cda_publisher_latest_completed_height or vector(0)", "legendFormat": "BlockReady"}
+                ],
+                "options": {
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "center",
+                    "textMode": "value"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {"mode": "fixed", "fixedColor": "green"}
+                    }
+                }
+            },
+            {
+                "type": "stat",
+                "title": "CDA Dimension K (ODS Matrix)",
+                "description": "Kích thước ma trận ODS (KxK cells) và EDS (2Kx2K cells) của khối gần nhất",
+                "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+                "targets": [
+                    {"expr": "cda_publisher_latest_k or vector(0)", "legendFormat": "K"}
+                ],
+                "options": {
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "center",
+                    "textMode": "value"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {"mode": "fixed", "fixedColor": "orange"}
+                    }
+                }
+            },
+            {
+                "type": "gauge",
+                "title": "CDA Pipeline In-Flight",
+                "description": "Số lượng khối đang được xử lý trong hàng đợi của Publisher (tối đa 32)",
+                "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+                "targets": [
+                    {"expr": "cda_publisher_in_flight_blocks or vector(0)", "legendFormat": "In-Flight"}
+                ],
+                "fieldConfig": {
+                    "defaults": {
+                        "min": 0,
+                        "max": 32,
+                        "thresholds": {
+                            "mode": "absolute",
+                            "steps": [
+                                {"value": None, "color": "green"},
+                                {"value": 16, "color": "orange"},
+                                {"value": 28, "color": "red"}
+                            ]
+                        }
+                    }
+                }
+            },
+            {
+                "type": "stat",
+                "title": "Mempool Pending Txns",
+                "description": "Số lượng giao dịch đang chờ trong mempool của CometBFT",
+                "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+                "targets": [
+                    {"expr": "sum(cometbft_mempool_size) or vector(0)", "legendFormat": "Pending Txns"}
+                ],
+                "options": {
+                    "colorMode": "value",
+                    "graphMode": "none",
+                    "justifyMode": "center",
+                    "textMode": "value"
+                },
+                "fieldConfig": {
+                    "defaults": {
+                        "color": {"mode": "fixed", "fixedColor": "yellow"}
+                    }
+                }
+            },
+            {
+                "type": "stat",
                 "title": "Healthy / Online Nodes",
-                "gridPos": {"h": 5, "w": 6, "x": 0, "y": 0},
+                "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
                 "targets": [
                     {"expr": "sum(up)", "legendFormat": "Nodes Up"}
                 ],
                 "options": {
                     "colorMode": "value",
-                    "graphMode": "area",
+                    "graphMode": "none",
                     "justifyMode": "center",
                     "textMode": "value"
                 }
             },
             {
+                "type": "graph",
+                "title": "Block Height Progression (Consensus vs CDA BlockReady)",
+                "description": "So sánh tiến độ khối của CometBFT Consensus và tiến độ đạt BlockReady trên CDA",
+                "gridPos": {"h": 7, "w": 12, "x": 0, "y": 4},
+                **line_graph_opts(),
+                "targets": [
+                    {
+                        "expr": "max(cometbft_consensus_height)",
+                        "legendFormat": "CometBFT Consensus Height"
+                    },
+                    {
+                        "expr": "cda_publisher_latest_completed_height",
+                        "legendFormat": "CDA BlockReady Height"
+                    }
+                ],
+                "yaxes": [
+                    {"format": "short", "show": True},
+                    {"format": "short", "show": False}
+                ]
+            },
+            {
+                "type": "graph",
+                "title": "CDA Pipeline Latency (Publish -> BlockReady Duration)",
+                "description": "Thời gian hoàn thành xử lý khối từ khi tiếp nhận đến khi 8 Store nodes custody xong (BlockReady)",
+                "gridPos": {"h": 7, "w": 12, "x": 12, "y": 4},
+                **line_graph_opts(),
+                "targets": [
+                    {
+                        "expr": "rate(cda_publisher_block_duration_seconds_sum[10s]) / rate(cda_publisher_block_duration_seconds_count[10s])",
+                        "legendFormat": "Avg Pipeline Latency"
+                    },
+                    {
+                        "expr": "histogram_quantile(0.95, rate(cda_publisher_block_duration_seconds_bucket[10s]))",
+                        "legendFormat": "95th Percentile Latency"
+                    }
+                ],
+                "yaxes": [
+                    {"format": "s", "show": True},
+                    {"format": "short", "show": False}
+                ]
+            },
+            {
                 "type": "gauge",
                 "title": "DAS Success Rate",
-                "gridPos": {"h": 5, "w": 6, "x": 6, "y": 0},
+                "gridPos": {"h": 5, "w": 8, "x": 0, "y": 11},
                 "targets": [
                     {"expr": "cda_light_das_success_rate", "legendFormat": "{{instance}}"}
                 ],
@@ -354,7 +545,7 @@ providers:
                 "type": "stat",
                 "title": "Byzantine Forged Pieces Blocked (Security Alerts)",
                 "description": "Số mảnh dữ liệu giả mạo bị phát hiện và ngăn chặn bởi chữ ký / kiểm chứng mật mã KZG (Layer 3)",
-                "gridPos": {"h": 5, "w": 6, "x": 12, "y": 0},
+                "gridPos": {"h": 5, "w": 8, "x": 8, "y": 11},
                 "targets": [
                     {"expr": "sum(cda_store_byzantine_detection_count)", "legendFormat": "Byzantine Detections"}
                 ],
@@ -380,7 +571,7 @@ providers:
                 "type": "stat",
                 "title": "Publisher Throughput (1m Avg)",
                 "description": "Lưu lượng phát hành trung bình động 1 phút",
-                "gridPos": {"h": 5, "w": 6, "x": 18, "y": 0},
+                "gridPos": {"h": 5, "w": 8, "x": 16, "y": 11},
                 "targets": [
                     {"expr": "sum(rate(cda_publisher_throughput_bytes_total[1m]))", "legendFormat": "Bytes/sec (Avg)"}
                 ],
@@ -393,7 +584,7 @@ providers:
             {
                 "type": "graph",
                 "title": "DAS Sampling Latency (95th vs Average)",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -414,7 +605,7 @@ providers:
                 "type": "graph",
                 "title": "Publisher Throughput Over Time (Moving Average)",
                 "description": "Sơ đồ lưu lượng phát hành trung bình theo thời gian (Moving Average 30s & 1m)",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -434,7 +625,7 @@ providers:
             {
                 "type": "graph",
                 "title": "Total Stored Pieces per Store Node (Custody + Recoded Non-Custody)",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -450,7 +641,7 @@ providers:
             {
                 "type": "table",
                 "title": "Store Node Total Stored Pieces Table",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 13},
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
                 "targets": [
                     {
                         "expr": "cda_store_linear_independent_pieces_count",
@@ -483,7 +674,7 @@ providers:
                 "type": "graph",
                 "title": "Store Node Database Size (BadgerDB Actual Data Used)",
                 "description": "Dung lượng dữ liệu thực tế đã sử dụng trong BadgerDB (User Key-Value Payload)",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 21},
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -499,7 +690,7 @@ providers:
             {
                 "type": "graph",
                 "title": "Store Node Network Rates (P2P Queries & GossipSub Propagation)",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 21},
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -515,7 +706,7 @@ providers:
             {
                 "type": "graph",
                 "title": "Node Encoding & Proof Durations",
-                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 29},
+                "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -540,7 +731,7 @@ providers:
                 "type": "graph",
                 "title": "System CPU Usage (Cores)",
                 "description": "Số lượng CPU Cores thực tế được sử dụng (1.0 = 1 full core)",
-                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 29},
+                "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
                 **line_graph_opts(),
                 "targets": [
                     {
@@ -555,6 +746,8 @@ providers:
             }
         ]
     }
+    for idx, panel in enumerate(dashboard_json["panels"], start=1):
+        panel["id"] = idx
     with open('data/grafana/provisioning/dashboards/cda_dashboard.json', 'w') as f:
         json.dump(dashboard_json, f, indent=2)
     print("Generated Grafana provisioning configuration successfully.")
@@ -591,22 +784,33 @@ if __name__ == '__main__':
     parser.add_argument('--prune-enable', action='store_true', default=True, help='Enable pruning for store and bootstrap nodes (default: True)')
     parser.add_argument('--no-prune', dest='prune_enable', action='store_false', help='Disable pruning for store and bootstrap nodes')
     parser.add_argument('--prune-ttl', type=str, default='15s', help='TTL duration before pruning (default: 15s)')
-    parser.add_argument('--store-gossip-batch-size', type=int, default=None, help='Store GossipSub batch verification size')
-    parser.add_argument('--store-gossip-batch-workers', type=int, default=None, help='Store GossipSub batch worker count')
-    parser.add_argument('--store-gossip-batch-ticker-ms', type=int, default=None, help='Store GossipSub batch flush interval in ms')
-    parser.add_argument('--store-dissemination-sem', type=int, default=None, help='Store dissemination semaphore limit')
+    parser.add_argument('--store-gossip-batch-size', type=int, default=64, help='Store GossipSub batch verification size (default: 64)')
+    parser.add_argument('--store-gossip-batch-workers', type=int, default=4, help='Store GossipSub batch worker count (default: 4)')
+    parser.add_argument('--store-gossip-batch-ticker-ms', type=int, default=10, help='Store GossipSub batch flush interval in ms (default: 10)')
+    parser.add_argument('--store-dissemination-sem', type=int, default=32, help='Store dissemination semaphore limit (default: 32)')
     parser.add_argument('--store-fallback-pull-sem', type=int, default=None, help='Store fallback pull semaphore limit')
-    parser.add_argument('--store-sharded-workers', type=int, default=None, help='Store sharded cell worker pool size')
+    parser.add_argument('--store-sharded-workers', type=int, default=16, help='Store sharded cell worker pool size (default: 16)')
     parser.add_argument('--bootstrap-proof-gen-sem', type=int, default=None, help='Bootstrap KZG opening proof generator concurrency semaphore')
     parser.add_argument('--bootstrap-encode-workers', type=int, default=None, help='Bootstrap RLNC seed encoding parallel worker count')
-    parser.add_argument('--bootstrap-seeding-sem', type=int, default=None, help='Bootstrap P2P seeding stream semaphore')
-    parser.add_argument('--bootstrap-batch-chunk-size', type=int, default=None, help='Bootstrap P2P batch chunk size')
+    parser.add_argument('--bootstrap-seeding-sem', type=int, default=64, help='Bootstrap P2P seeding stream semaphore (default: 64)')
+    parser.add_argument('--bootstrap-batch-chunk-size', type=int, default=64, help='Bootstrap P2P batch chunk size (default: 64)')
     parser.add_argument('--publisher-max-in-flight', type=int, default=None, help='Publisher max in-flight blocks')
-    parser.add_argument('--gomaxprocs', type=int, default=None, help='GOMAXPROCS for Go runtime')
+    parser.add_argument('--cometbft-validators', type=int, default=0, help='Number of CometBFT validator nodes (default: 0)')
+    parser.add_argument('--gomaxprocs', type=int, default=4, help='GOMAXPROCS for Go runtime (default: 4)')
     parser.add_argument('--cpus', type=str, default=None, help='Docker container CPU limit (e.g. 4, 8, 12)')
     parser.add_argument('--out', type=str, default='docker-compose.json', help='Output file')
     
     args = parser.parse_args()
+
+    if args.cometbft_validators > 0:
+        import sys
+        sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+        from init_cometbft_cluster import init_cometbft_cluster
+        try:
+            init_cometbft_cluster(num_validators=args.cometbft_validators, output_dir="./data/cometbft")
+        except Exception as e:
+            print(f"[Warning] Could not initialize CometBFT configs automatically ({e}).")
+            print("         If running containers own data/cometbft, please run ./scripts/cleanup.sh first.")
 
     active_cols = args.active_cols if args.active_cols is not None else args.cols
     compose_dict, store_ports = generate_compose(
@@ -631,13 +835,14 @@ if __name__ == '__main__':
         bootstrap_batch_chunk_size=args.bootstrap_batch_chunk_size,
         publisher_max_in_flight=args.publisher_max_in_flight,
         gomaxprocs=args.gomaxprocs,
-        cpus=args.cpus
+        cpus=args.cpus,
+        cometbft_validators=args.cometbft_validators
     )
     
     n = 2 * args.k
     cols_per_net_col = n // args.cols if args.cols > 0 else 1
     
-    generate_prometheus_config(active_cols, args.stores_per_col, args.lights)
+    generate_prometheus_config(active_cols, args.stores_per_col, args.lights, cometbft_validators=args.cometbft_validators)
     generate_grafana_provisioning()
     generate_publisher_config(args.k, args.k_piece, args.cols, cols_per_net_col, active_cols)
     

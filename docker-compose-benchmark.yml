@@ -22,7 +22,7 @@
       ],
       "environment": [
         "PUBLISHER_QUEUE_TIMEOUT=300s",
-        "PUBLISHER_MAX_IN_FLIGHT=2"
+        "PUBLISHER_MAX_IN_FLIGHT=32"
       ],
       "deploy": {
         "resources": {
@@ -48,7 +48,7 @@
         "-k",
         "64",
         "-k-piece",
-        "8",
+        "4",
         "-prune-enable=true",
         "-prune-ttl",
         "15s"
@@ -63,10 +63,6 @@
       ],
       "depends_on": [
         "publisher"
-      ],
-      "environment": [
-        "BOOTSTRAP_PROOF_GEN_SEM=32",
-        "BOOTSTRAP_ENCODE_WORKERS=8"
       ],
       "deploy": {
         "resources": {
@@ -96,9 +92,9 @@
         "-k",
         "64",
         "-k-piece",
-        "8",
+        "4",
         "-num-cols",
-        "16",
+        "8",
         "-stores-per-col",
         "8",
         "-myaddr",
@@ -120,10 +116,6 @@
       ],
       "depends_on": [
         "bootstrap-0"
-      ],
-      "environment": [
-        "STORE_GOSSIP_BATCH_SIZE=64",
-        "STORE_GOSSIP_BATCH_WORKERS=4"
       ],
       "deploy": {
         "resources": {
@@ -153,9 +145,9 @@
         "-k",
         "64",
         "-k-piece",
-        "8",
+        "4",
         "-num-cols",
-        "16",
+        "8",
         "-stores-per-col",
         "8",
         "-myaddr",
@@ -177,10 +169,6 @@
       ],
       "depends_on": [
         "bootstrap-0"
-      ],
-      "environment": [
-        "STORE_GOSSIP_BATCH_SIZE=64",
-        "STORE_GOSSIP_BATCH_WORKERS=4"
       ],
       "deploy": {
         "resources": {
@@ -210,9 +198,9 @@
         "-k",
         "64",
         "-k-piece",
-        "8",
+        "4",
         "-num-cols",
-        "16",
+        "8",
         "-stores-per-col",
         "8",
         "-myaddr",
@@ -234,10 +222,6 @@
       ],
       "depends_on": [
         "bootstrap-0"
-      ],
-      "environment": [
-        "STORE_GOSSIP_BATCH_SIZE=64",
-        "STORE_GOSSIP_BATCH_WORKERS=4"
       ],
       "deploy": {
         "resources": {
@@ -267,9 +251,9 @@
         "-k",
         "64",
         "-k-piece",
-        "8",
+        "4",
         "-num-cols",
-        "16",
+        "8",
         "-stores-per-col",
         "8",
         "-myaddr",
@@ -291,10 +275,6 @@
       ],
       "depends_on": [
         "bootstrap-0"
-      ],
-      "environment": [
-        "STORE_GOSSIP_BATCH_SIZE=64",
-        "STORE_GOSSIP_BATCH_WORKERS=4"
       ],
       "deploy": {
         "resources": {
@@ -324,9 +304,9 @@
         "-k",
         "64",
         "-k-piece",
-        "8",
+        "4",
         "-num-cols",
-        "16",
+        "8",
         "-stores-per-col",
         "8",
         "-myaddr",
@@ -348,10 +328,6 @@
       ],
       "depends_on": [
         "bootstrap-0"
-      ],
-      "environment": [
-        "STORE_GOSSIP_BATCH_SIZE=64",
-        "STORE_GOSSIP_BATCH_WORKERS=4"
       ],
       "deploy": {
         "resources": {
@@ -381,9 +357,9 @@
         "-k",
         "64",
         "-k-piece",
-        "8",
+        "4",
         "-num-cols",
-        "16",
+        "8",
         "-stores-per-col",
         "8",
         "-myaddr",
@@ -405,10 +381,6 @@
       ],
       "depends_on": [
         "bootstrap-0"
-      ],
-      "environment": [
-        "STORE_GOSSIP_BATCH_SIZE=64",
-        "STORE_GOSSIP_BATCH_WORKERS=4"
       ],
       "deploy": {
         "resources": {
@@ -438,9 +410,9 @@
         "-k",
         "64",
         "-k-piece",
-        "8",
+        "4",
         "-num-cols",
-        "16",
+        "8",
         "-stores-per-col",
         "8",
         "-myaddr",
@@ -462,10 +434,6 @@
       ],
       "depends_on": [
         "bootstrap-0"
-      ],
-      "environment": [
-        "STORE_GOSSIP_BATCH_SIZE=64",
-        "STORE_GOSSIP_BATCH_WORKERS=4"
       ],
       "deploy": {
         "resources": {
@@ -495,9 +463,9 @@
         "-k",
         "64",
         "-k-piece",
-        "8",
+        "4",
         "-num-cols",
-        "16",
+        "8",
         "-stores-per-col",
         "8",
         "-myaddr",
@@ -519,10 +487,6 @@
       ],
       "depends_on": [
         "bootstrap-0"
-      ],
-      "environment": [
-        "STORE_GOSSIP_BATCH_SIZE=64",
-        "STORE_GOSSIP_BATCH_WORKERS=4"
       ],
       "deploy": {
         "resources": {
@@ -548,9 +512,9 @@
         "-k",
         "64",
         "-k-piece",
-        "8",
+        "4",
         "-num-cols",
-        "16",
+        "8",
         "-auto-das=true"
       ],
       "ports": [
@@ -591,9 +555,9 @@
         "-k",
         "64",
         "-k-piece",
-        "8",
+        "4",
         "-num-cols",
-        "16",
+        "8",
         "-auto-das=true"
       ],
       "ports": [
@@ -609,6 +573,158 @@
       ],
       "depends_on": [
         "publisher"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "cometbft-0": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile.cometbft"
+      },
+      "command": [
+        "node",
+        "--proxy_app",
+        "kvstore"
+      ],
+      "ports": [
+        "26657:26657",
+        "26656:26656"
+      ],
+      "volumes": [
+        "./data/cometbft/node0:/cometbft"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "publisher"
+      ],
+      "environment": [
+        "NODE_ID=0",
+        "PUBLISHER_URL=http://publisher:8080/publish",
+        "CDA_K=64",
+        "CDA_K_PIECE=4",
+        "DISABLE_AUTO_PUBLISHER_PUSH=false"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "cometbft-1": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile.cometbft"
+      },
+      "command": [
+        "node",
+        "--proxy_app",
+        "kvstore"
+      ],
+      "ports": [
+        "27658:26657",
+        "28657:26656"
+      ],
+      "volumes": [
+        "./data/cometbft/node1:/cometbft"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "publisher"
+      ],
+      "environment": [
+        "NODE_ID=1",
+        "PUBLISHER_URL=http://publisher:8080/publish",
+        "CDA_K=64",
+        "CDA_K_PIECE=4",
+        "DISABLE_AUTO_PUBLISHER_PUSH=true"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "cometbft-2": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile.cometbft"
+      },
+      "command": [
+        "node",
+        "--proxy_app",
+        "kvstore"
+      ],
+      "ports": [
+        "27659:26657",
+        "28658:26656"
+      ],
+      "volumes": [
+        "./data/cometbft/node2:/cometbft"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "publisher"
+      ],
+      "environment": [
+        "NODE_ID=2",
+        "PUBLISHER_URL=http://publisher:8080/publish",
+        "CDA_K=64",
+        "CDA_K_PIECE=4",
+        "DISABLE_AUTO_PUBLISHER_PUSH=true"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "8"
+          }
+        }
+      }
+    },
+    "cometbft-3": {
+      "build": {
+        "context": ".",
+        "dockerfile": "Dockerfile.cometbft"
+      },
+      "command": [
+        "node",
+        "--proxy_app",
+        "kvstore"
+      ],
+      "ports": [
+        "27660:26657",
+        "28659:26656"
+      ],
+      "volumes": [
+        "./data/cometbft/node3:/cometbft"
+      ],
+      "networks": [
+        "cda-net"
+      ],
+      "depends_on": [
+        "publisher"
+      ],
+      "environment": [
+        "NODE_ID=3",
+        "PUBLISHER_URL=http://publisher:8080/publish",
+        "CDA_K=64",
+        "CDA_K_PIECE=4",
+        "DISABLE_AUTO_PUBLISHER_PUSH=true"
       ],
       "deploy": {
         "resources": {

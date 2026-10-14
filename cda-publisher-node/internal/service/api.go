@@ -19,6 +19,7 @@ import (
 	"cda-publisher-node/internal/p2p"
 
 	p2pcommon "cda-p2p"
+	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	"github.com/dgraph-io/badger/v4"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
@@ -41,9 +42,12 @@ type APIService struct {
 	publishCond           *sync.Cond
 	latestPublishedHeight int
 	latestCompletedHeight int
+	inFlightCount         int
 	storeReadyMap         map[string]map[int]map[int]bool // BlockID -> NetColIdx -> set of RowIdx
 	columnReadyMap        map[string]map[int]bool          // BlockID -> set of NetColIdx
 	blockReadyEmitted     map[string]bool
+	blockK                map[string]int
+	blockStartTime        map[string]time.Time
 }
 
 type HeaderPayload struct {
@@ -100,6 +104,8 @@ func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.Pub
 		storeReadyMap:     make(map[string]map[int]map[int]bool),
 		columnReadyMap:    make(map[string]map[int]bool),
 		blockReadyEmitted: make(map[string]bool),
+		blockK:            make(map[string]int),
+		blockStartTime:    make(map[string]time.Time),
 	}
 	svc.publishCond = sync.NewCond(&svc.colReadyMu)
 
@@ -145,12 +151,14 @@ func (s *APIService) listenStoreReady(sub *pubsub.Subscription) {
 	}
 }
 
-func (s *APIService) isNetColActive(colIdx int) bool {
+func (s *APIService) isNetColActiveForN(colIdx int, n int) bool {
 	activeCols := s.activeCols
 	if activeCols <= 0 {
 		activeCols = 8
 	}
-	n := 2 * s.kVal
+	if n <= 0 {
+		n = 2 * s.kVal
+	}
 	if n <= 0 {
 		n = 32
 	}
@@ -167,6 +175,10 @@ func (s *APIService) isNetColActive(colIdx int) bool {
 	netColNumber := netColIdx / colsPerNetCol
 
 	return netColNumber < activeCols
+}
+
+func (s *APIService) isNetColActive(colIdx int) bool {
+	return s.isNetColActiveForN(colIdx, 2*s.kVal)
 }
 
 func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload) {
@@ -188,7 +200,15 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 	}
 
 	netColIdx := payload.NetColIdx
-	if !s.isNetColActive(netColIdx) {
+	kVal := s.blockK[blockID]
+	if kVal <= 0 {
+		kVal = s.kVal
+	}
+	nVal := 2 * kVal
+	if nVal <= 0 {
+		nVal = 32
+	}
+	if !s.isNetColActiveForN(netColIdx, nVal) {
 		s.colReadyMu.Unlock()
 		return
 	}
@@ -241,13 +261,37 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 
 func (s *APIService) broadcastBlockReady(blockID string, height int, activeCols int) {
 	s.colReadyMu.Lock()
+	if s.inFlightCount > 0 {
+		s.inFlightCount--
+	}
 	if height > s.latestCompletedHeight {
 		s.latestCompletedHeight = height
 	}
+	LatestCompletedHeight.Set(float64(s.latestCompletedHeight))
+	InFlightBlocks.Set(float64(s.inFlightCount))
+
 	if s.publishCond != nil {
 		s.publishCond.Broadcast()
 	}
+	kVal := s.blockK[blockID]
+	if kVal <= 0 {
+		kVal = s.kVal
+	}
+	LatestK.Set(float64(kVal))
+
+	startTime := s.blockStartTime[blockID]
+	duration := 0.0
+	if !startTime.IsZero() {
+		duration = time.Since(startTime).Seconds()
+		BlockDuration.Observe(duration)
+	}
 	s.colReadyMu.Unlock()
+
+	odsCells := kVal * kVal
+	edsCells := (2 * kVal) * (2 * kVal)
+
+	log.Printf("[Height: %d] [Publisher] 🎉 [BLOCK_COMPLETED] BlockID=%s Height=%d K=%d ODS=%dx%d (%d cells) EDS=%dx%d (%d cells) ActiveCols=%d StoreNodesCompleted=100%% Duration=%.3fs",
+		height, blockID, height, kVal, kVal, kVal, odsCells, 2*kVal, 2*kVal, edsCells, activeCols, duration)
 
 	if s.blockReadyTopic == nil {
 		return
@@ -255,6 +299,7 @@ func (s *APIService) broadcastBlockReady(blockID string, height int, activeCols 
 	payload := p2pcommon.GossipBlockReadyPayload{
 		BlockID: blockID,
 		Height:  height,
+		K:       kVal,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -268,8 +313,8 @@ func (s *APIService) broadcastBlockReady(blockID string, height int, activeCols 
 	if err := s.blockReadyTopic.Publish(ctx, data); err != nil {
 		log.Printf("[Publisher] Warning: Failed to publish block-ready for %s: %v", blockID, err)
 	} else {
-		log.Printf("[Height: %d] [Publisher] 🎉 ALL %d active columns (100%% store nodes) complete for block %s — Broadcasted BlockReady signal to Light Nodes!",
-			height, activeCols, blockID)
+		log.Printf("[Height: %d] [Publisher] Successfully broadcasted BlockReady signal (K=%d) to Light Nodes for %s",
+			height, kVal, blockID)
 	}
 }
 
@@ -285,8 +330,28 @@ func (s *APIService) RegisterHandlers(mux *http.ServeMux) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"healthy"}`))
 	})
+	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/publish", s.handlePublish)
 	mux.HandleFunc("/header/", s.handleGetHeader)
+}
+
+func (s *APIService) handleStatus(w http.ResponseWriter, r *http.Request) {
+	s.colReadyMu.Lock()
+	inFlight := s.inFlightCount
+	completedH := s.latestCompletedHeight
+	pubH := s.latestPublishedHeight
+	s.colReadyMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":                  "healthy",
+		"in_flight_count":         inFlight,
+		"latest_published_height": pubH,
+		"latest_completed_height": completedH,
+		"active_cols":             s.activeCols,
+		"num_cols":                s.numCols,
+		"default_k":               s.kVal,
+	})
 }
 
 func VerifySignature(blockID string, data []string, sigHex, pubKeyHex string) error {
@@ -412,7 +477,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	maxInFlight := 1
+	maxInFlight := 32
 	if envMax := os.Getenv("PUBLISHER_MAX_IN_FLIGHT"); envMax != "" {
 		if m, err := strconv.Atoi(envMax); err == nil && m > 0 {
 			maxInFlight = m
@@ -420,23 +485,37 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.colReadyMu.Lock()
-	if reqHeight > 1 {
+	if maxInFlight > 0 {
 		deadline := time.Now().Add(queueTimeout)
-		for (reqHeight - s.latestCompletedHeight) > maxInFlight && time.Now().Before(deadline) {
-			log.Printf("[Height: %d] [Publisher Queue] In-flight pipeline full (%d in-flight, latest completed: %d). Waiting for block-%d before accepting block-%d...",
-				reqHeight, reqHeight-s.latestCompletedHeight, s.latestCompletedHeight, reqHeight-maxInFlight, reqHeight)
+		for s.inFlightCount >= maxInFlight && time.Now().Before(deadline) {
+			log.Printf("[Height: %d] [Publisher Queue] In-flight pipeline full (%d in-flight, max: %d). Waiting before accepting block-%d...",
+				reqHeight, s.inFlightCount, maxInFlight, reqHeight)
 			s.colReadyMu.Unlock()
 			time.Sleep(200 * time.Millisecond)
 			s.colReadyMu.Lock()
 		}
-		if (reqHeight - s.latestCompletedHeight) > maxInFlight {
-			currentCompleted := s.latestCompletedHeight
+		if s.inFlightCount >= maxInFlight {
+			currentInFlight := s.inFlightCount
 			s.colReadyMu.Unlock()
-			http.Error(w, fmt.Sprintf("Block height %d timed out waiting in publisher queue (current completed: %d, max in-flight: %d after waiting %v)", reqHeight, currentCompleted, maxInFlight, queueTimeout), http.StatusUnprocessableEntity)
+			http.Error(w, fmt.Sprintf("Block height %d timed out waiting in publisher queue (%d in-flight, max in-flight: %d after waiting %v)", reqHeight, currentInFlight, maxInFlight, queueTimeout), http.StatusUnprocessableEntity)
 			return
 		}
 	}
+	s.inFlightCount++
+	InFlightBlocks.Set(float64(s.inFlightCount))
 	s.colReadyMu.Unlock()
+
+	accepted := false
+	defer func() {
+		if !accepted {
+			s.colReadyMu.Lock()
+			if s.inFlightCount > 0 {
+				s.inFlightCount--
+				InFlightBlocks.Set(float64(s.inFlightCount))
+			}
+			s.colReadyMu.Unlock()
+		}
+	}()
 
 	// 1. Decode hex data cells (ODS) concurrently
 	decodedData := make([][]byte, len(req.Data))
@@ -449,6 +528,18 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 		decodedData[i] = b
 		totalBytes += len(b)
+	}
+
+	// Dynamic ODS sizing: find smallest power-of-2 K (>= 8) such that K*K >= len(decodedData)
+	kBlock := cda.ComputeOptimalODSK(len(decodedData), cda.DefaultMinODSK, 64)
+	targetCells := kBlock * kBlock
+	for i := len(decodedData); i < targetCells; i++ {
+		padCell := make([]byte, 64)
+		padCell[0] = byte(i >> 24)
+		padCell[1] = byte(i >> 16)
+		padCell[2] = byte(i >> 8)
+		padCell[3] = byte(i)
+		decodedData = append(decodedData, padCell)
 	}
 
 	// 2. Run engine pipeline concurrently: ODS -> EDS -> Commitments -> Header
@@ -500,6 +591,8 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	if reqHeight > s.latestPublishedHeight {
 		s.latestPublishedHeight = reqHeight
 	}
+	s.blockK[header.BlockID] = kBlock
+	s.blockStartTime[header.BlockID] = start
 	s.colReadyMu.Unlock()
 
 	// Record metrics
@@ -541,7 +634,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(colIdx int) {
 			defer wg.Done()
-			if !s.isNetColActive(colIdx) {
+			if !s.isNetColActiveForN(colIdx, n) {
 				return
 			}
 			colSem <- struct{}{}
@@ -573,6 +666,8 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 
+	accepted = true
+
 	// Respond with the BlockHeader
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(header)
@@ -588,6 +683,19 @@ func (s *APIService) handleGetHeader(w http.ResponseWriter, r *http.Request) {
 	if blockID == "" {
 		http.Error(w, "Missing block ID", http.StatusBadRequest)
 		return
+	}
+	if blockID == "latest" {
+		s.colReadyMu.Lock()
+		latestH := s.latestCompletedHeight
+		if latestH <= 0 {
+			latestH = s.latestPublishedHeight
+		}
+		s.colReadyMu.Unlock()
+		if latestH <= 0 {
+			http.Error(w, "No block available yet", http.StatusNotFound)
+			return
+		}
+		blockID = fmt.Sprintf("block-%d", latestH)
 	}
 
 	var header *engine.BlockHeader

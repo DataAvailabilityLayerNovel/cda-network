@@ -53,6 +53,9 @@ func VerifyAnchor(
 	if err != nil {
 		return false, fmt.Errorf("failed to decode commits_root: %w", err)
 	}
+	if k <= 0 || k != len(pieceCommits) {
+		k = len(pieceCommits)
+	}
 	if len(merkleProofs) != k {
 		return false, fmt.Errorf("invalid number of Merkle proofs: expected %d, got %d", k, len(merkleProofs))
 	}

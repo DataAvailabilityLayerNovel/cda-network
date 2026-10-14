@@ -127,25 +127,13 @@ func main() {
 		log.Fatalf("Failed to initialize GossipSub: %v", err)
 	}
 
-	n := 2 * cfg.K
-	colsPerNetCol := n / cfg.NumCols
-	if colsPerNetCol <= 0 {
-		colsPerNetCol = 1
+	baseColsPerNetCol := (2 * cfg.K) / cfg.NumCols
+	if baseColsPerNetCol <= 0 {
+		baseColsPerNetCol = 1
 	}
-	expandedPeers := make(map[int]string)
-	for colKey, addr := range cfg.BootstrapPeers {
-		baseCol := colKey
-		if colKey < cfg.NumCols {
-			baseCol = colKey * colsPerNetCol
-		}
-		for offset := 0; offset < colsPerNetCol; offset++ {
-			expandedPeers[baseCol+offset] = addr
-		}
-	}
-	cfg.BootstrapPeers = expandedPeers
 
 	// 3. Initialize Discovery & Sender
-	disc := p2p.NewDiscovery(cfg.BootstrapPeers)
+	disc := p2p.NewDiscovery(cfg.BootstrapPeers, cfg.NumCols, cfg.K)
 	sender := p2p.NewSender(p2pHost, disc)
 
 	// 4. Initialize Pipeline Engine
@@ -160,7 +148,11 @@ func main() {
 		if connectedBootstraps[addrStr] {
 			continue
 		}
-		bootColID := (colIdx / colsPerNetCol) * colsPerNetCol
+		netCol := colIdx
+		if colIdx >= cfg.NumCols {
+			netCol = colIdx / baseColsPerNetCol
+		}
+		bootColID := netCol * baseColsPerNetCol
 		_, bootPID, err := p2pcommon.GenerateDeterministicKeypair(fmt.Sprintf("cda-bootstrap-%d", bootColID))
 		if err != nil {
 			continue

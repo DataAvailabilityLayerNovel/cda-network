@@ -39,6 +39,10 @@ else
 fi
 rm -f publisher.log light*.log bootstrap*.log store*.log data/completion.log
 rm -f store_*.key *.key
-rm -rf bin/
+
+if [ -f "scripts/init_cometbft_cluster.py" ]; then
+    echo "[*] Re-initializing CometBFT cluster configurations with shared genesis..."
+    python3 scripts/init_cometbft_cluster.py -v 4 2>/dev/null || true
+fi
 
 echo "[+] Cleanup completed successfully."

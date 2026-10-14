@@ -279,4 +279,5 @@ type GossipStoreReadyPayload struct {
 type GossipBlockReadyPayload struct {
 	BlockID string `json:"block_id"`
 	Height  int    `json:"height"`
+	K       int    `json:"k,omitempty"`
 }

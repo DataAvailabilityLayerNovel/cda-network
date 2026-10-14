@@ -1,0 +1,44 @@
+# Stage 1: Build stage for CometBFT Consensus Node
+FROM golang:1.25-alpine AS builder
+
+RUN apk add --no-cache git build-base
+
+WORKDIR /app
+
+# Copy workspace definition and required source code
+COPY go.work go.work
+COPY rlnc-rsmt2d/ rlnc-rsmt2d/
+COPY cda-p2p/ cda-p2p/
+COPY cometbft/ cometbft/
+
+# Drop modules not needed for building CometBFT to optimize build isolation
+RUN go work edit -dropuse ./cda-bootstrap-node \
+                 -dropuse ./cda-light-node \
+                 -dropuse ./cda-publisher-node \
+                 -dropuse ./cda-store-node
+
+# Compile CometBFT statically
+ENV CGO_ENABLED=0
+RUN go build -ldflags="-s -w" -o bin/cometbft ./cometbft/cmd/cometbft
+
+# Stage 2: Runtime stage
+FROM alpine:3.19
+RUN apk add --no-cache curl jq bash ca-certificates
+
+WORKDIR /cometbft
+
+# Copy compiled binary
+COPY --from=builder /app/bin/cometbft /usr/local/bin/cometbft
+
+# Copy entrypoint script
+COPY scripts/cometbft_entrypoint.sh /usr/local/bin/cometbft_entrypoint.sh
+RUN chmod +x /usr/local/bin/cometbft_entrypoint.sh
+
+# CometBFT default ports:
+# 26656: P2P
+# 26657: RPC API
+# 26660: Prometheus metrics
+EXPOSE 26656 26657 26660
+
+ENTRYPOINT ["/usr/local/bin/cometbft_entrypoint.sh"]
+CMD ["node", "--proxy_app", "kvstore"]

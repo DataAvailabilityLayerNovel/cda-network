@@ -58,9 +58,10 @@ type Receiver struct {
 	pruneTTL    time.Duration
 
 	// Multi-block Pipelining & Pre-computation State
-	pipelineMu            sync.Mutex
-	pipelineCond          *sync.Cond
-	latestCompletedHeight int
+	pipelineMu              sync.Mutex
+	pipelineCond            *sync.Cond
+	latestCompletedHeight   int
+	currentDispatchedHeight int
 }
 
 func NewReceiver(
@@ -283,7 +284,7 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 
 		// Encode RLNC pieces and pre-compute all seeds in memory buffer for active Store Nodes
 		n := len(columnData)
-		totalSeeds := 2 * rcv.k
+		totalSeeds := n
 
 		type precomputedPiece struct {
 			row      int
@@ -343,30 +344,30 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 		log.Printf("[Height: %d] [Bootstrap Pre-computation] Successfully pre-computed %d opening proofs and %d RLNC seeds in buffer for Column %d, Block %s",
 			height, n, len(precomputedPieces), colIdx, payload.BlockID)
 
-		// Sequential Completion Gate: Wait until store nodes complete block-(height-1) before dispatching
-		if height > 1 {
-			rcv.pipelineMu.Lock()
-			if rcv.latestCompletedHeight < height-1 {
-				log.Printf("[Height: %d] [Bootstrap Pipeline] Pre-computed buffer ready! Waiting for store nodes to complete block-%d before dispatching (current completed: %d)...",
-					height, height-1, rcv.latestCompletedHeight)
-				deadline := time.Now().Add(120 * time.Second)
-				for rcv.latestCompletedHeight < height-1 && time.Now().Before(deadline) {
+		// Sequential Completion Gate: Wait until store nodes complete the PREVIOUS in-flight block before dispatching.
+		rcv.pipelineMu.Lock()
+		if height > rcv.currentDispatchedHeight {
+			prevHeight := rcv.currentDispatchedHeight
+			if prevHeight > 0 && prevHeight > rcv.latestCompletedHeight {
+				log.Printf("[Height: %d] [Bootstrap Pipeline] Pre-computed buffer ready! Waiting for in-flight block-%d to complete before dispatching...",
+					height, prevHeight)
+				deadline := time.Now().Add(3 * time.Second)
+				for rcv.latestCompletedHeight < prevHeight && time.Now().Before(deadline) {
 					rcv.pipelineMu.Unlock()
-					time.Sleep(100 * time.Millisecond)
+					time.Sleep(20 * time.Millisecond)
 					rcv.pipelineMu.Lock()
 				}
-				if rcv.latestCompletedHeight < height-1 {
-					log.Printf("[Height: %d] [Bootstrap Pipeline] ERROR: Safety timeout reached without block-%d completion (completed: %d). Aborting dispatch of block-%d seeds to maintain multi-column synchronization!",
-						height, height-1, rcv.latestCompletedHeight, height)
-					rcv.pipelineMu.Unlock()
-					return
+				if rcv.latestCompletedHeight < prevHeight {
+					log.Printf("[Height: %d] [Bootstrap Pipeline] Warning: Safety timeout reached waiting for block-%d. Proceeding with block-%d dispatch.",
+						height, prevHeight, height)
 				} else {
-					log.Printf("[Height: %d] [Bootstrap Pipeline] Store nodes finished block-%d! Instantly dispatching pre-computed seeds for block-%d...",
-						height, height-1, height)
+					log.Printf("[Height: %d] [Bootstrap Pipeline] In-flight block-%d finished! Instantly dispatching pre-computed seeds for block-%d...",
+						height, prevHeight, height)
 				}
 			}
-			rcv.pipelineMu.Unlock()
+			rcv.currentDispatchedHeight = height
 		}
+		rcv.pipelineMu.Unlock()
 
 		// Dispatch Anchor to GossipSub now that previous block is complete and this block is active
 		if err := rcv.broadcaster.BroadcastAnchor(payload.BlockID, colIdx, pieceCommits, merkleProofs); err != nil {
@@ -562,8 +563,12 @@ func (rcv *Receiver) GetPeersForCell(row, col int, pieceIdx int) []p2pcommon.Pee
 	defer rcv.peersMu.RUnlock()
 
 	var colPeers []p2pcommon.PeerInfo
+	seen := make(map[string]bool)
 	for _, info := range rcv.activePeers {
-		colPeers = append(colPeers, info)
+		if info.Row >= 0 && !seen[info.PeerID] {
+			seen[info.PeerID] = true
+			colPeers = append(colPeers, info)
+		}
 	}
 
 	if len(colPeers) == 0 {
@@ -580,16 +585,15 @@ func (rcv *Receiver) GetPeersForCell(row, col int, pieceIdx int) []p2pcommon.Pee
 		kVal = 4
 	}
 
-	// Find the primary store node for this row
-	// The primary store node's Row coordinate should match row % len(colPeers)
-	primaryIdx := row % len(colPeers)
+	storesPerCol := len(colPeers)
+	primaryIdx := row % storesPerCol
 
 	// Determine if this pieceIdx is for the primary node or the backup node
 	isBackup := (pieceIdx / kVal) > 0
 
 	var targetIdx int
 	if isBackup {
-		targetIdx = (primaryIdx + 1) % len(colPeers)
+		targetIdx = (primaryIdx + 1) % storesPerCol
 	} else {
 		targetIdx = primaryIdx
 	}
