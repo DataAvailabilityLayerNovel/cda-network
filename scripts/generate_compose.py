@@ -239,7 +239,8 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
         'networks': ['cda-net'],
         'environment': [
             'GF_SECURITY_ADMIN_PASSWORD=admin',
-            'GF_USERS_ALLOW_SIGN_UP=false'
+            'GF_USERS_ALLOW_SIGN_UP=false',
+            'GF_DASHBOARDS_MIN_REFRESH_INTERVAL=250ms'
         ],
         'depends_on': ['prometheus']
     }
@@ -357,7 +358,7 @@ providers:
             "to": "now"
         },
         "timepicker": {
-            "refresh_intervals": ["1s", "2s", "5s", "10s", "30s", "1m"],
+            "refresh_intervals": ["250ms", "500ms", "1s", "2s", "5s", "10s", "30s", "1m"],
             "time_options": ["1m", "2m", "5m", "15m", "1h", "6h", "12h", "24h"]
         },
         "panels": [

@@ -41,6 +41,11 @@ var (
 		Help:    "End-to-end duration from block ingestion to BlockReady in seconds.",
 		Buckets: []float64{0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0},
 	})
+
+	BlocksCompletedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "cda_publisher_blocks_completed_total",
+		Help: "Total completed blocks on CDA network grouped by dynamic dimension K.",
+	}, []string{"k"})
 )
 
 func init() {
@@ -52,5 +57,6 @@ func init() {
 		LatestK,
 		InFlightBlocks,
 		BlockDuration,
+		BlocksCompletedTotal,
 	)
 }

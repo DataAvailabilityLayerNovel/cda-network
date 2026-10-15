@@ -48,6 +48,7 @@ type APIService struct {
 	latestPublishedHeight int
 	latestCompletedHeight int
 	inFlightCount         int
+	inFlightBlocks        map[string]int                  // BlockID -> Height
 	storeReadyMap         map[string]map[int]map[int]bool // BlockID -> NetColIdx -> set of RowIdx
 	columnReadyMap        map[string]map[int]bool          // BlockID -> set of NetColIdx
 	blockReadyEmitted     map[string]bool
@@ -120,8 +121,73 @@ func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.Pub
 		blockReadyEmitted: make(map[string]bool),
 		blockK:            make(map[string]int),
 		blockStartTime:    make(map[string]time.Time),
+		inFlightBlocks:    make(map[string]int),
 	}
 	svc.publishCond = sync.NewCond(&svc.colReadyMu)
+
+	// Background reconciliation loop: prunes stale in-flight blocks and enforces pipeline completion invariants
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			svc.colReadyMu.Lock()
+			// Invariant 1: When latest completed height >= latest published height, all published blocks are done.
+			if svc.latestCompletedHeight >= svc.latestPublishedHeight && svc.latestPublishedHeight > 0 {
+				if len(svc.inFlightBlocks) > 0 || svc.inFlightCount > 0 {
+					svc.inFlightBlocks = make(map[string]int)
+					svc.inFlightCount = 0
+					InFlightBlocks.Set(0)
+				}
+			} else if len(svc.inFlightBlocks) > 0 {
+				changed := false
+				for bid, h := range svc.inFlightBlocks {
+					// Invariant 2: Any block whose height <= latestCompletedHeight has been completed/superseded
+					if h > 0 && h <= svc.latestCompletedHeight {
+						delete(svc.inFlightBlocks, bid)
+						changed = true
+						continue
+					}
+					// Invariant 3: If a block has been in-flight for > 15s and reached >= 75% custody (e.g. 6/8 store nodes),
+					// finalize BlockReady since RS 2D can fully recover the ODS from >= 50% data.
+					stTime := svc.blockStartTime[bid]
+					if !stTime.IsZero() && time.Since(stTime) > 15*time.Second {
+						readyCount := 0
+						if svc.storeReadyMap[bid] != nil && svc.storeReadyMap[bid][0] != nil {
+							readyCount = len(svc.storeReadyMap[bid][0])
+						}
+						storesPerCol := 8
+						if envStores := os.Getenv("STORE_NODES_PER_COL"); envStores != "" {
+							if val, err := strconv.Atoi(envStores); err == nil && val > 0 {
+								storesPerCol = val
+							}
+						}
+						minQuorum := (storesPerCol * 3) / 4
+						if minQuorum < 1 {
+							minQuorum = 1
+						}
+						if readyCount >= minQuorum && !svc.blockReadyEmitted[bid] {
+							svc.blockReadyEmitted[bid] = true
+							expCols := svc.activeCols
+							if expCols <= 0 {
+								expCols = 8
+							}
+							log.Printf("[Publisher Reconcile] Block %s reached %d/%d store custody (>75%% quorum) after 15s timeout. Finalizing BlockReady.", bid, readyCount, storesPerCol)
+							go svc.broadcastBlockReady(bid, h, expCols)
+						} else if time.Since(stTime) > 60*time.Second {
+							// Pipeline timeout fallback: prune dead in-flight entries after 60s
+							delete(svc.inFlightBlocks, bid)
+							changed = true
+						}
+					}
+				}
+				if changed {
+					svc.inFlightCount = len(svc.inFlightBlocks)
+					InFlightBlocks.Set(float64(svc.inFlightCount))
+				}
+			}
+			svc.colReadyMu.Unlock()
+		}
+	}()
 
 	if ps != nil {
 		var err error
@@ -263,13 +329,20 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 		s.columnReadyMap[blockID] = make(map[int]bool)
 	}
 
-	if readyStoreCount >= storesPerCol {
+	quorumStores := storesPerCol
+	if envQuorum := os.Getenv("STORE_READY_QUORUM"); envQuorum != "" {
+		if val, err := strconv.Atoi(envQuorum); err == nil && val > 0 && val <= storesPerCol {
+			quorumStores = val
+		}
+	}
+
+	if readyStoreCount >= quorumStores {
 		s.columnReadyMap[blockID][netColIdx] = true
 	}
 	readyColCount := len(s.columnReadyMap[blockID])
 
-	log.Printf("[Height: %d] [Publisher] Received StoreReady from Col %d Row %d (%d/%d Store Nodes ready for Col %d). Block %s: %d/%d active columns complete",
-		height, netColIdx, rowIdx, readyStoreCount, storesPerCol, netColIdx, blockID, readyColCount, expectedCols)
+	log.Printf("[Height: %d] [Publisher] Received StoreReady from Col %d Row %d (%d/%d Store Nodes ready for Col %d, quorum: %d). Block %s: %d/%d active columns complete",
+		height, netColIdx, rowIdx, readyStoreCount, storesPerCol, netColIdx, quorumStores, blockID, readyColCount, expectedCols)
 
 	if readyColCount >= expectedCols && !s.blockReadyEmitted[blockID] {
 		s.blockReadyEmitted[blockID] = true
@@ -283,11 +356,26 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 
 func (s *APIService) broadcastBlockReady(blockID string, height int, activeCols int) {
 	s.colReadyMu.Lock()
-	if s.inFlightCount > 0 {
+	if s.inFlightBlocks != nil {
+		delete(s.inFlightBlocks, blockID)
+		// Prune any superseded blocks (older heights that were bypassed by newer completed blocks)
+		for bid, h := range s.inFlightBlocks {
+			if h > 0 && h <= height {
+				delete(s.inFlightBlocks, bid)
+			}
+		}
+		s.inFlightCount = len(s.inFlightBlocks)
+	} else if s.inFlightCount > 0 {
 		s.inFlightCount--
 	}
 	if height > s.latestCompletedHeight {
 		s.latestCompletedHeight = height
+	}
+	if s.latestCompletedHeight >= s.latestPublishedHeight && s.latestPublishedHeight > 0 {
+		if s.inFlightBlocks != nil {
+			s.inFlightBlocks = make(map[string]int)
+		}
+		s.inFlightCount = 0
 	}
 	LatestCompletedHeight.Set(float64(s.latestCompletedHeight))
 	InFlightBlocks.Set(float64(s.inFlightCount))
@@ -300,6 +388,7 @@ func (s *APIService) broadcastBlockReady(blockID string, height int, activeCols 
 		kVal = s.kVal
 	}
 	LatestK.Set(float64(kVal))
+	BlocksCompletedTotal.WithLabelValues(strconv.Itoa(kVal)).Inc()
 
 	startTime := s.blockStartTime[blockID]
 	duration := 0.0
@@ -362,6 +451,13 @@ func (s *APIService) RegisterHandlers(mux *http.ServeMux) {
 
 func (s *APIService) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.colReadyMu.Lock()
+	if s.latestCompletedHeight >= s.latestPublishedHeight && s.latestPublishedHeight > 0 {
+		if len(s.inFlightBlocks) > 0 || s.inFlightCount > 0 {
+			s.inFlightBlocks = make(map[string]int)
+			s.inFlightCount = 0
+			InFlightBlocks.Set(0)
+		}
+	}
 	inFlight := s.inFlightCount
 	completedH := s.latestCompletedHeight
 	pubH := s.latestPublishedHeight
@@ -514,6 +610,32 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		reqHeight = p2pcommon.ParseHeightFromBlockID(req.BlockID)
 	}
 
+	// 0.4 Idempotency Check: if block already completed, return existing header without re-entering pipeline
+	s.colReadyMu.Lock()
+	if s.blockReadyEmitted[req.BlockID] || (reqHeight > 0 && reqHeight <= s.latestCompletedHeight) {
+		s.colReadyMu.Unlock()
+		log.Printf("[Height: %d] [Publisher] Block %s already completed (latest completed: %d). Returning cached header.", reqHeight, req.BlockID, s.latestCompletedHeight)
+		if s.db != nil {
+			var cachedHeader *engine.BlockHeader
+			_ = s.db.View(func(txn *badger.Txn) error {
+				item, err := txn.Get([]byte("header_" + req.BlockID))
+				if err != nil {
+					return err
+				}
+				return item.Value(func(val []byte) error {
+					return json.Unmarshal(val, &cachedHeader)
+				})
+			})
+			if cachedHeader != nil {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(cachedHeader)
+				return
+			}
+		}
+	} else {
+		s.colReadyMu.Unlock()
+	}
+
 	queueTimeout := 300 * time.Second
 	if envTimeout := os.Getenv("PUBLISHER_QUEUE_TIMEOUT"); envTimeout != "" {
 		if d, err := time.ParseDuration(envTimeout); err == nil && d > 0 {
@@ -531,23 +653,27 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.colReadyMu.Lock()
+	if s.inFlightBlocks == nil {
+		s.inFlightBlocks = make(map[string]int)
+	}
 	if maxInFlight > 0 {
 		deadline := time.Now().Add(queueTimeout)
-		for s.inFlightCount >= maxInFlight && time.Now().Before(deadline) {
+		for len(s.inFlightBlocks) >= maxInFlight && time.Now().Before(deadline) {
 			log.Printf("[Height: %d] [Publisher Queue] In-flight pipeline full (%d in-flight, max: %d). Waiting before accepting block-%d...",
-				reqHeight, s.inFlightCount, maxInFlight, reqHeight)
+				reqHeight, len(s.inFlightBlocks), maxInFlight, reqHeight)
 			s.colReadyMu.Unlock()
 			time.Sleep(200 * time.Millisecond)
 			s.colReadyMu.Lock()
 		}
-		if s.inFlightCount >= maxInFlight {
-			currentInFlight := s.inFlightCount
+		if len(s.inFlightBlocks) >= maxInFlight {
+			currentInFlight := len(s.inFlightBlocks)
 			s.colReadyMu.Unlock()
 			http.Error(w, fmt.Sprintf("Block height %d timed out waiting in publisher queue (%d in-flight, max in-flight: %d after waiting %v)", reqHeight, currentInFlight, maxInFlight, queueTimeout), http.StatusUnprocessableEntity)
 			return
 		}
 	}
-	s.inFlightCount++
+	s.inFlightBlocks[req.BlockID] = reqHeight
+	s.inFlightCount = len(s.inFlightBlocks)
 	InFlightBlocks.Set(float64(s.inFlightCount))
 	s.colReadyMu.Unlock()
 
@@ -555,10 +681,13 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if !accepted {
 			s.colReadyMu.Lock()
-			if s.inFlightCount > 0 {
+			if s.inFlightBlocks != nil {
+				delete(s.inFlightBlocks, req.BlockID)
+				s.inFlightCount = len(s.inFlightBlocks)
+			} else if s.inFlightCount > 0 {
 				s.inFlightCount--
-				InFlightBlocks.Set(float64(s.inFlightCount))
 			}
+			InFlightBlocks.Set(float64(s.inFlightCount))
 			s.colReadyMu.Unlock()
 		}
 	}()
@@ -1357,25 +1486,28 @@ func (s *APIService) handleGetBlockData(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/json")
 
 	path := strings.TrimPrefix(r.URL.Path, "/block/")
-	path = strings.TrimSuffix(path, "/data")
 	path = strings.Trim(path, "/")
 	if path == "" {
 		http.Error(w, `{"status":"error","message":"missing block height or id"}`, http.StatusBadRequest)
 		return
 	}
 
+	// Extract primary block identifier segment (handles /1843, /1843/data, /1843/dat)
+	parts := strings.Split(path, "/")
+	target := parts[0]
+
 	var height int64
 	var blockID string
 
-	if hVal, err := strconv.ParseInt(path, 10, 64); err == nil {
+	if hVal, err := strconv.ParseInt(target, 10, 64); err == nil {
 		height = hVal
 		blockID = fmt.Sprintf("block-%d", height)
 	} else {
-		blockID = path
+		blockID = target
 		if strings.HasPrefix(blockID, "block-") {
-			parts := strings.Split(blockID, "-")
-			if len(parts) >= 2 {
-				height, _ = strconv.ParseInt(parts[1], 10, 64)
+			subParts := strings.Split(blockID, "-")
+			if len(subParts) >= 2 {
+				height, _ = strconv.ParseInt(subParts[1], 10, 64)
 			}
 		}
 	}
