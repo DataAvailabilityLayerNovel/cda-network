@@ -34,6 +34,7 @@ func main() {
 	kPieceVal := flag.Int("k-piece", 0, "override K-piece parameter")
 	activeColsVal := flag.Int("active-cols", 0, "override active columns parameter")
 	numColsVal := flag.Int("num-cols", 0, "override number of network column groups")
+	cometbftVal := flag.String("cometbft", "", "override CometBFT RPC address")
 	flag.Parse()
 
 	var cfg *config.Config
@@ -105,7 +106,17 @@ func main() {
 		}
 	}
 
-	log.Printf("Starting Publisher Node with configuration: APIPort=%d, K=%d, KPiece=%d, ActiveCols=%d", cfg.APIPort, cfg.K, cfg.KPiece, cfg.ActiveCols)
+	if *cometbftVal != "" {
+		cfg.CometBFTRPC = *cometbftVal
+	} else if envComet := os.Getenv("COMETBFT_RPC"); envComet != "" {
+		cfg.CometBFTRPC = envComet
+	}
+	if cfg.CometBFTRPC == "" {
+		cfg.CometBFTRPC = "http://localhost:26657"
+	}
+
+	log.Printf("Starting Publisher Node with configuration: APIPort=%d, K=%d, KPiece=%d, ActiveCols=%d, CometBFT=%s",
+		cfg.APIPort, cfg.K, cfg.KPiece, cfg.ActiveCols, cfg.CometBFTRPC)
 
 	// 1. Initialize P2P Host with deterministic PeerID
 	privKey, pid, err := p2pcommon.GenerateDeterministicKeypair("cda-publisher")
@@ -200,9 +211,12 @@ func main() {
 		}(*bootInfo)
 	}
 
-	// 5. Initialize API Service
+	// 5. Initialize API Service and Block Reconstructor
 	dbPath := "data/publisher/badger"
+	reconstructor := engine.NewBlockReconstructor(p2pHost, disc, pipeline)
 	apiService := service.NewAPIService(pipeline, sender, ps, dbPath, cfg.SequencerPublicKey, cfg.ActiveCols, cfg.K, cfg.NumCols)
+	apiService.SetReconstructor(reconstructor)
+	apiService.SetCometBFTRPC(cfg.CometBFTRPC)
 	mux := http.NewServeMux()
 	apiService.RegisterHandlers(mux)
 	mux.Handle("/metrics", promhttp.Handler())

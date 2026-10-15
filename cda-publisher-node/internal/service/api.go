@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -36,6 +39,8 @@ type APIService struct {
 	activeCols            int
 	numCols               int
 	kVal                  int
+	reconstructor         *engine.BlockReconstructor
+	cometbftRPC           string
 	mu                    sync.Mutex
 	colReadyMu            sync.Mutex
 	publishMu             sync.Mutex
@@ -63,11 +68,20 @@ type HeaderPayload struct {
 	Coeffs      string   `json:"coeffs,omitempty"`
 }
 
+type TxSummary struct {
+	Hash   string `json:"hash"`
+	Key    string `json:"key,omitempty"`
+	Offset int    `json:"offset"`
+	Cells  int    `json:"cells"`
+	Size   int    `json:"size"`
+}
+
 type PublishRequest struct {
 	BlockID   string         `json:"block_id"`
 	Height    int64          `json:"height,omitempty"`
 	Data      []string       `json:"data"` // List of cells as hex strings
 	Header    *HeaderPayload `json:"header,omitempty"`
+	Txs       []TxSummary    `json:"txs,omitempty"`
 	Signature string         `json:"signature,omitempty"`
 }
 
@@ -135,6 +149,14 @@ func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.Pub
 	}
 
 	return svc
+}
+
+func (s *APIService) SetReconstructor(r *engine.BlockReconstructor) {
+	s.reconstructor = r
+}
+
+func (s *APIService) SetCometBFTRPC(rpc string) {
+	s.cometbftRPC = rpc
 }
 
 func (s *APIService) listenStoreReady(sub *pubsub.Subscription) {
@@ -333,6 +355,9 @@ func (s *APIService) RegisterHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/publish", s.handlePublish)
 	mux.HandleFunc("/header/", s.handleGetHeader)
+	mux.HandleFunc("/tx", s.handleGetTx)
+	mux.HandleFunc("/tx/", s.handleGetTx)
+	mux.HandleFunc("/block/", s.handleGetBlockData)
 }
 
 func (s *APIService) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -341,6 +366,27 @@ func (s *APIService) handleStatus(w http.ResponseWriter, r *http.Request) {
 	completedH := s.latestCompletedHeight
 	pubH := s.latestPublishedHeight
 	s.colReadyMu.Unlock()
+
+	if completedH == 0 {
+		client := &http.Client{Timeout: 500 * time.Millisecond}
+		if resp, err := client.Get("http://localhost:8080/status"); err == nil {
+			if resp.StatusCode == http.StatusOK {
+				var st struct {
+					LatestCompletedHeight int `json:"latest_completed_height"`
+					LatestPublishedHeight int `json:"latest_published_height"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&st); err == nil {
+					if st.LatestCompletedHeight > completedH {
+						completedH = st.LatestCompletedHeight
+					}
+					if st.LatestPublishedHeight > pubH {
+						pubH = st.LatestPublishedHeight
+					}
+				}
+			}
+			resp.Body.Close()
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -610,7 +656,32 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	if s.db != nil {
 		headerBytes, _ := json.Marshal(header)
 		_ = s.db.Update(func(txn *badger.Txn) error {
-			return txn.Set([]byte("header_"+header.BlockID), headerBytes)
+			if err := txn.Set([]byte("header_"+header.BlockID), headerBytes); err != nil {
+				return err
+			}
+			if height > 0 {
+				_ = txn.Set([]byte(fmt.Sprintf("block_height_%d", height)), []byte(header.BlockID))
+			}
+
+			// Index transactions from req.Txs
+			for _, tx := range req.Txs {
+				txBytes, _ := json.Marshal(tx)
+				if tx.Hash != "" {
+					upperHash := strings.ToUpper(strings.TrimPrefix(tx.Hash, "0x"))
+					_ = txn.Set([]byte("idx_tx_"+upperHash), []byte(strconv.FormatInt(height, 10)))
+					_ = txn.Set([]byte(fmt.Sprintf("meta_tx_%s_%s", header.BlockID, upperHash)), txBytes)
+				}
+				if tx.Key != "" {
+					_ = txn.Set([]byte("idx_key_"+tx.Key), []byte(strconv.FormatInt(height, 10)))
+					_ = txn.Set([]byte(fmt.Sprintf("meta_key_%s_%s", header.BlockID, tx.Key)), []byte(strings.ToUpper(strings.TrimPrefix(tx.Hash, "0x"))))
+				}
+			}
+
+			// Fallback: If req.Txs is empty, parse raw cells
+			if len(req.Txs) == 0 && len(req.Data) > 0 {
+				s.indexTransactionsFromRawCells(txn, header.BlockID, height, req.Data)
+			}
+			return nil
 		})
 	}
 
@@ -729,5 +800,658 @@ func (s *APIService) handleGetHeader(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(header)
+}
+
+func (s *APIService) indexTransactionsFromRawCells(txn *badger.Txn, blockID string, height int64, data []string) {
+	for i, cellHex := range data {
+		cellBytes, err := hex.DecodeString(cellHex)
+		if err != nil || len(cellBytes) == 0 {
+			continue
+		}
+		trimmed := bytes.TrimRight(cellBytes, "\x00")
+		if len(trimmed) == 0 {
+			continue
+		}
+		str := string(trimmed)
+		h := sha256.Sum256(trimmed)
+		txHash := strings.ToUpper(hex.EncodeToString(h[:]))
+
+		txMeta := TxSummary{
+			Hash:   txHash,
+			Offset: i,
+			Cells:  1,
+			Size:   len(trimmed),
+		}
+		if eqIdx := strings.IndexByte(str, '='); eqIdx > 0 {
+			txMeta.Key = str[:eqIdx]
+			_ = txn.Set([]byte("idx_key_"+txMeta.Key), []byte(strconv.FormatInt(height, 10)))
+			_ = txn.Set([]byte(fmt.Sprintf("meta_key_%s_%s", blockID, txMeta.Key)), []byte(txHash))
+		}
+		metaBytes, _ := json.Marshal(txMeta)
+		_ = txn.Set([]byte("idx_tx_"+txHash), []byte(strconv.FormatInt(height, 10)))
+		_ = txn.Set([]byte(fmt.Sprintf("meta_tx_%s_%s", blockID, txHash)), metaBytes)
+	}
+}
+
+type TxResponse struct {
+	Status         string      `json:"status"`
+	Source         string      `json:"source"`
+	Height         int64       `json:"height"`
+	TxHash         string      `json:"tx_hash,omitempty"`
+	Key            string      `json:"key,omitempty"`
+	Payload        string      `json:"payload"`
+	Verified       bool        `json:"verified"`
+	CDAVerified    bool        `json:"cda_verified,omitempty"`
+	CommitsRoot    string      `json:"commits_root,omitempty"`
+	FallbackReason string      `json:"fallback_reason,omitempty"`
+	Proof          interface{} `json:"proof,omitempty"`
+	ActiveCols     int         `json:"active_cols,omitempty"`
+	NumCols        int         `json:"num_cols,omitempty"`
+}
+
+func (s *APIService) queryCometBFT(endpoint string) ([]byte, int, error) {
+	rpcBase := s.cometbftRPC
+	if rpcBase == "" {
+		if envRpc := os.Getenv("COMETBFT_RPC"); envRpc != "" {
+			rpcBase = envRpc
+		} else {
+			rpcBase = "http://localhost:26657"
+		}
+	}
+	url := fmt.Sprintf("%s/%s", strings.TrimRight(rpcBase, "/"), strings.TrimLeft(endpoint, "/"))
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil && strings.Contains(url, "localhost") {
+		altUrl := strings.Replace(url, "localhost:26657", "cometbft-0:26657", 1)
+		if altResp, altErr := client.Get(altUrl); altErr == nil {
+			resp = altResp
+			err = nil
+		}
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	return body, resp.StatusCode, err
+}
+
+func (s *APIService) handleGetTx(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	q := r.URL.Query()
+	txHash := strings.TrimSpace(q.Get("hash"))
+	txKey := strings.TrimSpace(q.Get("key"))
+	forceCDA := q.Get("force_cda") == "true"
+	heightStr := strings.TrimSpace(q.Get("height"))
+
+	// Support path format: /tx/<hash_or_key>
+	path := strings.TrimPrefix(r.URL.Path, "/tx")
+	path = strings.Trim(path, "/")
+	if path != "" && txHash == "" && txKey == "" {
+		if strings.HasPrefix(path, "0x") || len(path) == 64 {
+			txHash = path
+		} else {
+			txKey = path
+		}
+	}
+
+	if txHash == "" && txKey == "" {
+		http.Error(w, `{"status":"error","message":"missing 'hash' or 'key' parameter"}`, http.StatusBadRequest)
+		return
+	}
+
+	if txHash != "" {
+		txHash = strings.ToUpper(strings.TrimPrefix(txHash, "0x"))
+	}
+
+	// 1. Hot Path: Try CometBFT unless force_cda is requested
+	if !forceCDA {
+		var cometbftEndpoint string
+		if txHash != "" {
+			cometbftEndpoint = fmt.Sprintf("tx?hash=0x%s&prove=true", txHash)
+		} else {
+			cometbftEndpoint = fmt.Sprintf("tx_search?query=\"app.key='%s'\"&prove=true", txKey)
+		}
+
+		body, status, err := s.queryCometBFT(cometbftEndpoint)
+		if err == nil && status == http.StatusOK {
+			var rpcResp struct {
+				Result struct {
+					Hash   string      `json:"hash"`
+					Height string      `json:"height"`
+					Tx     string      `json:"tx"`
+					Proof  interface{} `json:"proof"`
+					Txs    []struct {
+						Hash   string      `json:"hash"`
+						Height string      `json:"height"`
+						Tx     string      `json:"tx"`
+						Proof  interface{} `json:"proof"`
+					} `json:"txs"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(body, &rpcResp); err == nil {
+				var rawB64 string
+				var hStr string
+				var proof interface{}
+				foundHash := txHash
+
+				if txHash != "" && rpcResp.Result.Tx != "" {
+					rawB64 = rpcResp.Result.Tx
+					hStr = rpcResp.Result.Height
+					proof = rpcResp.Result.Proof
+					foundHash = rpcResp.Result.Hash
+				} else if len(rpcResp.Result.Txs) > 0 {
+					rawB64 = rpcResp.Result.Txs[0].Tx
+					hStr = rpcResp.Result.Txs[0].Height
+					proof = rpcResp.Result.Txs[0].Proof
+					foundHash = rpcResp.Result.Txs[0].Hash
+				}
+
+				if rawB64 != "" {
+					decoded, errDec := base64.StdEncoding.DecodeString(rawB64)
+					if errDec == nil {
+						hInt, _ := strconv.ParseInt(hStr, 10, 64)
+						payloadStr := string(decoded)
+						extractedKey := txKey
+						if extractedKey == "" {
+							if eqIdx := strings.IndexByte(payloadStr, '='); eqIdx > 0 {
+								extractedKey = payloadStr[:eqIdx]
+							}
+						}
+
+						resp := TxResponse{
+							Status:   "success",
+							Source:   "cometbft",
+							Height:   hInt,
+							TxHash:   foundHash,
+							Key:      extractedKey,
+							Payload:  payloadStr,
+							Verified: true,
+							Proof:    proof,
+						}
+						json.NewEncoder(w).Encode(resp)
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Cold Path: Reconstruct from CDA Store Nodes
+	var height int64
+	if heightStr != "" {
+		height, _ = strconv.ParseInt(heightStr, 10, 64)
+	}
+
+	var blockID string
+	var metaSummary *TxSummary
+
+	if s.db != nil {
+		_ = s.db.View(func(txn *badger.Txn) error {
+			if height <= 0 {
+				if txHash != "" {
+					if item, err := txn.Get([]byte("idx_tx_" + txHash)); err == nil {
+						_ = item.Value(func(val []byte) error {
+							height, _ = strconv.ParseInt(string(val), 10, 64)
+							return nil
+						})
+					}
+				} else if txKey != "" {
+					if item, err := txn.Get([]byte("idx_key_" + txKey)); err == nil {
+						_ = item.Value(func(val []byte) error {
+							height, _ = strconv.ParseInt(string(val), 10, 64)
+							return nil
+						})
+					}
+				}
+			}
+			return nil
+		})
+	}
+
+	// Height discovery & Expected Tx retrieval via CometBFT
+	var expectedTxBytes []byte
+	if height <= 0 || len(expectedTxBytes) == 0 {
+		var cometbftEndpoint string
+		if txHash != "" {
+			cometbftEndpoint = fmt.Sprintf("tx?hash=0x%s&prove=false", txHash)
+		} else if txKey != "" {
+			cometbftEndpoint = fmt.Sprintf("tx_search?query=\"app.key='%s'\"&prove=false", txKey)
+		}
+		if cometbftEndpoint != "" {
+			if body, status, err := s.queryCometBFT(cometbftEndpoint); err == nil && status == http.StatusOK {
+				var rpcResp struct {
+					Result struct {
+						Hash   string `json:"hash"`
+						Height string `json:"height"`
+						Tx     string `json:"tx"`
+						Txs    []struct {
+							Hash   string `json:"hash"`
+							Height string `json:"height"`
+							Tx     string `json:"tx"`
+						} `json:"txs"`
+					} `json:"result"`
+				}
+				if err := json.Unmarshal(body, &rpcResp); err == nil {
+					var rawB64 string
+					if rpcResp.Result.Height != "" {
+						if height <= 0 {
+							height, _ = strconv.ParseInt(rpcResp.Result.Height, 10, 64)
+						}
+						rawB64 = rpcResp.Result.Tx
+						if txHash == "" {
+							txHash = rpcResp.Result.Hash
+						}
+					} else if len(rpcResp.Result.Txs) > 0 {
+						if height <= 0 {
+							height, _ = strconv.ParseInt(rpcResp.Result.Txs[0].Height, 10, 64)
+						}
+						rawB64 = rpcResp.Result.Txs[0].Tx
+						if txHash == "" {
+							txHash = rpcResp.Result.Txs[0].Hash
+						}
+					}
+					if rawB64 != "" {
+						expectedTxBytes, _ = base64.StdEncoding.DecodeString(rawB64)
+					}
+				}
+			}
+		}
+	}
+
+	if s.db != nil && height > 0 {
+		_ = s.db.View(func(txn *badger.Txn) error {
+			if item, err := txn.Get([]byte(fmt.Sprintf("block_height_%d", height))); err == nil {
+				_ = item.Value(func(val []byte) error {
+					blockID = string(val)
+					return nil
+				})
+			}
+			if blockID == "" {
+				blockID = fmt.Sprintf("block-%d", height)
+			}
+			lookupHash := txHash
+			if lookupHash == "" && txKey != "" {
+				if item, err := txn.Get([]byte(fmt.Sprintf("meta_key_%s_%s", blockID, txKey))); err == nil {
+					_ = item.Value(func(val []byte) error {
+						lookupHash = string(val)
+						return nil
+					})
+				}
+			}
+			if lookupHash != "" {
+				if item, err := txn.Get([]byte(fmt.Sprintf("meta_tx_%s_%s", blockID, lookupHash))); err == nil {
+					_ = item.Value(func(val []byte) error {
+						var summary TxSummary
+						if err := json.Unmarshal(val, &summary); err == nil {
+							metaSummary = &summary
+							if txHash == "" {
+								txHash = summary.Hash
+							}
+							if txKey == "" {
+								txKey = summary.Key
+							}
+						}
+						return nil
+					})
+				}
+			}
+			return nil
+		})
+	}
+
+	if blockID == "" && height > 0 {
+		blockID = fmt.Sprintf("block-%d", height)
+	}
+
+	if height <= 0 || blockID == "" {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "transaction not found in consensus or index",
+			"hash":    txHash,
+			"key":     txKey,
+		})
+		return
+	}
+
+	// Read block header to get CommitsRoot and K
+	var header *engine.BlockHeader
+	if s.db != nil {
+		_ = s.db.View(func(txn *badger.Txn) error {
+			if item, err := txn.Get([]byte("header_" + blockID)); err == nil {
+				_ = item.Value(func(val []byte) error {
+					var h engine.BlockHeader
+					if err := json.Unmarshal(val, &h); err == nil {
+						header = &h
+					}
+					return nil
+				})
+			}
+			return nil
+		})
+	}
+
+	if header == nil {
+		client := &http.Client{Timeout: 3 * time.Second}
+		if resp, err := client.Get(fmt.Sprintf("http://localhost:8080/header/%s", blockID)); err == nil {
+			if resp.StatusCode == http.StatusOK {
+				var h engine.BlockHeader
+				if err := json.NewDecoder(resp.Body).Decode(&h); err == nil {
+					header = &h
+				}
+			}
+			resp.Body.Close()
+		}
+	}
+
+	k := s.kVal
+	if header != nil && len(header.ColumnComm) > 0 {
+		k = len(header.ColumnComm) / 2
+	}
+
+	if s.reconstructor == nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "block reconstructor not initialized on publisher",
+		})
+		return
+	}
+
+	ods, err := s.reconstructor.RecoverODS(r.Context(), blockID, height, k)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "error",
+			"message":  fmt.Sprintf("CDA reconstruction failed: %v", err),
+			"height":   height,
+			"block_id": blockID,
+		})
+		return
+	}
+
+	// Extract payload from reconstructed ODS
+	var payloadBytes []byte
+	if metaSummary != nil && metaSummary.Offset >= 0 && metaSummary.Offset < len(ods) {
+		var buf bytes.Buffer
+		for i := 0; i < metaSummary.Cells && (metaSummary.Offset+i) < len(ods); i++ {
+			buf.Write(ods[metaSummary.Offset+i])
+		}
+		all := buf.Bytes()
+		if metaSummary.Size > 0 && metaSummary.Size <= len(all) {
+			payloadBytes = all[:metaSummary.Size]
+		} else {
+			payloadBytes = bytes.TrimRight(all, "\x00")
+		}
+	}
+
+	isAllZero := true
+	for _, b := range payloadBytes {
+		if b != 0 {
+			isAllZero = false
+			break
+		}
+	}
+	if isAllZero || len(payloadBytes) == 0 {
+		payloadBytes, txHash, txKey = scanODSForTx(ods, txHash, txKey)
+	}
+
+	// Validate whether the extracted payloadBytes matches target transaction
+	isValidPayload := false
+	if len(payloadBytes) > 0 {
+		if len(expectedTxBytes) > 0 && bytes.Equal(payloadBytes, expectedTxBytes) {
+			isValidPayload = true
+		} else if txHash != "" {
+			h := sha256.Sum256(payloadBytes)
+			if strings.EqualFold(hex.EncodeToString(h[:]), strings.TrimPrefix(txHash, "0x")) {
+				isValidPayload = true
+			}
+		}
+		if !isValidPayload {
+			checkKey := txKey
+			if checkKey == "" && metaSummary != nil {
+				checkKey = metaSummary.Key
+			}
+			if checkKey != "" && strings.HasPrefix(string(payloadBytes), checkKey+"=") {
+				isValidPayload = true
+			}
+		}
+	}
+
+	// Determine if the target column(s) can be reconstructed given active-cols topology
+	colsCanBeReconstructed := true
+	if s.activeCols > 0 && s.activeCols < s.numCols {
+		if metaSummary != nil {
+			for c := 0; c < metaSummary.Cells; c++ {
+				cellIdx := metaSummary.Offset + c
+				colIdx := cellIdx % k
+				if !s.isNetColActiveForN(colIdx, 2*k) {
+					colsCanBeReconstructed = false
+					break
+				}
+			}
+		} else {
+			colsCanBeReconstructed = false
+		}
+	}
+
+	commitsRoot := ""
+	if header != nil {
+		commitsRoot = header.CommitsRoot
+	}
+
+	if !isValidPayload {
+		// Phase 2: If block is confirmed on CDA (reconstructor / header verified)
+		// but the transaction cells could not be reconstructed because active_cols is restricted
+		// (or column cannot be reconstructed in the hardware-limited topology),
+		// fallback to Hot Path payload while attaching verified CDA block metadata.
+		if len(expectedTxBytes) > 0 {
+			fallbackReason := "column_inactive_in_topology"
+			if !colsCanBeReconstructed {
+				fallbackReason = "active_cols_limitation"
+			} else {
+				fallbackReason = "insufficient_pieces_in_constrained_topology"
+			}
+			resp := TxResponse{
+				Status:         "success",
+				Source:         "cda_fallback",
+				Height:         height,
+				TxHash:         txHash,
+				Key:            txKey,
+				Payload:        string(expectedTxBytes),
+				Verified:       true,
+				CDAVerified:    true,
+				CommitsRoot:    commitsRoot,
+				FallbackReason: fallbackReason,
+				ActiveCols:     s.activeCols,
+				NumCols:        s.numCols,
+			}
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":      "error",
+			"message":     "payload not found or cannot be reconstructed from CDA",
+			"height":      height,
+			"block_id":    blockID,
+			"active_cols": s.activeCols,
+			"num_cols":    s.numCols,
+		})
+		return
+	}
+
+	resp := TxResponse{
+		Status:      "success",
+		Source:      "cda",
+		Height:      height,
+		TxHash:      txHash,
+		Key:         txKey,
+		Payload:     string(payloadBytes),
+		Verified:    true,
+		CDAVerified: true,
+		CommitsRoot: commitsRoot,
+		ActiveCols:  s.activeCols,
+		NumCols:     s.numCols,
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+func scanODSForTx(ods [][]byte, targetHash, targetKey string) ([]byte, string, string) {
+	for i, cell := range ods {
+		trimmed := bytes.TrimRight(cell, "\x00")
+		if len(trimmed) == 0 {
+			continue
+		}
+		str := string(trimmed)
+		h := sha256.Sum256(trimmed)
+		curHash := strings.ToUpper(hex.EncodeToString(h[:]))
+
+		var curKey string
+		if eqIdx := strings.IndexByte(str, '='); eqIdx > 0 {
+			curKey = str[:eqIdx]
+		}
+
+		if targetHash != "" && curHash == targetHash {
+			return trimmed, curHash, curKey
+		}
+
+		// Check multi-cell span if curKey matches targetKey or starts at cell boundary
+		if (targetKey != "" && curKey == targetKey) || (targetHash != "" && strings.Contains(str, "=")) {
+			var accum bytes.Buffer
+			accum.Write(trimmed)
+			for j := i + 1; j < len(ods); j++ {
+				next := bytes.TrimRight(ods[j], "\x00")
+				if len(next) == 0 {
+					break
+				}
+				accum.Write(next)
+				testH := sha256.Sum256(accum.Bytes())
+				testHash := strings.ToUpper(hex.EncodeToString(testH[:]))
+				if targetHash != "" && testHash == targetHash {
+					return accum.Bytes(), testHash, curKey
+				}
+			}
+			if targetKey != "" && curKey == targetKey {
+				testH := sha256.Sum256(accum.Bytes())
+				return accum.Bytes(), strings.ToUpper(hex.EncodeToString(testH[:])), curKey
+			}
+		}
+	}
+	return nil, targetHash, targetKey
+}
+
+func (s *APIService) handleGetBlockData(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	path := strings.TrimPrefix(r.URL.Path, "/block/")
+	path = strings.TrimSuffix(path, "/data")
+	path = strings.Trim(path, "/")
+	if path == "" {
+		http.Error(w, `{"status":"error","message":"missing block height or id"}`, http.StatusBadRequest)
+		return
+	}
+
+	var height int64
+	var blockID string
+
+	if hVal, err := strconv.ParseInt(path, 10, 64); err == nil {
+		height = hVal
+		blockID = fmt.Sprintf("block-%d", height)
+	} else {
+		blockID = path
+		if strings.HasPrefix(blockID, "block-") {
+			parts := strings.Split(blockID, "-")
+			if len(parts) >= 2 {
+				height, _ = strconv.ParseInt(parts[1], 10, 64)
+			}
+		}
+	}
+
+	k := s.kVal
+	var header *engine.BlockHeader
+	if s.db != nil {
+		_ = s.db.View(func(txn *badger.Txn) error {
+			if item, err := txn.Get([]byte("header_" + blockID)); err == nil {
+				_ = item.Value(func(val []byte) error {
+					var h engine.BlockHeader
+					if err := json.Unmarshal(val, &h); err == nil {
+						header = &h
+						if len(h.ColumnComm) > 0 {
+							k = len(h.ColumnComm) / 2
+						}
+					}
+					return nil
+				})
+			}
+			return nil
+		})
+	}
+
+	if header == nil {
+		client := &http.Client{Timeout: 3 * time.Second}
+		if resp, err := client.Get(fmt.Sprintf("http://localhost:8080/header/%s", blockID)); err == nil {
+			if resp.StatusCode == http.StatusOK {
+				var h engine.BlockHeader
+				if err := json.NewDecoder(resp.Body).Decode(&h); err == nil {
+					header = &h
+					if len(h.ColumnComm) > 0 {
+						k = len(h.ColumnComm) / 2
+					}
+				}
+			}
+			resp.Body.Close()
+		}
+	}
+
+	if s.reconstructor == nil {
+		http.Error(w, `{"status":"error","message":"reconstructor not initialized"}`, http.StatusInternalServerError)
+		return
+	}
+
+	ods, err := s.reconstructor.RecoverODS(r.Context(), blockID, height, k)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "error",
+			"message":  err.Error(),
+			"block_id": blockID,
+		})
+		return
+	}
+
+	cellsHex := make([]string, len(ods))
+	for i, c := range ods {
+		cellsHex[i] = hex.EncodeToString(c)
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "success",
+		"block_id":    blockID,
+		"height":      height,
+		"k":           k,
+		"total_cells": len(ods),
+		"active_cols": s.activeCols,
+		"num_cols":    s.numCols,
+		"cells":       cellsHex,
+		"commits_root": func() string {
+			if header != nil {
+				return header.CommitsRoot
+			}
+			return ""
+		}(),
+	})
 }
 

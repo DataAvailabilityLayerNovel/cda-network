@@ -1,10 +1,15 @@
 package service
 
 import (
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"cda-publisher-node/internal/engine"
+	"github.com/dgraph-io/badger/v4"
 )
 
 func TestVerifyCDAHeader_Success(t *testing.T) {
@@ -122,5 +127,164 @@ func TestVerifyCDAHeader_MismatchedCoeffs(t *testing.T) {
 	err := VerifyCDAHeader(computed, bftHeader)
 	if err == nil {
 		t.Fatalf("expected error for tampered Coeffs, got nil")
+	}
+}
+
+func TestHandleGetTx_BadRequest(t *testing.T) {
+	svc := &APIService{}
+	req, _ := http.NewRequest(http.MethodGet, "/tx", nil)
+	rr := httptest.NewRecorder()
+	svc.handleGetTx(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400 for missing params, got %d", rr.Code)
+	}
+}
+
+func TestHandleGetTx_HotPath_CometBFT(t *testing.T) {
+	expectedPayload := "tx_test_key_0=deadbeef1234"
+	expectedB64 := base64.StdEncoding.EncodeToString([]byte(expectedPayload))
+
+	mockComet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]interface{}{
+			"result": map[string]interface{}{
+				"hash":   "AA11BB22CC33",
+				"height": "42",
+				"tx":     expectedB64,
+				"proof":  map[string]string{"type": "mock_merkle_proof"},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer mockComet.Close()
+
+	svc := &APIService{
+		cometbftRPC: mockComet.URL,
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, "/tx?hash=AA11BB22CC33", nil)
+	rr := httptest.NewRecorder()
+	svc.handleGetTx(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp TxResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+
+	if resp.Source != "cometbft" {
+		t.Errorf("expected source cometbft, got %s", resp.Source)
+	}
+	if resp.Height != 42 {
+		t.Errorf("expected height 42, got %d", resp.Height)
+	}
+	if resp.Payload != expectedPayload {
+		t.Errorf("expected payload %s, got %s", expectedPayload, resp.Payload)
+	}
+	if resp.Key != "tx_test_key_0" {
+		t.Errorf("expected key tx_test_key_0, got %s", resp.Key)
+	}
+}
+
+func TestHandleGetTx_ColdPath_CDA(t *testing.T) {
+	dbDir := t.TempDir()
+	opts := badger.DefaultOptions(dbDir).WithLogger(nil)
+	db, err := badger.Open(opts)
+	if err != nil {
+		t.Fatalf("failed to open badger db: %v", err)
+	}
+	defer db.Close()
+
+	testHash := "F1E2D3C4B5A600112233"
+	testKey := "tx_cold_key_1"
+	testPayload := "tx_cold_key_1=998877665544332211"
+	expectedCommitsRoot := "0xmock_cda_commits_root_abcdef"
+	blockID := "block-5"
+	height := int64(5)
+
+	header := &engine.BlockHeader{
+		BlockID:     blockID,
+		CommitsRoot: expectedCommitsRoot,
+		ColumnComm:  [][]byte{[]byte("c0"), []byte("c1"), []byte("c2"), []byte("c3")},
+	}
+	headerBytes, _ := json.Marshal(header)
+
+	meta := TxSummary{
+		Hash:   testHash,
+		Key:    testKey,
+		Offset: 0,
+		Cells:  1,
+		Size:   len(testPayload),
+	}
+	metaBytes, _ := json.Marshal(meta)
+
+	// Seed BadgerDB with index and metadata
+	_ = db.Update(func(txn *badger.Txn) error {
+		_ = txn.Set([]byte("idx_tx_"+testHash), []byte("5"))
+		_ = txn.Set([]byte("idx_key_"+testKey), []byte("5"))
+		_ = txn.Set([]byte("block_height_5"), []byte(blockID))
+		_ = txn.Set([]byte("header_"+blockID), headerBytes)
+		_ = txn.Set([]byte("meta_tx_"+blockID+"_"+testHash), metaBytes)
+		_ = txn.Set([]byte("meta_key_"+blockID+"_"+testKey), []byte(testHash))
+		return nil
+	})
+
+	reconstructor := engine.NewBlockReconstructor(nil, nil, nil)
+	// Seed LRU cache with the recovered cell
+	cellData := make([]byte, 512)
+	copy(cellData, []byte(testPayload))
+	reconstructor.PutCachedODS(blockID, height, [][]byte{cellData, make([]byte, 512), make([]byte, 512), make([]byte, 512)})
+
+	svc := &APIService{
+		db:            db,
+		reconstructor: reconstructor,
+		kVal:          2,
+	}
+
+	// 1. Query by hash with force_cda=true
+	req, _ := http.NewRequest(http.MethodGet, "/tx?hash="+testHash+"&force_cda=true", nil)
+	rr := httptest.NewRecorder()
+	svc.handleGetTx(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp TxResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+
+	if resp.Source != "cda" {
+		t.Errorf("expected source cda, got %s", resp.Source)
+	}
+	if resp.Height != 5 {
+		t.Errorf("expected height 5, got %d", resp.Height)
+	}
+	if resp.Payload != testPayload {
+		t.Errorf("expected payload %s, got %s", testPayload, resp.Payload)
+	}
+	if resp.CommitsRoot != expectedCommitsRoot {
+		t.Errorf("expected commits_root %s, got %s", expectedCommitsRoot, resp.CommitsRoot)
+	}
+
+	// 2. Query by key with force_cda=true
+	reqKey, _ := http.NewRequest(http.MethodGet, "/tx?key="+testKey+"&force_cda=true", nil)
+	rrKey := httptest.NewRecorder()
+	svc.handleGetTx(rrKey, reqKey)
+
+	if rrKey.Code != http.StatusOK {
+		t.Fatalf("expected status 200 for key query, got %d: %s", rrKey.Code, rrKey.Body.String())
+	}
+	var respKey TxResponse
+	if err := json.Unmarshal(rrKey.Body.Bytes(), &respKey); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if respKey.Payload != testPayload {
+		t.Errorf("expected payload %s, got %s", testPayload, respKey.Payload)
 	}
 }
