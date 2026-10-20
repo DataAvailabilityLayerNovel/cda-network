@@ -11,6 +11,8 @@ type Config struct {
 	KPiece             int            `json:"k_piece"`
 	ActiveCols         int            `json:"active_cols,omitempty"`
 	NumCols            int            `json:"num_cols,omitempty"`
+	NetCols            int            `json:"net_cols,omitempty"`
+	NetRows            int            `json:"net_rows,omitempty"`
 	BootstrapPeers     map[int]string `json:"bootstrap_peers"` // maps colIdx to bootstrap node address (HTTP/P2P address)
 	SequencerPublicKey string         `json:"sequencer_public_key"`
 	CometBFTRPC        string         `json:"cometbft_rpc,omitempty"`
@@ -22,6 +24,8 @@ func DefaultConfig() *Config {
 		K:           4,
 		KPiece:      4,
 		NumCols:     8,
+		NetCols:     8,
+		NetRows:     8,
 		CometBFTRPC: "http://localhost:26657",
 		BootstrapPeers: map[int]string{
 			0: "http://localhost:8081", // Default address for column 0 (for other columns, fallback or config map)

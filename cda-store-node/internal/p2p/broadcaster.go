@@ -18,7 +18,9 @@ import (
 type Broadcaster struct {
 	host       host.Host
 	ps         *pubsub.PubSub
-	selfPeerID string // This node's own PeerID string — used as the dedicated topic/protocol identifier
+	selfPeerID string // This node's own PeerID string
+	netColIdx  int
+	netRows    int
 	peers      []peer.ID
 	mu         sync.RWMutex
 	topics     map[string]*pubsub.Topic
@@ -29,7 +31,19 @@ func NewBroadcaster(h host.Host, ps *pubsub.PubSub, selfPeerID string) *Broadcas
 		host:       h,
 		ps:         ps,
 		selfPeerID: selfPeerID,
+		netRows:    8,
 		topics:     make(map[string]*pubsub.Topic),
+	}
+}
+
+func (b *Broadcaster) SetNetworkMatrix(netColIdx, netRows int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if netColIdx >= 0 {
+		b.netColIdx = netColIdx
+	}
+	if netRows > 0 {
+		b.netRows = netRows
 	}
 }
 
@@ -60,12 +74,23 @@ func (b *Broadcaster) UpdatePeers(peers []peer.ID) {
 	b.peers = peers
 }
 
-// BroadcastRecodedPiece broadcasts a recoded piece to this node's dedicated GossipSub topic.
-// Using TopicNode(selfPeerID) instead of the shared column topic ensures that only nodes
-// which explicitly subscribed to this custody node's topic receive the recoded piece.
+// BroadcastRecodedPiece broadcasts a recoded piece to the row-based Network Matrix channel
+// TopicCellRow(netColIdx, row % netRows). All custody nodes in the same cell (and non-custody
+// nodes in the same column) subscribe to TopicCellRow to exchange independent recoded pieces.
 func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece *cda.ReceivedPiece, pieceCommits [][]byte) error {
-	// Publish on this node's own dedicated topic (per-node channel)
-	topicName := p2pcommon.TopicNode(b.selfPeerID)
+	b.mu.RLock()
+	netColIdx := b.netColIdx
+	netRows := b.netRows
+	b.mu.RUnlock()
+	if netRows <= 0 {
+		netRows = 8
+	}
+	targetNetRow := row % netRows
+	if targetNetRow < 0 {
+		targetNetRow += netRows
+	}
+
+	topicName := p2pcommon.TopicCellRow(netColIdx, targetNetRow)
 	topic, err := b.JoinTopic(topicName)
 	if err != nil {
 		return fmt.Errorf("failed to join GossipSub topic %s: %w", topicName, err)
@@ -90,19 +115,23 @@ func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece 
 	}
 
 	recordGossipMessage()
-	p2pcommon.LogDebug("[GossipSub] Successfully gossiped binary recoded piece for cell [%d, %d] to topic %s", row, col, topicName)
+	p2pcommon.LogDebug("[GossipSub] Successfully gossiped binary recoded piece for cell [%d, %d] to row topic %s", row, col, topicName)
 	return nil
 }
 
 // BroadcastStoreReady publishes a StoreReady signal so the publisher can aggregate store custody completion
-func (b *Broadcaster) BroadcastStoreReady(blockID string, height int, colIdx int, rowIdx int, storesPerCol int) error {
+func (b *Broadcaster) BroadcastStoreReady(blockID string, height int, netColIdx int, colIdx int, rowIdx int, netRows int, custodyNetRows []int, activePeersInCol int) error {
 	payload := p2pcommon.GossipStoreReadyPayload{
-		BlockID:      blockID,
-		Height:       height,
-		NetColIdx:    colIdx,
-		ColIdx:       colIdx,
-		RowIdx:       rowIdx,
-		StoresPerCol: storesPerCol,
+		BlockID:          blockID,
+		Height:           height,
+		NetColIdx:        netColIdx,
+		ColIdx:           colIdx,
+		RowIdx:           rowIdx,
+		PeerID:           b.selfPeerID,
+		StoresPerCol:     netRows,
+		NetRows:          netRows,
+		CustodyNetRows:   custodyNetRows,
+		ActivePeersInCol: activePeersInCol,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -121,6 +150,7 @@ func (b *Broadcaster) BroadcastStoreReady(blockID string, height int, colIdx int
 		return fmt.Errorf("failed to publish store-ready: %w", err)
 	}
 
-	log.Printf("[GossipSub] StoreReady signal broadcasted for Col %d, Row %d (StoresPerCol=%d), block %s (height %d)", colIdx, rowIdx, storesPerCol, blockID, height)
+	log.Printf("[GossipSub] StoreReady signal broadcasted for NetCol %d (Col %d), Row %d (CustodyNetRows=%v, ActivePeers=%d, NetRows=%d), block %s (height %d)",
+		netColIdx, colIdx, rowIdx, custodyNetRows, activePeersInCol, netRows, blockID, height)
 	return nil
 }

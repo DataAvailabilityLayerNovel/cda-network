@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,10 +48,12 @@ type Receiver struct {
 	crashOnFail   bool
 	db            *badger.DB
 
-	// Dynamic Peer Registry
+	// Network Matrix & Dynamic Peer Registry
 	peersMu      sync.RWMutex
 	activePeers  map[peer.ID]p2pcommon.PeerInfo
 	lastSeenPeer map[peer.ID]time.Time
+	netRows      int
+	peerTTL      time.Duration
 
 	pruneEnable bool
 	pruneTTL    time.Duration
@@ -90,6 +91,8 @@ func NewReceiver(
 		crashOnFail:   crashOnFail,
 		activePeers:   make(map[peer.ID]p2pcommon.PeerInfo),
 		lastSeenPeer:  make(map[peer.ID]time.Time),
+		netRows:       getEnvInt("CDA_NET_ROWS", 8),
+		peerTTL:       15 * time.Second,
 		pruneEnable:   pruneEnable,
 		pruneTTL:      pruneTTL,
 	}
@@ -127,7 +130,7 @@ func NewReceiver(
 					var info p2pcommon.PeerInfo
 					if err := json.Unmarshal(val, &info); err == nil {
 						rcv.activePeers[pid] = info
-						rcv.lastSeenPeer[pid] = time.Now() // Give 15 seconds to re-register
+						rcv.lastSeenPeer[pid] = time.Now() // Give peerTTL to re-register
 					}
 					return nil
 				})
@@ -137,6 +140,18 @@ func NewReceiver(
 	}
 
 	return rcv
+}
+
+// SetNetworkMatrixConfig configures the network row dimension and peer heartbeat expiry TTL.
+func (rcv *Receiver) SetNetworkMatrixConfig(netRows int, peerTTL time.Duration) {
+	rcv.peersMu.Lock()
+	defer rcv.peersMu.Unlock()
+	if netRows > 0 {
+		rcv.netRows = netRows
+	}
+	if peerTTL > 0 {
+		rcv.peerTTL = peerTTL
+	}
 }
 
 func (rcv *Receiver) Close() error {
@@ -151,17 +166,23 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	rcv.host.SetStreamHandler(p2pcommon.ProtoPublisherPush, rcv.handleReceiveColumn)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoBootstrapRouting, rcv.handleRouting)
 
-	// Periodically clean up stale peers (older than 15s)
+	// Periodically clean up stale peers (older than peerTTL, default 15s)
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
+				var expiredPeers []peer.ID
 				rcv.peersMu.Lock()
+				ttl := rcv.peerTTL
+				if ttl <= 0 {
+					ttl = 15 * time.Second
+				}
 				now := time.Now()
 				for pid, lastSeen := range rcv.lastSeenPeer {
-					if now.Sub(lastSeen) > 90*time.Second {
-						log.Printf("[P2P Registry] Removing stale peer: %s", pid)
+					if now.Sub(lastSeen) > ttl {
+						log.Printf("[P2P Registry] Removing stale peer %s (inactive for %v > %v)", pid, now.Sub(lastSeen).Round(time.Second), ttl)
 						if rcv.db != nil {
 							_ = rcv.db.Update(func(txn *badger.Txn) error {
 								return txn.Delete([]byte("peer_" + pid.String()))
@@ -169,9 +190,13 @@ func (rcv *Receiver) Start(ctx context.Context) {
 						}
 						delete(rcv.activePeers, pid)
 						delete(rcv.lastSeenPeer, pid)
+						expiredPeers = append(expiredPeers, pid)
 					}
 				}
 				rcv.peersMu.Unlock()
+				for _, pid := range expiredPeers {
+					rcv.broadcaster.ClosePersistentStream(pid)
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -182,6 +207,7 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	if rcv.pruneEnable {
 		go func() {
 			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
 			for {
 				select {
 				case <-ticker.C:
@@ -192,6 +218,28 @@ func (rcv *Receiver) Start(ctx context.Context) {
 			}
 		}()
 	}
+}
+
+func (rcv *Receiver) getCustodySnapshot() (map[int][]p2pcommon.PeerInfo, int, int) {
+	rcv.peersMu.RLock()
+	defer rcv.peersMu.RUnlock()
+
+	netRows := rcv.netRows
+	if netRows <= 0 {
+		netRows = 8
+	}
+	var allPeers []p2pcommon.PeerInfo
+	for _, info := range rcv.activePeers {
+		allPeers = append(allPeers, info)
+	}
+	activeStores := p2pcommon.GetActiveColumnStores(allPeers)
+	custodyMap := p2pcommon.ComputeColumnCustodyMap(activeStores, netRows)
+	return custodyMap, netRows, len(activeStores)
+}
+
+// GetCustodySummary returns the current RowCustodyMap, NetRows, and count of active store peers in this column.
+func (rcv *Receiver) GetCustodySummary() (map[int][]p2pcommon.PeerInfo, int, int) {
+	return rcv.getCustodySnapshot()
 }
 
 func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
@@ -279,18 +327,15 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 			return
 		}
 		KZGProofDuration.Observe(duration)
-		rcv.cache.SetProofs(payload.BlockID, proofs)
+		rcv.cache.SetProofsForCol(payload.BlockID, colIdx, proofs)
 		log.Printf("[Height: %d] Successfully generated opening proofs async for Column %d", height, colIdx)
+
+		// Snapshot the column custody map so seed generation matches active cell size M
+		custodyMap, netRows, _ := rcv.getCustodySnapshot()
 
 		// Encode RLNC pieces and pre-compute all seeds in memory buffer for active Store Nodes
 		n := len(columnData)
-		totalSeeds := getEnvInt("BOOTSTRAP_TOTAL_SEEDS_PER_ROW", 2*rcv.k)
-		if totalSeeds <= 0 {
-			totalSeeds = 2 * rcv.k
-		}
-		if totalSeeds <= 0 {
-			totalSeeds = 8
-		}
+		overrideSeeds := getEnvInt("BOOTSTRAP_TOTAL_SEEDS_PER_ROW", 0)
 
 		type precomputedPiece struct {
 			row      int
@@ -318,6 +363,13 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 			go func(rowIdx int) {
 				defer encodeWg.Done()
 				defer func() { <-encodeSem }()
+
+				targetNetRow := rowIdx % netRows
+				custodyPeers := custodyMap[targetNetRow]
+				totalSeeds, _, _ := p2pcommon.ComputeSeedingPlan(len(custodyPeers), rcv.k)
+				if overrideSeeds > totalSeeds {
+					totalSeeds = overrideSeeds
+				}
 
 				codedPieces, err := rcv.encoder.EncodeRowNSeeds(rowIdx, colIdx, columnData, proofs[rowIdx], totalSeeds)
 				if err != nil {
@@ -444,7 +496,8 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 			}(targetPeer, seeds)
 		}
 		wg.Wait()
-		log.Printf("[Height: %d] Async Phase 2 finished successfully: seeded %d pieces total (%d per store node) for Column %d", height, len(precomputedPieces), rcv.k, colIdx)
+		log.Printf("[Height: %d] Async Phase 2 finished successfully: seeded %d pieces total across %d store nodes for Column %d",
+			height, len(precomputedPieces), len(nodeBatches), colIdx)
 	}()
 }
 
@@ -508,10 +561,14 @@ func (rcv *Receiver) handleRouting(stream network.Stream) {
 	// Find peers in the requester's row or column
 	var rowPeers []p2pcommon.PeerInfo
 	var colPeers []p2pcommon.PeerInfo
+	var allStorePeers []p2pcommon.PeerInfo
 
 	for p, info := range rcv.activePeers {
+		if info.Row >= 0 {
+			allStorePeers = append(allStorePeers, info)
+		}
 		if p == pid {
-			continue // skip self
+			continue // skip self in rowPeers/colPeers list
 		}
 		if isLightNode {
 			if req.TargetCol >= 0 {
@@ -552,11 +609,22 @@ func (rcv *Receiver) handleRouting(stream network.Stream) {
 			}
 		}
 	}
+
+	netRows := rcv.netRows
+	if netRows <= 0 {
+		netRows = 8
+	}
 	rcv.peersMu.Unlock()
 
+	activeStores := p2pcommon.GetActiveColumnStores(allStorePeers)
+	custodyMap := p2pcommon.ComputeColumnCustodyMap(activeStores, netRows)
+
 	resp := p2pcommon.BootstrapRoutingResponse{
-		RowPeers: rowPeers,
-		ColPeers: colPeers,
+		RowPeers:         rowPeers,
+		ColPeers:         colPeers,
+		RowCustodyMap:    custodyMap,
+		NetRows:          netRows,
+		ActivePeersInCol: len(activeStores),
 	}
 
 	if err := json.NewEncoder(stream).Encode(resp); err != nil {
@@ -565,47 +633,30 @@ func (rcv *Receiver) handleRouting(stream network.Stream) {
 }
 
 func (rcv *Receiver) GetPeersForCell(row, col int, pieceIdx int) []p2pcommon.PeerInfo {
-	rcv.peersMu.RLock()
-	defer rcv.peersMu.RUnlock()
-
-	var colPeers []p2pcommon.PeerInfo
-	seen := make(map[string]bool)
-	for _, info := range rcv.activePeers {
-		if info.Row >= 0 && !seen[info.PeerID] {
-			seen[info.PeerID] = true
-			colPeers = append(colPeers, info)
-		}
-	}
-
-	if len(colPeers) == 0 {
+	custodyMap, netRows, _ := rcv.getCustodySnapshot()
+	if len(custodyMap) == 0 {
 		return nil
 	}
 
-	// Sort colPeers deterministically by Row coordinate
-	sort.Slice(colPeers, func(i, j int) bool {
-		return colPeers[i].Row < colPeers[j].Row
-	})
-
-	kVal := rcv.k
-	if kVal <= 0 {
-		kVal = 4
+	targetNetRow := row % netRows
+	if targetNetRow < 0 {
+		targetNetRow += netRows
+	}
+	custodyPeers := custodyMap[targetNetRow]
+	if len(custodyPeers) == 0 {
+		return nil
 	}
 
-	storesPerCol := len(colPeers)
-	primaryIdx := row % storesPerCol
-
-	// Determine if this pieceIdx is for the primary node or the backup node
-	isBackup := (pieceIdx / kVal) > 0
-
-	var targetIdx int
-	if isBackup {
-		targetIdx = (primaryIdx + 1) % storesPerCol
-	} else {
-		targetIdx = primaryIdx
+	_, seedsPerPeer, _ := p2pcommon.ComputeSeedingPlan(len(custodyPeers), rcv.k)
+	if seedsPerPeer <= 0 {
+		seedsPerPeer = rcv.k
+		if seedsPerPeer <= 0 {
+			seedsPerPeer = 4
+		}
 	}
 
-	targetPeer := colPeers[targetIdx]
-	return []p2pcommon.PeerInfo{targetPeer}
+	peerSlot := (pieceIdx / seedsPerPeer) % len(custodyPeers)
+	return []p2pcommon.PeerInfo{custodyPeers[peerSlot]}
 }
 
 func (rcv *Receiver) GetActivePeers() []string {

@@ -13,6 +13,9 @@ type Config struct {
 	SeedAddr      string `json:"seed_addr"`
 	K             int    `json:"k"`
 	KPiece        int    `json:"k_piece"`
+	NetRows       int    `json:"net_rows"`
+	NetCols       int    `json:"net_cols"`
+	PeerTTL       string `json:"peer_ttl"`
 	PruneEnable   bool   `json:"prune_enable"`
 	PruneTTL      string `json:"prune_ttl"`
 }
@@ -25,6 +28,9 @@ func DefaultConfig() *Config {
 		PublisherAddr: "http://localhost:8080",
 		K:             4,
 		KPiece:        4,
+		NetRows:       8,
+		NetCols:       8,
+		PeerTTL:       "15s",
 		PruneEnable:   false,
 		PruneTTL:      "5m",
 	}

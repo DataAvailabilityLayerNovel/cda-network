@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -56,8 +57,33 @@ func CalculateCell(pid peer.ID, k1, k2 int, salt string) (row, col int) {
 
 // GenerateKeypairForCell searches deterministically for a private key whose PeerID maps to the target (row, col)
 func GenerateKeypairForCell(row, col, k1, k2 int, salt string) (crypto.PrivKey, peer.ID, error) {
+	return GenerateKeypairForCellInstance(row, col, k1, k2, salt, "")
+}
+
+// GenerateKeypairForCellInstance searches deterministically for a private key for a specific node instance
+// whose PeerID maps to the target (row % k1, col % k2) under CalculateCell.
+func GenerateKeypairForCellInstance(row, col, k1, k2 int, salt string, instanceID string) (crypto.PrivKey, peer.ID, error) {
+	if k1 <= 0 {
+		k1 = 8
+	}
+	if k2 <= 0 {
+		k2 = 8
+	}
+	targetRow := row % k1
+	if targetRow < 0 {
+		targetRow += k1
+	}
+	targetCol := col % k2
+	if targetCol < 0 {
+		targetCol += k2
+	}
 	for counter := 0; counter < 1000000; counter++ {
-		seedStr := fmt.Sprintf("cda-node-%d-%d-%d", row, col, counter)
+		var seedStr string
+		if instanceID == "" {
+			seedStr = fmt.Sprintf("cda-node-%d-%d-%d", row, col, counter)
+		} else {
+			seedStr = fmt.Sprintf("cda-node-%s-%d-%d-%d", instanceID, row, col, counter)
+		}
 		seed := sha256.Sum256([]byte(seedStr))
 		priv, _, err := crypto.GenerateEd25519Key(bytes.NewReader(seed[:]))
 		if err != nil {
@@ -68,11 +94,11 @@ func GenerateKeypairForCell(row, col, k1, k2 int, salt string) (crypto.PrivKey, 
 			return nil, "", err
 		}
 		r, c := CalculateCell(pid, k1, k2, salt)
-		if r == row && c == col {
+		if r == targetRow && c == targetCol {
 			return priv, pid, nil
 		}
 	}
-	return nil, "", fmt.Errorf("failed to generate key for cell [%d, %d] in 1M iterations", row, col)
+	return nil, "", fmt.Errorf("failed to generate key for cell [%d, %d] (instance %s) in 1M iterations", row, col, instanceID)
 }
 
 // GenerateDeterministicKeypair generates a private key deterministically from a simple string seed
@@ -149,6 +175,13 @@ func TopicRow(row int) string {
 	return fmt.Sprintf("/cda/1.0.0/row/%d", row)
 }
 
+// TopicCellRow returns the GossipSub topic for a specific network cell (netCol, netRow).
+// All custody nodes (whether native to netRow or borrowed from another row) publish their recoded
+// RLNC pieces for data row r (where r % netRows == netRow) onto this deterministic channel.
+func TopicCellRow(netCol, netRow int) string {
+	return fmt.Sprintf("/cda/1.0.0/col/%d/row/%d", netCol, netRow)
+}
+
 // TopicNode returns the per-node GossipSub topic for a store node identified by its PeerID.
 // Custody nodes publish their RLNC pieces here; non-custody nodes subscribe to get pieces.
 func TopicNode(peerID string) string {
@@ -173,16 +206,208 @@ type BootstrapRoutingRequest struct {
 
 // BootstrapRoutingResponse payload for Discovery Stream
 type BootstrapRoutingResponse struct {
-	RowPeers []PeerInfo `json:"row_peers"`
-	ColPeers []PeerInfo `json:"col_peers"`
+	RowPeers         []PeerInfo         `json:"row_peers"`
+	ColPeers         []PeerInfo         `json:"col_peers"`
+	RowCustodyMap    map[int][]PeerInfo `json:"row_custody_map,omitempty"`
+	NetRows          int                `json:"net_rows,omitempty"`
+	ActivePeersInCol int                `json:"active_peers_in_col,omitempty"`
+}
+
+// GetActiveColumnStores filters and deduplicates valid Store Node peers (Row >= 0),
+// sorted deterministically by (Row, PeerID).
+func GetActiveColumnStores(colPeers []PeerInfo) []PeerInfo {
+	seen := make(map[string]bool, len(colPeers))
+	var active []PeerInfo
+	for _, p := range colPeers {
+		if p.Row >= 0 && p.PeerID != "" && !seen[p.PeerID] {
+			seen[p.PeerID] = true
+			active = append(active, p)
+		}
+	}
+	sort.Slice(active, func(i, j int) bool {
+		if active[i].Row != active[j].Row {
+			return active[i].Row < active[j].Row
+		}
+		return active[i].PeerID < active[j].PeerID
+	})
+	return active
+}
+
+// ComputeColumnCustodyMap deterministically computes the Custody Store Nodes assigned to each
+// network row netRow in [0, netRows-1] for a given column's active store peers:
+//  1. If cell (netRow, netCol) has >= 2 store nodes: all M store nodes in that cell are active Custody Nodes.
+//  2. If cell (netRow, netCol) has == 1 store node: that node is the primary custody node, and 1 additional
+//     store node is borrowed from the next active row in the column so M_effective = 2.
+//  3. If cell (netRow, netCol) has == 0 store nodes (empty/left): up to 2 store nodes are borrowed from
+//     subsequent active rows in the column so no data row is ever orphaned.
+func ComputeColumnCustodyMap(colPeers []PeerInfo, netRows int) map[int][]PeerInfo {
+	if netRows <= 0 {
+		netRows = 8
+	}
+	active := GetActiveColumnStores(colPeers)
+	custodyMap := make(map[int][]PeerInfo, netRows)
+	if len(active) == 0 {
+		return custodyMap
+	}
+
+	grouped := make(map[int][]PeerInfo, netRows)
+	for _, p := range active {
+		r := p.Row % netRows
+		if r < 0 {
+			r += netRows
+		}
+		grouped[r] = append(grouped[r], p)
+	}
+
+	for targetRow := 0; targetRow < netRows; targetRow++ {
+		cellPeers := grouped[targetRow]
+		if len(cellPeers) >= 2 {
+			assigned := make([]PeerInfo, len(cellPeers))
+			copy(assigned, cellPeers)
+			custodyMap[targetRow] = assigned
+			continue
+		}
+
+		if len(cellPeers) == 1 {
+			assigned := []PeerInfo{cellPeers[0]}
+			// Borrow 1 additional peer from the next available row in the column
+			// Note: in legacy 1-node-per-cell mode, row r was backed up by rowIdx = (r + 1) % netRows.
+			for offset := 1; offset < netRows; offset++ {
+				candRow := (targetRow + offset) % netRows
+				candPeers := grouped[candRow]
+				if len(candPeers) > 0 {
+					// If candRow has multiple nodes, pick a secondary node to balance load; otherwise pick candPeers[0]
+					pickIdx := 0
+					if len(candPeers) > 1 {
+						pickIdx = (targetRow + offset) % len(candPeers)
+					}
+					if candPeers[pickIdx].PeerID != assigned[0].PeerID {
+						assigned = append(assigned, candPeers[pickIdx])
+						break
+					}
+				}
+			}
+			custodyMap[targetRow] = assigned
+			continue
+		}
+
+		// len(cellPeers) == 0: borrow up to 2 distinct peers from subsequent active rows
+		var assigned []PeerInfo
+		used := make(map[string]bool)
+		for offset := 1; offset < netRows && len(assigned) < 2; offset++ {
+			candRow := (targetRow + offset) % netRows
+			for _, p := range grouped[candRow] {
+				if !used[p.PeerID] {
+					used[p.PeerID] = true
+					assigned = append(assigned, p)
+					if len(assigned) >= 2 {
+						break
+					}
+				}
+			}
+		}
+		custodyMap[targetRow] = assigned
+	}
+
+	return custodyMap
+}
+
+// ComputeSeedingPlan returns:
+// - totalSeeds: total RLNC seeds Bootstrap should generate for a cell with M custody peers: max(2*kPiece, M * ceil(2*kPiece/M))
+// - seedsPerPeer: number of seeds each of the M custody peers receives: max(2, ceil(2*kPiece/M))
+// - recodesPerPeer: number of recoded pieces each custody peer should broadcast to TopicCellRow: max(1, ceil(2*kPiece/M))
+func ComputeSeedingPlan(numCustodyPeers int, kPiece int) (totalSeeds int, seedsPerPeer int, recodesPerPeer int) {
+	if kPiece <= 0 {
+		kPiece = 4
+	}
+	if numCustodyPeers <= 0 {
+		numCustodyPeers = 2
+	}
+	targetTotal := 2 * kPiece
+	seedsPerPeer = (targetTotal + numCustodyPeers - 1) / numCustodyPeers
+	if seedsPerPeer < 2 {
+		seedsPerPeer = 2
+	}
+	totalSeeds = numCustodyPeers * seedsPerPeer
+	recodesPerPeer = (targetTotal + numCustodyPeers - 1) / numCustodyPeers
+	if recodesPerPeer < 1 {
+		recodesPerPeer = 1
+	}
+	// When M == 2 and kPiece == 4, each peer gets 4 seeds and broadcasts kPiece/2 = 2 recoded pieces (total 4 recoded pieces across the 2 peers, or 2 rounds each)
+	if numCustodyPeers == 2 && kPiece >= 2 {
+		recodesPerPeer = kPiece / 2
+	}
+	return totalSeeds, seedsPerPeer, recodesPerPeer
+}
+
+// EvaluateNodeCustodyForRow checks a Store Node's custody role for dataRow given custodyMap:
+// - isCustody: true if selfPeerID is assigned in custodyMap[dataRow % netRows]
+// - isNativeRetention: true if this node retains all kPiece raw pieces long-term (native cell member, or first borrowed holder when cell is empty)
+// - numCustodyPeers: M (number of custody peers assigned to this cell)
+func EvaluateNodeCustodyForRow(selfPeerID string, selfNetRow int, dataRow int, netRows int, custodyMap map[int][]PeerInfo) (isCustody bool, isNativeRetention bool, numCustodyPeers int) {
+	if netRows <= 0 {
+		netRows = 8
+	}
+	targetNetRow := dataRow % netRows
+	if targetNetRow < 0 {
+		targetNetRow += netRows
+	}
+
+	if len(custodyMap) > 0 {
+		assigned := custodyMap[targetNetRow]
+		numCustodyPeers = len(assigned)
+		for idx, p := range assigned {
+			if p.PeerID == selfPeerID {
+				isCustody = true
+				pNetRow := p.Row % netRows
+				if pNetRow == targetNetRow || idx == 0 {
+					isNativeRetention = true
+				}
+				return isCustody, isNativeRetention, numCustodyPeers
+			}
+		}
+		return false, false, numCustodyPeers
+	}
+
+	// Fallback if custodyMap is not yet populated from Bootstrap
+	normSelfRow := selfNetRow % netRows
+	isPrimary := targetNetRow == normSelfRow
+	isBackup := ((targetNetRow + 1) % netRows) == normSelfRow
+	return isPrimary || isBackup, isPrimary, 2
+}
+
+// GetNodeCustodyNetRows returns the list of network rows (0..netRows-1) for which selfPeerID holds custody.
+func GetNodeCustodyNetRows(selfPeerID string, selfNetRow int, netRows int, custodyMap map[int][]PeerInfo) []int {
+	if netRows <= 0 {
+		netRows = 8
+	}
+	var rows []int
+	if len(custodyMap) > 0 {
+		for r := 0; r < netRows; r++ {
+			for _, p := range custodyMap[r] {
+				if p.PeerID == selfPeerID {
+					rows = append(rows, r)
+					break
+				}
+			}
+		}
+		return rows
+	}
+	normSelfRow := selfNetRow % netRows
+	rows = append(rows, normSelfRow)
+	prevRow := (normSelfRow - 1 + netRows) % netRows
+	if prevRow != normSelfRow {
+		rows = append(rows, prevRow)
+	}
+	return rows
 }
 
 // PublisherPushRequest payload for chunk pushing
 type PublisherPushRequest struct {
-	BlockID      string       `json:"block_id"`
-	ColIdx       int          `json:"col_idx"`
-	ColumnData   []string     `json:"column_data"`   // Hex-encoded data cells
-	PieceCommits []string     `json:"piece_commits"` // Hex-encoded piece commitments
+	BlockID      string                  `json:"block_id"`
+	ColIdx       int                     `json:"col_idx"`
+	ColumnData   []string                `json:"column_data"`   // Hex-encoded data cells
+	PieceCommits []string                `json:"piece_commits"` // Hex-encoded piece commitments
 	MerkleProofs []SerializedMerkleProof `json:"merkle_proofs"`
 }
 
@@ -197,10 +422,10 @@ type SeedCellRequest struct {
 	BlockID      string   `json:"block_id"`
 	Row          int      `json:"row"`
 	Col          int      `json:"col"`
-	Data         string   `json:"data"`          // Hex coded data d_i
-	Coeffs       string   `json:"coeffs"`        // Hex coefficients g_i
-	Proof        string   `json:"proof"`         // Hex combined proof P_i
-	PieceCommits []string `json:"piece_commits"` // Hex piece commitments C_0..C_k-1
+	Data         string   `json:"data"`                     // Hex coded data d_i
+	Coeffs       string   `json:"coeffs"`                   // Hex coefficients g_i
+	Proof        string   `json:"proof"`                    // Hex combined proof P_i
+	PieceCommits []string `json:"piece_commits"`            // Hex piece commitments C_0..C_k-1
 	SenderPeerID string   `json:"sender_peer_id,omitempty"` // PeerID of the custody node sending this piece
 }
 
@@ -220,13 +445,13 @@ type StoreFetchRequest struct {
 
 // StoreFetchResponse contains recovered or cached pieces from a Store node
 type StoreFetchResponse struct {
-	BlockID     string         `json:"block_id"`
-	Row         int            `json:"row"`
-	Col         int            `json:"col"`
-	Recovered   bool           `json:"recovered"`
-	Data        string         `json:"data,omitempty"`
-	PiecesCount int            `json:"pieces_count"`
-	Pieces      []CodedPiece   `json:"pieces"`
+	BlockID     string       `json:"block_id"`
+	Row         int          `json:"row"`
+	Col         int          `json:"col"`
+	Recovered   bool         `json:"recovered"`
+	Data        string       `json:"data,omitempty"`
+	PiecesCount int          `json:"pieces_count"`
+	Pieces      []CodedPiece `json:"pieces"`
 }
 
 // CellCoord identifies a cell by its row and column coordinates
@@ -267,12 +492,16 @@ type GossipAnchorPayload struct {
 
 // GossipStoreReadyPayload signals that an individual store node has completed storing its custody cells for a block
 type GossipStoreReadyPayload struct {
-	BlockID      string `json:"block_id"`
-	Height       int    `json:"height"`
-	NetColIdx    int    `json:"net_col_idx"`
-	ColIdx       int    `json:"col_idx"`
-	RowIdx       int    `json:"row_idx"`
-	StoresPerCol int    `json:"stores_per_col"`
+	BlockID          string `json:"block_id"`
+	Height           int    `json:"height"`
+	PeerID           string `json:"peer_id,omitempty"`
+	NetColIdx        int    `json:"net_col_idx"`
+	ColIdx           int    `json:"col_idx"`
+	RowIdx           int    `json:"row_idx"`
+	StoresPerCol     int    `json:"stores_per_col"`
+	NetRows          int    `json:"net_rows,omitempty"`
+	CustodyNetRows   []int  `json:"custody_net_rows,omitempty"`
+	ActivePeersInCol int    `json:"active_peers_in_col,omitempty"`
 }
 
 // GossipBlockReadyPayload signals that all active columns are ready and light nodes can start DAS

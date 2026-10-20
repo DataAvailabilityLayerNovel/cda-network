@@ -29,8 +29,10 @@ import (
 )
 
 type cachedRoutingInfo struct {
-	stores    []p2pcommon.PeerInfo
-	timestamp time.Time
+	stores        []p2pcommon.PeerInfo
+	rowCustodyMap map[int][]p2pcommon.PeerInfo
+	netRows       int
+	timestamp     time.Time
 }
 
 type APIService struct {
@@ -569,8 +571,10 @@ func (s *APIService) getRoutingInfo(netColIdx int, colsPerNetCol int, row int, c
 										if len(discoveredStores) > 0 {
 											s.routingCacheMu.Lock()
 											s.routingCache[netColIdx] = cachedRoutingInfo{
-												stores:    discoveredStores,
-												timestamp: time.Now(),
+												stores:        discoveredStores,
+												rowCustodyMap: resp.RowCustodyMap,
+												netRows:       resp.NetRows,
+												timestamp:     time.Now(),
 											}
 											s.routingCacheMu.Unlock()
 											stream.Close()
@@ -599,6 +603,8 @@ func (s *APIService) getRoutingInfo(netColIdx int, colsPerNetCol int, row int, c
 	defer cancel()
 
 	var activeStores []p2pcommon.PeerInfo
+	var rowCustodyMap map[int][]p2pcommon.PeerInfo
+	var netRows int
 	var lastErr error
 
 	colIdx := netColIdx * colsPerNetCol
@@ -686,6 +692,9 @@ func (s *APIService) getRoutingInfo(netColIdx int, colsPerNetCol int, row int, c
 		stream.Close()
 		streamCancel()
 
+		rowCustodyMap = routingResp.RowCustodyMap
+		netRows = routingResp.NetRows
+
 		for _, p := range routingResp.ColPeers {
 			storeNetCol := 0
 			if colsPerNetCol > 0 {
@@ -713,8 +722,10 @@ func (s *APIService) getRoutingInfo(netColIdx int, colsPerNetCol int, row int, c
 
 	s.routingCacheMu.Lock()
 	s.routingCache[netColIdx] = cachedRoutingInfo{
-		stores:    activeStores,
-		timestamp: time.Now(),
+		stores:        activeStores,
+		rowCustodyMap: rowCustodyMap,
+		netRows:       netRows,
+		timestamp:     time.Now(),
 	}
 	s.routingCacheMu.Unlock()
 
@@ -742,6 +753,10 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("routing query failed on all bootstraps: %v", err)}
 	}
 
+	s.routingCacheMu.RLock()
+	cachedInfo := s.routingCache[netColIdx]
+	s.routingCacheMu.RUnlock()
+
 	var recvPieces []cda.ReceivedPiece
 	var queryErrors []string
 	var querySuccess bool
@@ -760,13 +775,40 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 
 	maxAttempts := 5
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		// Re-shuffle active stores on each attempt
-		shuffledStores := append([]p2pcommon.PeerInfo(nil), activeStores...)
-		for i := range shuffledStores {
-			j := rand.Intn(i + 1)
-			shuffledStores[i], shuffledStores[j] = shuffledStores[j], shuffledStores[i]
+		// Prioritize custody stores for (row % netRows) first, then remaining column stores
+		var prioritizedStores []p2pcommon.PeerInfo
+		seenPID := make(map[string]bool)
+		netRows := cachedInfo.netRows
+		if netRows <= 0 {
+			netRows = 8
+		}
+		if cachedInfo.rowCustodyMap != nil {
+			custodyStores := append([]p2pcommon.PeerInfo(nil), cachedInfo.rowCustodyMap[row%netRows]...)
+			for i := range custodyStores {
+				j := rand.Intn(i + 1)
+				custodyStores[i], custodyStores[j] = custodyStores[j], custodyStores[i]
+			}
+			for _, p := range custodyStores {
+				if !seenPID[p.PeerID] {
+					seenPID[p.PeerID] = true
+					prioritizedStores = append(prioritizedStores, p)
+				}
+			}
 		}
 
+		remainingStores := append([]p2pcommon.PeerInfo(nil), activeStores...)
+		for i := range remainingStores {
+			j := rand.Intn(i + 1)
+			remainingStores[i], remainingStores[j] = remainingStores[j], remainingStores[i]
+		}
+		for _, p := range remainingStores {
+			if !seenPID[p.PeerID] {
+				seenPID[p.PeerID] = true
+				prioritizedStores = append(prioritizedStores, p)
+			}
+		}
+
+		shuffledStores := prioritizedStores
 		maxTries := len(shuffledStores)
 		for idx := 0; idx < maxTries; idx++ {
 			selectedStore := shuffledStores[idx]

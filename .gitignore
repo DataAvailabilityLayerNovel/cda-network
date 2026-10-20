@@ -29,3 +29,5 @@ data/
 publisher_config_docker.json
 
 .agents
+
+.scratch

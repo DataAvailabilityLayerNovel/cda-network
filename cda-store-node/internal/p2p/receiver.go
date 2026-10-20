@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -70,10 +71,14 @@ type Receiver struct {
 	broadcaster   *Broadcaster
 	crashOnFail   bool
 
-	// Peer lists for Row and Column subnets
-	peersMu   sync.RWMutex
-	rowPeers  []p2pcommon.PeerInfo
-	colPeers  []p2pcommon.PeerInfo
+	// Peer lists and Network Matrix Custody Map for Row and Column subnets
+	peersMu           sync.RWMutex
+	rowPeers          []p2pcommon.PeerInfo
+	colPeers          []p2pcommon.PeerInfo
+	rowCustodyMap     map[int][]p2pcommon.PeerInfo
+	activePeersInCol  int
+	bootstrapHTTPAddr string
+	initialSyncOnce   sync.Once
 
 	// Per-cell peer contribution tracking: cellKey -> senderPeerID -> count
 	// Used to enforce "pull from ≥2 different custody nodes" before recoding
@@ -108,8 +113,7 @@ type Receiver struct {
 	nonCustodyLockedMu sync.Mutex
 	nonCustodyLocked   map[string]bool
 
-	// Track globally subscribed non-custody topics to prevent duplicate subscriptions across SetPeers calls
-	// Track globally subscribed non-custody topics to prevent duplicate subscriptions across SetPeers calls
+	// Track globally subscribed topics to prevent duplicate subscriptions
 	subscribedTopicsMu sync.Mutex
 	subscribedTopics   map[string]bool
 
@@ -140,7 +144,7 @@ type Receiver struct {
 	// Bounded concurrency semaphore for custody cell dissemination
 	disseminationSem chan struct{}
 
-	// Context for subscribeToNonCustodyCells goroutines lifetime
+	// Context for GossipSub subscription goroutines lifetime
 	ctx context.Context
 }
 
@@ -196,35 +200,35 @@ func NewReceiver(
 		chans[i] = make(chan func(), 2000)
 	}
 
-	return &Receiver{
-		host:              h,
-		ps:                ps,
-		kzg:               kzg,
-		rm:                cda.NewRecipientManager(kPiece, kzg),
-		publisherAddr:     pubAddr,
-		selfPeerID:        selfPeerID,
-		kBlock:            kBlock,
-		kPiece:            kPiece,
-		numCols:           numCols,
-		storesPerCol:      storesPerCol,
-		rowIdx:            rowIdx,
-		colIdx:            colIdx,
-		cache:             cache,
-		broadcaster:       broadcaster,
-		crashOnFail:       crashOnFail,
-		rateLimiters:      make(map[peer.ID]*tokenBucket),
-		totalStoredPieces: int64(cache.GetTotalPieceCount()),
-		pruneEnable:       pruneEnable,
-		pruneTTL:          pruneTTL,
-		cellLastActivity:  make(map[string]time.Time),
-		prunedCells:       make(map[string]bool),
-		completedBlocks:    make(map[string]bool),
-		cellBroadcastCount: make(map[string]int),
-		nonCustodyLocked:   make(map[string]bool),
-		subscribedTopics:   make(map[string]bool),
-		peerContributions: make(map[string]map[string]int),
-		workerChans:       chans,
-		numWorkers:        nWorkers,
+	rcv := &Receiver{
+		host:                h,
+		ps:                  ps,
+		kzg:                 kzg,
+		rm:                  cda.NewRecipientManager(kPiece, kzg),
+		publisherAddr:       pubAddr,
+		selfPeerID:          selfPeerID,
+		kBlock:              kBlock,
+		kPiece:              kPiece,
+		numCols:             numCols,
+		storesPerCol:        storesPerCol,
+		rowIdx:              rowIdx,
+		colIdx:              colIdx,
+		cache:               cache,
+		broadcaster:         broadcaster,
+		crashOnFail:         crashOnFail,
+		rateLimiters:        make(map[peer.ID]*tokenBucket),
+		totalStoredPieces:   int64(cache.GetTotalPieceCount()),
+		pruneEnable:         pruneEnable,
+		pruneTTL:            pruneTTL,
+		cellLastActivity:    make(map[string]time.Time),
+		prunedCells:         make(map[string]bool),
+		completedBlocks:     make(map[string]bool),
+		cellBroadcastCount:  make(map[string]int),
+		nonCustodyLocked:    make(map[string]bool),
+		subscribedTopics:    make(map[string]bool),
+		peerContributions:   make(map[string]map[string]int),
+		workerChans:         chans,
+		numWorkers:          nWorkers,
 		pendingPulls:        make(map[string]bool),
 		activeFallbacks:     make(map[string]bool),
 		gossipQueue:         make(chan p2pcommon.SeedCellRequest, getEnvInt("STORE_GOSSIP_QUEUE_CAP", 16384)),
@@ -234,13 +238,62 @@ func NewReceiver(
 		disseminationSem:    make(chan struct{}, getEnvInt("STORE_DISSEMINATION_SEM", 16)),
 		blockN:              make(map[string]int),
 	}
+	if broadcaster != nil {
+		broadcaster.SetNetworkMatrix(rcv.getNetColIdx(), storesPerCol)
+	}
+	return rcv
+}
+
+func (rcv *Receiver) SetBootstrapHTTPAddr(addr string) {
+	rcv.peersMu.Lock()
+	rcv.bootstrapHTTPAddr = addr
+	rcv.peersMu.Unlock()
 }
 
 func (rcv *Receiver) SetPeers(rowPeers, colPeers []p2pcommon.PeerInfo) {
+	rcv.SetRoutingState(rowPeers, colPeers, nil, rcv.storesPerCol, 0)
+}
+
+func (rcv *Receiver) SetRoutingState(rowPeers, colPeers []p2pcommon.PeerInfo, custodyMap map[int][]p2pcommon.PeerInfo, netRows int, activePeersInCol int) {
 	rcv.peersMu.Lock()
 	rcv.rowPeers = rowPeers
 	rcv.colPeers = colPeers
+	if netRows > 0 {
+		rcv.storesPerCol = netRows
+	}
+	effectiveNetRows := rcv.storesPerCol
+	if effectiveNetRows <= 0 {
+		effectiveNetRows = 8
+	}
+
+	if len(custodyMap) > 0 {
+		rcv.rowCustodyMap = custodyMap
+	} else {
+		// Deterministic fallback: compute custody map from colPeers + self
+		allColStores := append([]p2pcommon.PeerInfo(nil), colPeers...)
+		allColStores = append(allColStores, p2pcommon.PeerInfo{
+			PeerID: rcv.selfPeerID,
+			Row:    rcv.rowIdx,
+			Col:    rcv.colIdx,
+		})
+		rcv.rowCustodyMap = p2pcommon.ComputeColumnCustodyMap(allColStores, effectiveNetRows)
+	}
+	if activePeersInCol > 0 {
+		rcv.activePeersInCol = activePeersInCol
+	} else {
+		allColStores := append([]p2pcommon.PeerInfo(nil), colPeers...)
+		allColStores = append(allColStores, p2pcommon.PeerInfo{
+			PeerID: rcv.selfPeerID,
+			Row:    rcv.rowIdx,
+			Col:    rcv.colIdx,
+		})
+		rcv.activePeersInCol = len(p2pcommon.GetActiveColumnStores(allColStores))
+	}
 	rcv.peersMu.Unlock()
+
+	if rcv.broadcaster != nil {
+		rcv.broadcaster.SetNetworkMatrix(rcv.getNetColIdx(), effectiveNetRows)
+	}
 
 	// Update broadcaster with column peers
 	var pIDs []peer.ID
@@ -249,12 +302,103 @@ func (rcv *Receiver) SetPeers(rowPeers, colPeers []p2pcommon.PeerInfo) {
 			pIDs = append(pIDs, pid)
 		}
 	}
-	rcv.broadcaster.UpdatePeers(pIDs)
-
-	// Subscribe to non-custody cells via custody node per-node topics (if context is ready)
-	if rcv.ctx != nil {
-		go rcv.subscribeToNonCustodyCells(rcv.ctx, colPeers)
+	if rcv.broadcaster != nil {
+		rcv.broadcaster.UpdatePeers(pIDs)
 	}
+
+	// Ensure subscriptions to all row channels in this column and legacy peer topics
+	if rcv.ctx != nil {
+		go rcv.subscribeToRowChannels(rcv.ctx)
+		go rcv.subscribeToNonCustodyCells(rcv.ctx, colPeers)
+		rcv.initialSyncOnce.Do(func() {
+			go rcv.catchUpRecentBlocksOnJoin(rcv.ctx)
+		})
+	}
+}
+
+// evalCustody evaluates whether this Store Node is an assigned Custody Node for data row,
+// whether it retains full rank kPiece pieces (native retention) vs pruning down to 1 (cross-row backup),
+// and the total number M of custody nodes assigned to data row's cell.
+func (rcv *Receiver) evalCustody(row int) (isCustody bool, isNativeRetention bool, numCustodyPeers int) {
+	rcv.peersMu.RLock()
+	cmap := rcv.rowCustodyMap
+	netRows := rcv.storesPerCol
+	activeInCol := rcv.activePeersInCol
+	if activeInCol <= 0 {
+		activeInCol = len(rcv.colPeers)
+	}
+	rcv.peersMu.RUnlock()
+	if netRows <= 0 {
+		netRows = 8
+	}
+	isCustody, isNativeRetention, numCustodyPeers = p2pcommon.EvaluateNodeCustodyForRow(rcv.selfPeerID, rcv.rowIdx, row, netRows, cmap)
+	if isCustody && activeInCol > 0 && activeInCol <= rcv.kPiece {
+		isNativeRetention = true
+	}
+	return isCustody, isNativeRetention, numCustodyPeers
+}
+
+func (rcv *Receiver) getCustodyNetRows() []int {
+	rcv.peersMu.RLock()
+	cmap := rcv.rowCustodyMap
+	netRows := rcv.storesPerCol
+	rcv.peersMu.RUnlock()
+	if netRows <= 0 {
+		netRows = 8
+	}
+	return p2pcommon.GetNodeCustodyNetRows(rcv.selfPeerID, rcv.rowIdx, netRows, cmap)
+}
+
+func (rcv *Receiver) getActivePeersInCol() int {
+	rcv.peersMu.RLock()
+	count := rcv.activePeersInCol
+	netRows := rcv.storesPerCol
+	rcv.peersMu.RUnlock()
+	if count > 0 {
+		return count
+	}
+	if netRows > 0 {
+		return netRows
+	}
+	return 8
+}
+
+func (rcv *Receiver) getCustodyPeersForRow(row int) []p2pcommon.PeerInfo {
+	rcv.peersMu.RLock()
+	cmap := rcv.rowCustodyMap
+	netRows := rcv.storesPerCol
+	colPeers := append([]p2pcommon.PeerInfo(nil), rcv.colPeers...)
+	rcv.peersMu.RUnlock()
+	if netRows <= 0 {
+		netRows = 8
+	}
+	targetNetRow := row % netRows
+	if targetNetRow < 0 {
+		targetNetRow += netRows
+	}
+	if len(cmap) > 0 {
+		if peers := cmap[targetNetRow]; len(peers) > 0 {
+			var res []p2pcommon.PeerInfo
+			for _, p := range peers {
+				if p.PeerID != rcv.selfPeerID {
+					res = append(res, p)
+				}
+			}
+			return res
+		}
+	}
+	var fallback []p2pcommon.PeerInfo
+	backupRow := (targetNetRow + 1) % netRows
+	for _, p := range colPeers {
+		if p.PeerID == rcv.selfPeerID || p.Row < 0 {
+			continue
+		}
+		pRow := p.Row % netRows
+		if pRow == targetNetRow || pRow == backupRow {
+			fallback = append(fallback, p)
+		}
+	}
+	return fallback
 }
 
 func (rcv *Receiver) getNetColIdx() int {
@@ -277,8 +421,78 @@ func (rcv *Receiver) getNetColIdx() int {
 	return netCol
 }
 
+func (rcv *Receiver) subscribeToTopicOnce(ctx context.Context, topicName string, logLabel string) {
+	rcv.subscribedTopicsMu.Lock()
+	if rcv.subscribedTopics == nil {
+		rcv.subscribedTopics = make(map[string]bool)
+	}
+	if rcv.subscribedTopics[topicName] {
+		rcv.subscribedTopicsMu.Unlock()
+		return
+	}
+	rcv.subscribedTopics[topicName] = true
+	rcv.subscribedTopicsMu.Unlock()
+
+	topic, err := rcv.broadcaster.JoinTopic(topicName)
+	if err != nil {
+		log.Printf("[StoreNode] Failed to join topic %s: %v", topicName, err)
+		return
+	}
+	sub, err := topic.Subscribe()
+	if err != nil {
+		log.Printf("[StoreNode] Failed to subscribe to topic %s: %v", topicName, err)
+		return
+	}
+	log.Printf("[StoreNode] Subscribed to %s topic %s", logLabel, topicName)
+
+	go func(sub *pubsub.Subscription) {
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return
+			}
+			if msg.ReceivedFrom == rcv.host.ID() {
+				continue // skip self
+			}
+			data := msg.Data
+			if len(data) > 0 && data[0] == p2pcommon.BinaryGossipMagic {
+				bgp, err := p2pcommon.DecodeBinaryGossipPiece(data)
+				if err == nil && bgp.BlockID != "" {
+					if !rcv.shouldDropGossipPiece(bgp.BlockID, int(bgp.Row), int(bgp.Col)) {
+						rcv.enqueueBinaryGossipPiece(bgp)
+					}
+				}
+				continue
+			}
+			var payload p2pcommon.SeedCellRequest
+			if err := json.Unmarshal(data, &payload); err == nil && payload.BlockID != "" {
+				if !rcv.shouldDropGossipPiece(payload.BlockID, payload.Row, payload.Col) {
+					rcv.enqueueGossipPiece(payload)
+				}
+			}
+		}
+	}(sub)
+}
+
+// subscribeToRowChannels subscribes to all NetRows cell row channels in this column:
+// /cda/1.0.0/col/<netColIdx>/row/<0..netRows-1>.
+// Both intra-cell sibling custody nodes and non-custody column nodes exchange recoded pieces over these channels.
+func (rcv *Receiver) subscribeToRowChannels(ctx context.Context) {
+	rcv.peersMu.RLock()
+	netRows := rcv.storesPerCol
+	rcv.peersMu.RUnlock()
+	if netRows <= 0 {
+		netRows = 8
+	}
+	netColIdx := rcv.getNetColIdx()
+	for r := 0; r < netRows; r++ {
+		rowTopic := p2pcommon.TopicCellRow(netColIdx, r)
+		rcv.subscribeToTopicOnce(ctx, rowTopic, fmt.Sprintf("network matrix row channel (col=%d, row=%d)", netColIdx, r))
+	}
+}
+
 func (rcv *Receiver) Start(ctx context.Context) {
-	// Store context for use in SetPeers (which may be called after Start)
+	// Store context for use in SetPeers / SetRoutingState
 	rcv.ctx = ctx
 
 	// Start sharded worker pool (1 goroutine per workerChan)
@@ -322,9 +536,7 @@ func (rcv *Receiver) Start(ctx context.Context) {
 		go rcv.startPruner(ctx)
 	}
 
-	// 1. Register per-node stream handler (replaces shared ProtoBootstrapSeed).
-	//    Each store node listens on its own dedicated protocol so bootstrap can
-	//    dial the right node without contention on a shared protocol name.
+	// 1. Register per-node stream handlers
 	nodeProto := p2pcommon.ProtoNodeSeed(rcv.selfPeerID)
 	rcv.host.SetStreamHandler(protocol.ID(nodeProto), rcv.handleSeedStream)
 	log.Printf("[StoreNode] Registered per-node seed handler on protocol %s", nodeProto)
@@ -346,44 +558,11 @@ func (rcv *Receiver) Start(ctx context.Context) {
 	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreGetPieces, rcv.handleFetchStream)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoStoreBatchFetch, rcv.handleBatchFetchStream)
 
-	// 2. Subscribe to this node's own dedicated GossipSub topic.
-	//    Bootstrap / other custody nodes will publish to this topic when they want to
-	//    send anchor payloads or recoded pieces intended for our custody cells.
-	self := p2pcommon.TopicNode(rcv.selfPeerID)
-	selfTopic, err := rcv.broadcaster.JoinTopic(self)
-	if err != nil {
-		log.Fatalf("[StoreNode] Failed to join own node topic %s: %v", self, err)
-	}
-	selfSub, err := selfTopic.Subscribe()
-	if err != nil {
-		log.Fatalf("[StoreNode] Failed to subscribe to own node topic %s: %v", self, err)
-	}
-	log.Printf("[StoreNode] Subscribed to own node topic %s", self)
-	go func(sub *pubsub.Subscription) {
-		for {
-			msg, err := sub.Next(ctx)
-			if err != nil {
-				return
-			}
-			if msg.ReceivedFrom == rcv.host.ID() {
-				continue // skip self
-			}
-			data := msg.Data
-			if len(data) > 0 && data[0] == p2pcommon.BinaryGossipMagic {
-				bgp, err := p2pcommon.DecodeBinaryGossipPiece(data)
-				if err == nil && bgp.BlockID != "" {
-					rcv.enqueueBinaryGossipPiece(bgp)
-				}
-				continue
-			}
-			var payload p2pcommon.SeedCellRequest
-			if err := json.Unmarshal(data, &payload); err == nil && payload.BlockID != "" {
-				rcv.enqueueGossipPiece(payload)
-			}
-		}
-	}(selfSub)
+	// 2. Subscribe to all row-based Network Matrix channels in this column AND own node topic
+	rcv.subscribeToRowChannels(ctx)
+	rcv.subscribeToTopicOnce(ctx, p2pcommon.TopicNode(rcv.selfPeerID), "own node")
 
-	// 3. Subscribe to column anchor topics (kept as-is — per-column, not per-node)
+	// 3. Subscribe to column anchor topics
 	n := 2 * rcv.kBlock
 	numCols := rcv.numCols
 	if numCols <= 0 {
@@ -407,7 +586,7 @@ func (rcv *Receiver) Start(ctx context.Context) {
 		if err != nil {
 			log.Fatalf("Failed to subscribe to column anchor GossipSub topic %s: %v", colTopicName, err)
 		}
-		go func(sub *pubsub.Subscription) {
+		go func(sub *pubsub.Subscription, colIndex int) {
 			for {
 				msg, err := sub.Next(ctx)
 				if err != nil {
@@ -420,13 +599,16 @@ func (rcv *Receiver) Start(ctx context.Context) {
 				var raw map[string]interface{}
 				if err := json.Unmarshal(data, &raw); err == nil {
 					bID, _ := raw["block_id"].(string)
-					cIdx := c
-					colKey := fmt.Sprintf("%s_col_%d", bID, cIdx)
+					colKey := fmt.Sprintf("%s_col_%d", bID, colIndex)
 					rcv.dispatchTask(colKey, func() { rcv.processAnchorMessage(data) })
 				}
 			}
-		}(sub)
+		}(sub, c)
 	}
+
+	rcv.initialSyncOnce.Do(func() {
+		go rcv.catchUpRecentBlocksOnJoin(ctx)
+	})
 }
 
 // workerLoop drains workerChan sequentially — one task at a time for sharded cells.
@@ -447,11 +629,11 @@ func (rcv *Receiver) workerLoop(ctx context.Context, ch chan func()) {
 // shouldDropGossipPiece checks if an incoming piece is for a block that is already complete,
 // or for a cell that is already pruned or non-custody locked.
 func (rcv *Receiver) shouldDropGossipPiece(blockID string, row, col int) bool {
-	isPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
+	isCustody, isNativeRetention, _ := rcv.evalCustody(row)
 	rcv.completedMu.Lock()
 	if rcv.completedBlocks != nil && rcv.completedBlocks[blockID] {
 		rcv.completedMu.Unlock()
-		if !isPrimary || rcv.cache.GetPieceCount(blockID, row, col) >= rcv.kPiece {
+		if !isNativeRetention || rcv.cache.GetPieceCount(blockID, row, col) >= rcv.kPiece {
 			return true
 		}
 	} else {
@@ -467,15 +649,15 @@ func (rcv *Receiver) shouldDropGossipPiece(blockID string, row, col int) bool {
 		return true
 	}
 
-	isPrimaryEarly := (row % rcv.storesPerCol) == rcv.rowIdx
-	isBackupEarly := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
-	if !isPrimaryEarly && !isBackupEarly {
+	if !isCustody {
 		rcv.nonCustodyLockedMu.Lock()
 		locked := rcv.nonCustodyLocked[cellKey]
 		rcv.nonCustodyLockedMu.Unlock()
 		if locked {
 			return true
 		}
+	} else if isNativeRetention && rcv.cache.GetPieceCount(blockID, row, col) >= rcv.kPiece {
+		return true
 	}
 	return false
 }
@@ -957,18 +1139,17 @@ func (rcv *Receiver) verifyAndProcessBinaryBatch(payload *p2pcommon.BinaryBatchS
 		col := int(s.Col)
 		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
 
-		isPrimaryEarly := (row % rcv.storesPerCol) == rcv.rowIdx
-		isBackupEarly := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+		isCustodyEarly, isNativeEarly, _ := rcv.evalCustody(row)
 
 		rcv.completedMu.Lock()
 		isBlockCompleted := rcv.completedBlocks != nil && rcv.completedBlocks[blockID]
 		rcv.completedMu.Unlock()
 		if isBlockCompleted {
-			if !isPrimaryEarly || rcv.cache.GetPieceCount(blockID, row, col) >= rcv.kPiece {
+			if !isNativeEarly || rcv.cache.GetPieceCount(blockID, row, col) >= rcv.kPiece {
 				continue
 			}
 		}
-		if !isPrimaryEarly && !isBackupEarly {
+		if !isCustodyEarly {
 			rcv.nonCustodyLockedMu.Lock()
 			locked := rcv.nonCustodyLocked[cellKey]
 			rcv.nonCustodyLockedMu.Unlock()
@@ -1050,18 +1231,17 @@ func (rcv *Receiver) verifyAndProcessBatch(seeds []p2pcommon.SeedCellRequest) {
 
 	for _, s := range seeds {
 		cellKey := fmt.Sprintf("%s_%d_%d", s.BlockID, s.Row, s.Col)
-		isPrimaryEarly := (s.Row % rcv.storesPerCol) == rcv.rowIdx
-		isBackupEarly := ((s.Row + 1) % rcv.storesPerCol) == rcv.rowIdx
+		isCustodyEarly, isNativeEarly, _ := rcv.evalCustody(s.Row)
 
 		rcv.completedMu.Lock()
 		isBlockCompleted := rcv.completedBlocks != nil && rcv.completedBlocks[s.BlockID]
 		rcv.completedMu.Unlock()
 		if isBlockCompleted {
-			if !isPrimaryEarly || rcv.cache.GetPieceCount(s.BlockID, s.Row, s.Col) >= rcv.kPiece {
+			if !isNativeEarly || rcv.cache.GetPieceCount(s.BlockID, s.Row, s.Col) >= rcv.kPiece {
 				continue
 			}
 		}
-		if !isPrimaryEarly && !isBackupEarly {
+		if !isCustodyEarly {
 			rcv.nonCustodyLockedMu.Lock()
 			locked := rcv.nonCustodyLocked[cellKey]
 			rcv.nonCustodyLockedMu.Unlock()
@@ -1168,19 +1348,18 @@ func (rcv *Receiver) verifyAndProcessBatch(seeds []p2pcommon.SeedCellRequest) {
 func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsStr, proofStr string, pieceCommitsStr []string, senderPeerID string, isGossip bool) error {
 	cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
 
-	isPrimaryEarly := (row % rcv.storesPerCol) == rcv.rowIdx
-	isBackupEarly := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+	isCustodyEarly, isNativeEarly, _ := rcv.evalCustody(row)
 
 	// Early exit 1: drop incoming pieces if this block is already completed and locked
 	rcv.completedMu.Lock()
 	isBlockCompleted := rcv.completedBlocks != nil && rcv.completedBlocks[blockID]
 	rcv.completedMu.Unlock()
 	if isBlockCompleted {
-		if !isPrimaryEarly || rcv.cache.GetPieceCount(blockID, row, col) >= rcv.kPiece {
+		if !isNativeEarly || rcv.cache.GetPieceCount(blockID, row, col) >= rcv.kPiece {
 			return nil
 		}
 	}
-	if !isPrimaryEarly && !isBackupEarly {
+	if !isCustodyEarly {
 		rcv.nonCustodyLockedMu.Lock()
 		locked := rcv.nonCustodyLocked[cellKey]
 		rcv.nonCustodyLockedMu.Unlock()
@@ -1280,9 +1459,7 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 
 	rcv.cellMu.Lock()
 
-	isPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
-	isBackup := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
-	isCustody := isPrimary || isBackup
+	isCustody, isNativeRetention, numCustodyPeers := rcv.evalCustody(row)
 
 	// Non-custody nodes: gather pieces from multiple sources, recode into 1 piece, and lock.
 	if !isCustody {
@@ -1378,6 +1555,11 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 
 	// 4. Rank Filtering (Gaussian Elimination) for Custody cells
 	existingPieces := rcv.cache.GetPieces(blockID, row, col)
+	if isNativeRetention && len(existingPieces) >= rcv.kPiece {
+		// Already at full rank for native custody cell
+		rcv.cellMu.Unlock()
+		return nil
+	}
 	existingCoeffs := make([][]byte, len(existingPieces))
 	for i, p := range existingPieces {
 		existingCoeffs[i] = p.Data.Coeffs
@@ -1408,7 +1590,7 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 		rcv.pruneMu.Unlock()
 	}
 
-	// 5b. Track peer contributions for this cell (used by non-custody recode decision)
+	// 5b. Track peer contributions for this cell
 	if senderPeerID != "" {
 		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
 		rcv.contribMu.Lock()
@@ -1421,23 +1603,42 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 
 	rcv.CheckAndLogCompletion(blockID)
 
-	// 6. P2P Recoding & GossipSub forwarding
+	// 6. P2P Recoding & Row-channel GossipSub forwarding
 	updatedPieces := rcv.cache.GetPieces(blockID, row, col)
 	rcv.cellMu.Unlock()
 
 	if isCustody {
-		// Custody nodes (primary + backup): recode only when rank >= kPiece (full rank).
-		// Broadcast kPiece/2 independently recoded pieces to give subscribers enough diversity.
-		if len(updatedPieces) >= rcv.kPiece {
-			go func(bID string, r, c int, pieces []cda.ReceivedPiece, primary bool) {
+		_, seedsPerPeer, broadcastQuota := p2pcommon.ComputeSeedingPlan(numCustodyPeers, rcv.kPiece)
+		minRecodePieces := seedsPerPeer
+		if minRecodePieces > rcv.kPiece {
+			minRecodePieces = rcv.kPiece
+		}
+		if minRecodePieces < 2 && rcv.kPiece >= 2 {
+			minRecodePieces = 2
+		}
+
+		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
+		rcv.broadcastMu.Lock()
+		alreadyBroadcast := rcv.cellBroadcastCount[cellKey]
+		rcv.broadcastMu.Unlock()
+
+		// Trigger recode & broadcast onto TopicCellRow when we reach either:
+		// (a) initial seed quota `minRecodePieces` (when M >= 3, allowing intra-cell peers to exchange pieces and reach full rank), or
+		// (b) full rank `kPiece` (if not yet broadcasted or if borrowed backup needs to prune after full rank).
+		shouldDisseminate := (len(updatedPieces) == minRecodePieces && alreadyBroadcast == 0) ||
+			(len(updatedPieces) >= rcv.kPiece && (alreadyBroadcast == 0 || !isNativeRetention))
+
+		if shouldDisseminate {
+			go func(bID string, r, c int, pieces []cda.ReceivedPiece, nativeRetention bool, quota int) {
 				rcv.disseminationSem <- struct{}{}
 				defer func() { <-rcv.disseminationSem }()
 
-				numBroadcast := getEnvInt("STORE_BROADCAST_ROUNDS", 2)
+				numBroadcast := getEnvInt("STORE_BROADCAST_ROUNDS", quota)
 				if numBroadcast < 1 {
 					numBroadcast = 1
 				}
-				log.Printf("[GossipSub] Cell [%d, %d] reached full rank %d/%d (Primary=%v). Broadcasting %d recoded pieces...", r, c, len(pieces), rcv.kPiece, primary, numBroadcast)
+				log.Printf("[GossipSub] Cell [%d, %d] rank %d/%d (NativeRetention=%v, M=%d). Broadcasting %d recoded pieces on row channel...",
+					r, c, len(pieces), rcv.kPiece, nativeRetention, numCustodyPeers, numBroadcast)
 
 				targetPieces := pieces
 				if len(targetPieces) > rcv.kPiece {
@@ -1451,7 +1652,7 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 						log.Printf("[GossipSub] Failed to recode pieces for cell [%d, %d] (round %d/%d): %v", r, c, i+1, numBroadcast, err)
 						continue
 					}
-					if !primary {
+					if !nativeRetention {
 						rcv.cellMu.Lock()
 						rcv.cache.StoreRecodedPiece(bID, r, c, *recodedPiece)
 						rcv.cellMu.Unlock()
@@ -1469,28 +1670,28 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 						log.Printf("[GossipSub] Failed to publish recoded piece for cell [%d, %d] (round %d/%d): %v", r, c, i+1, numBroadcast, err)
 					} else {
 						broadcastSucceeded++
-						log.Printf("[GossipSub] Successfully published recoded piece for cell [%d, %d] (Primary=%v, round %d/%d).", r, c, primary, i+1, numBroadcast)
-						cellKey := fmt.Sprintf("%s_%d_%d", bID, r, c)
+						log.Printf("[GossipSub] Successfully published recoded piece for cell [%d, %d] (NativeRetention=%v, round %d/%d).", r, c, nativeRetention, i+1, numBroadcast)
+						cKey := fmt.Sprintf("%s_%d_%d", bID, r, c)
 						rcv.broadcastMu.Lock()
-						rcv.cellBroadcastCount[cellKey]++
+						rcv.cellBroadcastCount[cKey]++
 						rcv.broadcastMu.Unlock()
 						rcv.CheckAndLogCompletion(bID)
 					}
 				}
 
-				if !primary {
-					// Backup custody node: prune raw pieces after dissemination attempt
+				if !nativeRetention && len(pieces) >= rcv.kPiece {
+					// Cross-row borrowed backup custody node: prune raw pieces after full-rank dissemination
 					rcv.cellMu.Lock()
 					rcv.cache.PruneRawPieces(bID, r, c, rcv.rm)
 					rcv.cellMu.Unlock()
-					cellKey := fmt.Sprintf("%s_%d_%d", bID, r, c)
+					cKey := fmt.Sprintf("%s_%d_%d", bID, r, c)
 					rcv.pruneMu.Lock()
-					rcv.prunedCells[cellKey] = true
+					rcv.prunedCells[cKey] = true
 					rcv.pruneMu.Unlock()
-					log.Printf("[StoreNode] Backup: cell [%d, %d] dissemination finished (%d/%d rounds); raw pieces pruned.", r, c, broadcastSucceeded, numBroadcast)
+					log.Printf("[StoreNode] Borrowed Backup: cell [%d, %d] dissemination finished (%d/%d rounds); raw pieces pruned.", r, c, broadcastSucceeded, numBroadcast)
 					rcv.CheckAndLogCompletion(bID)
 				}
-			}(blockID, row, col, updatedPieces, isPrimary)
+			}(blockID, row, col, updatedPieces, isNativeRetention, broadcastQuota)
 		}
 	}
 
@@ -1527,117 +1728,9 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 	return nil
 }
 
-// subscribeToNonCustodyCells subscribes to the per-node GossipSub topics of custody nodes
-// that manage cells this node does NOT have primary/backup custody of.
-// It picks >=2 custody nodes per needed cell (shuffled for randomness) and subscribes to
-// each custody node's TopicNode. ceil(kPiece/2) pieces from each source yields k_piece total.
-//
-// NOTE: This is called lazily from SetPeers after bootstrap routing delivers colPeers.
+// subscribeToNonCustodyCells ensures subscriptions to row channels and any legacy per-peer topics.
 func (rcv *Receiver) subscribeToNonCustodyCells(ctx context.Context, colPeers []p2pcommon.PeerInfo) {
-	if len(colPeers) == 0 {
-		return
-	}
-
-	// Sort colPeers by Row for deterministic primary/backup calculation
-	sortedPeers := make([]p2pcommon.PeerInfo, len(colPeers))
-	copy(sortedPeers, colPeers)
-	sort.Slice(sortedPeers, func(i, j int) bool {
-		return sortedPeers[i].Row < sortedPeers[j].Row
-	})
-
-	n := 2 * rcv.kBlock
-	// Track which topics we've already subscribed to (avoid duplicate subscriptions)
-	subscribed := make(map[string]bool)
-
-	for row := 0; row < n; row++ {
-		// Skip cells for which this node is primary or backup custody
-		isPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
-		isBackup := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
-		if isPrimary || isBackup {
-			continue
-		}
-
-		// Find primary and backup custody peers for this row
-		var custodyPeers []p2pcommon.PeerInfo
-		for _, p := range sortedPeers {
-			if p.Row == row%rcv.storesPerCol || p.Row == (row+1)%rcv.storesPerCol {
-				custodyPeers = append(custodyPeers, p)
-			}
-		}
-
-		// Shuffle custody peers for randomness (different non-custody nodes favour different sources)
-		for i := len(custodyPeers) - 1; i > 0; i-- {
-			j := mathRandIntn(i + 1)
-			custodyPeers[i], custodyPeers[j] = custodyPeers[j], custodyPeers[i]
-		}
-
-		// Subscribe to up to 2 custody node topics (skip self)
-		subscribed2 := 0
-		for _, custodyPeer := range custodyPeers {
-			if subscribed2 >= 2 {
-				break
-			}
-			if custodyPeer.PeerID == rcv.selfPeerID {
-				continue
-			}
-			topicName := p2pcommon.TopicNode(custodyPeer.PeerID)
-			if subscribed[topicName] {
-				subscribed2++
-				continue // already subscribed from a previous row's custody overlap
-			}
-
-			rcv.subscribedTopicsMu.Lock()
-			if rcv.subscribedTopics == nil {
-				rcv.subscribedTopics = make(map[string]bool)
-			}
-			if rcv.subscribedTopics[topicName] {
-				rcv.subscribedTopicsMu.Unlock()
-				subscribed[topicName] = true
-				subscribed2++
-				continue // already subscribed globally from a previous SetPeers invocation
-			}
-			rcv.subscribedTopics[topicName] = true
-			rcv.subscribedTopicsMu.Unlock()
-
-			topic, err := rcv.broadcaster.JoinTopic(topicName)
-			if err != nil {
-				log.Printf("[StoreNode] Failed to join non-custody topic %s: %v", topicName, err)
-				continue
-			}
-			sub, err := topic.Subscribe()
-			if err != nil {
-				log.Printf("[StoreNode] Failed to subscribe to non-custody topic %s: %v", topicName, err)
-				continue
-			}
-			subscribed[topicName] = true
-			subscribed2++
-			log.Printf("[StoreNode] Subscribed to custody node topic %s (for non-custody row %d)", topicName, row)
-
-			go func(sub *pubsub.Subscription) {
-				for {
-					msg, err := sub.Next(ctx)
-					if err != nil {
-						return
-					}
-					if msg.ReceivedFrom == rcv.host.ID() {
-						continue
-					}
-					data := msg.Data
-					if len(data) > 0 && data[0] == p2pcommon.BinaryGossipMagic {
-						bgp, err := p2pcommon.DecodeBinaryGossipPiece(data)
-						if err == nil && bgp.BlockID != "" {
-							rcv.enqueueBinaryGossipPiece(bgp)
-						}
-						continue
-					}
-					var payload p2pcommon.SeedCellRequest
-					if err := json.Unmarshal(data, &payload); err == nil && payload.BlockID != "" {
-						rcv.enqueueGossipPiece(payload)
-					}
-				}
-			}(sub)
-		}
-	}
+	rcv.subscribeToRowChannels(ctx)
 }
 
 func (rcv *Receiver) fallbackPullMissingCells(blockID string, attempt int) {
@@ -1661,10 +1754,6 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string, attempt int) {
 	if endCol > n {
 		endCol = n
 	}
-	storesPerCol := rcv.storesPerCol
-	if storesPerCol <= 0 {
-		storesPerCol = 8
-	}
 
 	rcv.peersMu.RLock()
 	peersCopy := make([]p2pcommon.PeerInfo, len(rcv.colPeers))
@@ -1675,44 +1764,36 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string, attempt int) {
 		return
 	}
 
-	peerByRow := make(map[int]p2pcommon.PeerInfo)
-	for _, p := range peersCopy {
-		peerByRow[p.Row] = p
-	}
-
 	peerRequests := make(map[string][]p2pcommon.CellCoord)
 	peerInfoMap := make(map[string]p2pcommon.PeerInfo)
 
 	for c := startCol; c < endCol; c++ {
 		for r := 0; r < n; r++ {
-			isPrimary := (r % storesPerCol) == rcv.rowIdx
-			isBackup := ((r + 1) % storesPerCol) == rcv.rowIdx
+			isCustody, isNativeRetention, _ := rcv.evalCustody(r)
 			cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
+			rowCustodyPeers := rcv.getCustodyPeersForRow(r)
 
-			primaryRow := r % storesPerCol
-			backupRow := (r + 1) % storesPerCol
-
-			if isPrimary {
+			if isCustody && isNativeRetention {
 				rcv.broadcastMu.Lock()
 				bCount := rcv.cellBroadcastCount[cellKey]
 				rcv.broadcastMu.Unlock()
 
 				pCount := rcv.cache.GetPieceCount(blockID, r, c)
 				if pCount < rcv.kPiece || bCount < 1 {
-					if bp, ok := peerByRow[backupRow]; ok && bp.PeerID != rcv.selfPeerID {
-						peerRequests[bp.PeerID] = append(peerRequests[bp.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
-						peerInfoMap[bp.PeerID] = bp
+					for _, cp := range rowCustodyPeers {
+						peerRequests[cp.PeerID] = append(peerRequests[cp.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
+						peerInfoMap[cp.PeerID] = cp
 					}
 					if attempt >= 2 {
 						for _, p := range peersCopy {
-							if p.PeerID != rcv.selfPeerID && p.Row != backupRow {
+							if p.PeerID != rcv.selfPeerID && p.Row >= 0 {
 								peerRequests[p.PeerID] = append(peerRequests[p.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
 								peerInfoMap[p.PeerID] = p
 							}
 						}
 					}
 				}
-			} else if isBackup {
+			} else if isCustody && !isNativeRetention {
 				rcv.broadcastMu.Lock()
 				bCount := rcv.cellBroadcastCount[cellKey]
 				rcv.broadcastMu.Unlock()
@@ -1723,13 +1804,13 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string, attempt int) {
 
 				pCount := rcv.cache.GetPieceCount(blockID, r, c)
 				if bCount < 1 && !pruned && pCount < rcv.kPiece {
-					if pp, ok := peerByRow[primaryRow]; ok && pp.PeerID != rcv.selfPeerID {
-						peerRequests[pp.PeerID] = append(peerRequests[pp.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
-						peerInfoMap[pp.PeerID] = pp
+					for _, cp := range rowCustodyPeers {
+						peerRequests[cp.PeerID] = append(peerRequests[cp.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
+						peerInfoMap[cp.PeerID] = cp
 					}
 					if attempt >= 2 {
 						for _, p := range peersCopy {
-							if p.PeerID != rcv.selfPeerID && p.Row != primaryRow {
+							if p.PeerID != rcv.selfPeerID && p.Row >= 0 {
 								peerRequests[p.PeerID] = append(peerRequests[p.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
 								peerInfoMap[p.PeerID] = p
 							}
@@ -1742,17 +1823,13 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string, attempt int) {
 				rcv.nonCustodyLockedMu.Unlock()
 
 				if !locked {
-					if pp, ok := peerByRow[primaryRow]; ok && pp.PeerID != rcv.selfPeerID {
-						peerRequests[pp.PeerID] = append(peerRequests[pp.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
-						peerInfoMap[pp.PeerID] = pp
-					}
-					if bp, ok := peerByRow[backupRow]; ok && bp.PeerID != rcv.selfPeerID {
-						peerRequests[bp.PeerID] = append(peerRequests[bp.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
-						peerInfoMap[bp.PeerID] = bp
+					for _, cp := range rowCustodyPeers {
+						peerRequests[cp.PeerID] = append(peerRequests[cp.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
+						peerInfoMap[cp.PeerID] = cp
 					}
 					if attempt >= 2 {
 						for _, p := range peersCopy {
-							if p.PeerID != rcv.selfPeerID && p.Row != primaryRow && p.Row != backupRow {
+							if p.PeerID != rcv.selfPeerID && p.Row >= 0 {
 								peerRequests[p.PeerID] = append(peerRequests[p.PeerID], p2pcommon.CellCoord{Row: r, Col: c})
 								peerInfoMap[p.PeerID] = p
 							}
@@ -1840,11 +1917,6 @@ func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, send
 		return
 	}
 
-	storesPerCol := rcv.storesPerCol
-	if storesPerCol <= 0 {
-		storesPerCol = 8
-	}
-
 	for key, pList := range cellsMap {
 		if len(pList) == 0 {
 			continue
@@ -1855,14 +1927,16 @@ func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, send
 			col = pList[0].Col
 		}
 
-		isPrimary := (row % storesPerCol) == rcv.rowIdx
-		isBackup := ((row + 1) % storesPerCol) == rcv.rowIdx
+		isCustody, isNativeRetention, numCustodyPeers := rcv.evalCustody(row)
 		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
 
-		if isPrimary {
+		if isCustody && isNativeRetention {
 			rcv.cellMu.Lock()
 			latestPieces := rcv.cache.GetPieces(blockID, row, col)
 			for _, pPayload := range pList {
+				if len(latestPieces) >= rcv.kPiece {
+					break
+				}
 				decData, err1 := hex.DecodeString(pPayload.Data)
 				decCoeffs, err2 := hex.DecodeString(pPayload.Coeffs)
 				decProof, err3 := hex.DecodeString(pPayload.Proof)
@@ -1897,7 +1971,7 @@ func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, send
 				bCount := rcv.cellBroadcastCount[cellKey]
 				rcv.broadcastMu.Unlock()
 				if bCount < 1 {
-					numBroadcast := rcv.kPiece / 2
+					_, _, numBroadcast := p2pcommon.ComputeSeedingPlan(numCustodyPeers, rcv.kPiece)
 					if numBroadcast < 1 {
 						numBroadcast = 1
 					}
@@ -1920,7 +1994,7 @@ func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, send
 					}
 				}
 			}
-		} else if isBackup {
+		} else if isCustody && !isNativeRetention {
 			rcv.broadcastMu.Lock()
 			bCount := rcv.cellBroadcastCount[cellKey]
 			rcv.broadcastMu.Unlock()
@@ -1966,7 +2040,7 @@ func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, send
 			rcv.cellMu.Unlock()
 
 			if fullRank {
-				numBroadcast := rcv.kPiece / 2
+				_, _, numBroadcast := p2pcommon.ComputeSeedingPlan(numCustodyPeers, rcv.kPiece)
 				if numBroadcast < 1 {
 					numBroadcast = 1
 				}
@@ -2186,21 +2260,16 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 		return
 	}
 
-	// Prioritize Primary Node, then Backup Node for this row
-	primaryRow := row % rcv.storesPerCol
-	backupRow := (row + 1) % rcv.storesPerCol
+	// Prioritize assigned Custody Nodes for this row
+	custodySet := make(map[string]bool)
+	for _, cp := range rcv.getCustodyPeersForRow(row) {
+		custodySet[cp.PeerID] = true
+	}
 	sort.SliceStable(peersCopy, func(i, j int) bool {
-		if peersCopy[i].Row == primaryRow {
-			return true
-		}
-		if peersCopy[j].Row == primaryRow {
-			return false
-		}
-		if peersCopy[i].Row == backupRow {
-			return true
-		}
-		if peersCopy[j].Row == backupRow {
-			return false
+		ci := custodySet[peersCopy[i].PeerID]
+		cj := custodySet[peersCopy[j].PeerID]
+		if ci != cj {
+			return ci
 		}
 		return peersCopy[i].Row < peersCopy[j].Row
 	})
@@ -2317,19 +2386,16 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 
 	if len(allPieces) >= rcv.kPiece {
 		pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
-		// Active pull: broadcast kPiece/2 independently recoded pieces for primary or backup custody nodes
-		isPullPrimary := (row % rcv.storesPerCol) == rcv.rowIdx
-		isPullBackup := ((row + 1) % rcv.storesPerCol) == rcv.rowIdx
+		isPullCustody, isPullNativeRetention, numCustodyPeers := rcv.evalCustody(row)
 
 		targetPieces := allPieces
 		if len(targetPieces) > rcv.kPiece {
 			targetPieces = targetPieces[:rcv.kPiece]
 		}
 
-		// Always recode+store once first (for local availability) if not primary custody
 		firstRecoded, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5)
 		if err == nil {
-			if !isPullPrimary {
+			if !isPullNativeRetention {
 				rcv.cellMu.Lock()
 				rcv.cache.StoreRecodedPiece(blockID, row, col, *firstRecoded)
 				rcv.cellMu.Unlock()
@@ -2337,8 +2403,8 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 			log.Printf("[StoreNode] Successfully recoded cell [%d, %d] in active pull.", row, col)
 			rcv.CheckAndLogCompletion(blockID)
 
-			if isPullPrimary || isPullBackup {
-				numBroadcast := rcv.kPiece / 2
+			if isPullCustody {
+				_, _, numBroadcast := p2pcommon.ComputeSeedingPlan(numCustodyPeers, rcv.kPiece)
 				if numBroadcast < 1 {
 					numBroadcast = 1
 				}
@@ -2350,10 +2416,10 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 						continue
 					}
 					if berr := rcv.broadcaster.BroadcastRecodedPiece(blockID, row, col, recodedPiece, pieceCommits); berr != nil {
-						log.Printf("[GossipSub] Active pull: broadcast round %d/%d failed for cell [%d, %d] (Primary=%v): %v", i+1, numBroadcast, row, col, isPullPrimary, berr)
+						log.Printf("[GossipSub] Active pull: broadcast round %d/%d failed for cell [%d, %d] (Native=%v): %v", i+1, numBroadcast, row, col, isPullNativeRetention, berr)
 					} else {
 						broadcastSucceeded++
-						log.Printf("[GossipSub] Active pull: broadcast round %d/%d succeeded for cell [%d, %d] (Primary=%v).", i+1, numBroadcast, row, col, isPullPrimary)
+						log.Printf("[GossipSub] Active pull: broadcast round %d/%d succeeded for cell [%d, %d] (Native=%v).", i+1, numBroadcast, row, col, isPullNativeRetention)
 						cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
 						rcv.broadcastMu.Lock()
 						rcv.cellBroadcastCount[cellKey]++
@@ -2362,8 +2428,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 					}
 				}
 
-				if !isPullPrimary {
-					// Backup: prune raw pieces after active-pull dissemination attempt
+				if !isPullNativeRetention {
 					rcv.cellMu.Lock()
 					rcv.cache.PruneRawPieces(blockID, row, col, rcv.rm)
 					rcv.cellMu.Unlock()
@@ -2371,10 +2436,9 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 					rcv.pruneMu.Lock()
 					rcv.prunedCells[cellKey] = true
 					rcv.pruneMu.Unlock()
-					log.Printf("[StoreNode] Backup: active pull cell [%d, %d] dissemination finished (%d/%d rounds); raw pieces pruned.", row, col, broadcastSucceeded, numBroadcast)
+					log.Printf("[StoreNode] Borrowed Backup: active pull cell [%d, %d] dissemination finished (%d/%d rounds); raw pieces pruned.", row, col, broadcastSucceeded, numBroadcast)
 				}
 			} else {
-				// Non-custody node: prune raw pieces, lock cell permanently, and satisfy IsComplete
 				rcv.cellMu.Lock()
 				rcv.cache.PruneRawPieces(blockID, row, col, rcv.rm)
 				rcv.cellMu.Unlock()
@@ -2403,35 +2467,13 @@ func (rcv *Receiver) pullNonCustodyPiece(blockID string, row, col int) {
 	}
 	rcv.nonCustodyLockedMu.Unlock()
 
-	rcv.peersMu.RLock()
-	peersCopy := make([]p2pcommon.PeerInfo, len(rcv.colPeers))
-	copy(peersCopy, rcv.colPeers)
-	rcv.peersMu.RUnlock()
-
-	if len(peersCopy) == 0 {
+	custodyPeers := rcv.getCustodyPeersForRow(row)
+	if len(custodyPeers) == 0 {
 		return
 	}
 
-	primaryRow := row % rcv.storesPerCol
-	backupRow := (row + 1) % rcv.storesPerCol
-	sort.SliceStable(peersCopy, func(i, j int) bool {
-		if peersCopy[i].Row == primaryRow {
-			return true
-		}
-		if peersCopy[j].Row == primaryRow {
-			return false
-		}
-		if peersCopy[i].Row == backupRow {
-			return true
-		}
-		return false
-	})
-
 	var pulledPieces []cda.ReceivedPiece
-	for _, pInfo := range peersCopy {
-		if pInfo.Row != primaryRow && pInfo.Row != backupRow {
-			continue
-		}
+	for _, pInfo := range custodyPeers {
 		pid, err := peer.Decode(pInfo.PeerID)
 		if err != nil || pid == rcv.host.ID() {
 			continue
@@ -2774,11 +2816,6 @@ func (rcv *Receiver) DiagnoseCompletion(blockID string) (bool, map[string]interf
 		endCol = n
 	}
 
-	storesPerCol := rcv.storesPerCol
-	if storesPerCol <= 0 {
-		storesPerCol = 8
-	}
-
 	minBroadcast := 1
 
 	rcv.broadcastMu.Lock()
@@ -2788,22 +2825,21 @@ func (rcv *Receiver) DiagnoseCompletion(blockID string) (bool, map[string]interf
 
 	for c := startCol; c < endCol; c++ {
 		for r := 0; r < n; r++ {
-			isPrimary := (r % storesPerCol) == rcv.rowIdx
-			isBackup := ((r + 1) % storesPerCol) == rcv.rowIdx
+			isCustody, isNativeRetention, _ := rcv.evalCustody(r)
 			cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
-			if isPrimary {
-				// Primary: must retain >= kPiece raw pieces for long-term storage
-				// AND must have disseminated >= 1 recoded piece to the network
+			if isCustody && isNativeRetention {
+				// Native custody node (including all M nodes in a multi-node cell):
+				// must retain >= kPiece raw pieces for long-term storage AND have disseminated >= 1 recoded piece
 				pCount := rcv.cache.GetPieceCount(blockID, r, c)
 				bCount := rcv.cellBroadcastCount[cellKey]
 				if pCount < rcv.kPiece {
-					unmetReasons = append(unmetReasons, fmt.Sprintf("primary [%d,%d]: pieces=%d < %d", r, c, pCount, rcv.kPiece))
+					unmetReasons = append(unmetReasons, fmt.Sprintf("custody [%d,%d]: pieces=%d < %d", r, c, pCount, rcv.kPiece))
 				}
 				if bCount < minBroadcast {
-					unmetReasons = append(unmetReasons, fmt.Sprintf("primary [%d,%d]: broadcast=%d < %d", r, c, bCount, minBroadcast))
+					unmetReasons = append(unmetReasons, fmt.Sprintf("custody [%d,%d]: broadcast=%d < %d", r, c, bCount, minBroadcast))
 				}
-			} else if isBackup {
-				// Backup: complete if dissemination finished (>= minBroadcast) OR if raw pieces pruned (<= 1 piece)
+			} else if isCustody && !isNativeRetention {
+				// Borrowed backup custody node: complete if dissemination finished (>= minBroadcast) OR if raw pieces pruned (<= 1 piece)
 				if rcv.cellBroadcastCount[cellKey] < minBroadcast {
 					rcv.pruneMu.Lock()
 					pruned := rcv.prunedCells[cellKey]
@@ -2815,7 +2851,6 @@ func (rcv *Receiver) DiagnoseCompletion(blockID string) (bool, map[string]interf
 				}
 			} else {
 				// Non-custody: must store exactly 1 piece and be locked!
-				cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
 				rcv.nonCustodyLockedMu.Lock()
 				locked := rcv.nonCustodyLocked[cellKey]
 				rcv.nonCustodyLockedMu.Unlock()
@@ -2930,16 +2965,19 @@ func (rcv *Receiver) doCheckAndLogCompletion(blockID string) {
 
 		// Broadcast StoreReady so the Publisher node can aggregate custody completion across all store nodes.
 		if rcv.broadcaster != nil {
-			go func(bID string, h int, col int, row int, stores int) {
+			custodyNetRows := rcv.getCustodyNetRows()
+			activePeers := rcv.getActivePeersInCol()
+			netColIdx := rcv.getNetColIdx()
+			go func(bID string, h int, netCol int, col int, row int, stores int, cRows []int, actPeers int) {
 				for attempt := 1; attempt <= 5; attempt++ {
-					_ = rcv.broadcaster.BroadcastStoreReady(bID, h, col, row, stores)
+					_ = rcv.broadcaster.BroadcastStoreReady(bID, h, netCol, col, row, stores, cRows, actPeers)
 					time.Sleep(200 * time.Millisecond)
 				}
-			}(blockID, height, rcv.colIdx, rcv.rowIdx, rcv.storesPerCol)
+			}(blockID, height, netColIdx, rcv.colIdx, rcv.rowIdx, rcv.storesPerCol, custodyNetRows, activePeers)
 		}
 
-		// Final Block Cleanup: Prune all raw pieces for Backup and Non-Custody cells,
-		// and delete any errant recoded pieces for Primary cells to guarantee strict steady-state piece counts.
+		// Final Block Cleanup: Prune all raw pieces for Borrowed Backup and Non-Custody cells,
+		// and delete any errant recoded pieces for Native Custody cells to guarantee strict steady-state piece counts.
 		go func(bID string) {
 			n := rcv.getBlockN(bID)
 			numCols := rcv.numCols
@@ -2956,15 +2994,11 @@ func (rcv *Receiver) doCheckAndLogCompletion(blockID string) {
 			if endCol > n {
 				endCol = n
 			}
-			storesPerCol := rcv.storesPerCol
-			if storesPerCol <= 0 {
-				storesPerCol = 8
-			}
 
 			for c := startCol; c < endCol; c++ {
 				for r := 0; r < n; r++ {
-					isPrimary := (r % storesPerCol) == rcv.rowIdx
-					if isPrimary {
+					_, isNativeRetention, _ := rcv.evalCustody(r)
+					if isNativeRetention {
 						rcv.cellMu.Lock()
 						rcv.cache.DeleteRecodedPieces(bID, r, c)
 						rcv.cellMu.Unlock()
@@ -2993,6 +3027,49 @@ func (rcv *Receiver) doCheckAndLogCompletion(blockID string) {
 	}
 }
 
+// catchUpRecentBlocksOnJoin queries Bootstrap /bootstrap/sync/recent on node startup/join
+// and pulls any recent blocks' missing pieces from column peers so newly joined Store Nodes
+// synchronize custody state for recent blocks.
+func (rcv *Receiver) catchUpRecentBlocksOnJoin(ctx context.Context) {
+	// Wait briefly for peer connections to settle
+	select {
+	case <-time.After(1500 * time.Millisecond):
+	case <-ctx.Done():
+		return
+	}
+
+	rcv.peersMu.RLock()
+	bootAddr := rcv.bootstrapHTTPAddr
+	rcv.peersMu.RUnlock()
+	if bootAddr == "" || !strings.HasPrefix(bootAddr, "http") {
+		return
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(strings.TrimSuffix(bootAddr, "/") + "/bootstrap/sync/recent?limit=3")
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	var recent struct {
+		BlockIDs []string `json:"block_ids"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&recent); err != nil || len(recent.BlockIDs) == 0 {
+		return
+	}
+
+	for _, bID := range recent.BlockIDs {
+		if rcv.IsComplete(bID) {
+			continue
+		}
+		log.Printf("[StoreNode CatchUp] Newly joined Store Node syncing recent block %s from column peers...", bID)
+		rcv.fallbackPullMissingCells(bID, 2)
+	}
+}
 
 func (rcv *Receiver) respondWithError(stream network.Stream, errMsg string) {
 	json.NewEncoder(stream).Encode(struct {
@@ -3081,8 +3158,8 @@ func (rcv *Receiver) startPruner(ctx context.Context) {
 					_, err1 := fmt.Sscanf(rowStr, "%d", &row)
 					_, err2 := fmt.Sscanf(colStr, "%d", &col)
 					if err1 == nil && err2 == nil {
-						isCustody := (row % rcv.storesPerCol) == rcv.rowIdx
-						if !isCustody {
+						_, isNativeRetention, _ := rcv.evalCustody(row)
+						if !isNativeRetention {
 							rcv.pruneMu.Lock()
 							if rcv.prunedCells[key] {
 								rcv.pruneMu.Unlock()
@@ -3091,7 +3168,7 @@ func (rcv *Receiver) startPruner(ctx context.Context) {
 							rcv.prunedCells[key] = true
 							rcv.pruneMu.Unlock()
 
-							log.Printf("[Pruning] Cell [%d, %d] of block %s is non-custody. Compressing raw pieces into 1 recoded piece and pruning raw pieces...", row, col, blockID)
+							log.Printf("[Pruning] Cell [%d, %d] of block %s is non-native custody. Compressing raw pieces into 1 recoded piece and pruning raw pieces...", row, col, blockID)
 							deleted := rcv.cache.PruneRawPieces(blockID, row, col, rcv.rm)
 							if deleted > 1 {
 								rcv.totalStoredPiecesMu.Lock()

@@ -14,6 +14,7 @@ type Config struct {
 	KPiece         int
 	CrashOnFail    bool
 	NumCols        int
+	NetRows        int
 	AutoDAS        bool
 	AutoDASSamples int
 }
@@ -26,6 +27,8 @@ func LoadConfig() *Config {
 	kPiece := flag.Int("k-piece", 0, "RLNC piece parameter k-piece")
 	crashOnFail := flag.Bool("crash-on-fail", false, "Crash the node if verification fails")
 	numCols := flag.Int("num-cols", 8, "Total number of network columns")
+	netCols := flag.Int("net-cols", 0, "Total number of network columns (NetCols alias)")
+	netRows := flag.Int("net-rows", 8, "Total number of network rows (NetRows)")
 	autoDAS := flag.Bool("auto-das", true, "Automatically trigger DAS when a new BlockHeader is received via GossipSub")
 	autoDASSamples := flag.Int("auto-das-samples", 0, "Number of samples for Auto-DAS (0 for all active cells, >0 for random samples)")
 	flag.Parse()
@@ -54,6 +57,11 @@ func LoadConfig() *Config {
 		kPieceVal = *k
 	}
 
+	effectiveCols := *numCols
+	if *netCols > 0 {
+		effectiveCols = *netCols
+	}
+
 	return &Config{
 		Port:           *port,
 		PublisherAddr:  *publisher,
@@ -61,7 +69,8 @@ func LoadConfig() *Config {
 		K:              *k,
 		KPiece:         kPieceVal,
 		CrashOnFail:    *crashOnFail,
-		NumCols:        *numCols,
+		NumCols:        effectiveCols,
+		NetRows:        *netRows,
 		AutoDAS:        *autoDAS,
 		AutoDASSamples: *autoDASSamples,
 	}

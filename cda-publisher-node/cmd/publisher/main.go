@@ -34,6 +34,8 @@ func main() {
 	kPieceVal := flag.Int("k-piece", 0, "override K-piece parameter")
 	activeColsVal := flag.Int("active-cols", 0, "override active columns parameter")
 	numColsVal := flag.Int("num-cols", 0, "override number of network column groups")
+	netColsVal := flag.Int("net-cols", 0, "override number of network columns (NetCols)")
+	netRowsVal := flag.Int("net-rows", 0, "override number of network rows (NetRows)")
 	cometbftVal := flag.String("cometbft", "", "override CometBFT RPC address")
 	flag.Parse()
 
@@ -88,12 +90,22 @@ func main() {
 	if *activeColsVal != 0 {
 		cfg.ActiveCols = *activeColsVal
 	}
-	if *numColsVal != 0 {
+	if *netColsVal != 0 {
+		cfg.NumCols = *netColsVal
+		cfg.NetCols = *netColsVal
+	} else if *numColsVal != 0 {
 		cfg.NumCols = *numColsVal
+		cfg.NetCols = *numColsVal
+	} else if cfg.NetCols > 0 && cfg.NumCols <= 0 {
+		cfg.NumCols = cfg.NetCols
+	}
+	if *netRowsVal != 0 {
+		cfg.NetRows = *netRowsVal
 	}
 	if cfg.NumCols <= 0 {
 		cfg.NumCols = 8
 	}
+	cfg.NetCols = cfg.NumCols
 	if cfg.ActiveCols <= 0 {
 		if len(cfg.BootstrapPeers) > 0 {
 			uniqueBootstraps := make(map[string]bool)

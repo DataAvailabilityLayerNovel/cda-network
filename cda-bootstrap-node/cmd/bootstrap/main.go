@@ -80,6 +80,9 @@ func main() {
 	seedAddr := flag.String("seed", "", "override seed bootstrap address")
 	kVal := flag.Int("k", 0, "override K chunks parameter")
 	kPieceVal := flag.Int("k-piece", 0, "override K-piece parameter")
+	netRowsVal := flag.Int("net-rows", 0, "override network matrix rows (stores per col)")
+	netColsVal := flag.Int("net-cols", 0, "override network matrix columns")
+	peerTTLVal := flag.String("peer-ttl", "", "TTL duration before expiring inactive peers (default 15s)")
 	crashOnFail := flag.Bool("crash-on-fail", false, "Crash the node if verification fails")
 	pruneEnable := flag.Bool("prune-enable", false, "Enable pruning of local cache")
 	pruneTTL := flag.String("prune-ttl", "", "TTL duration before pruning local cache")
@@ -122,7 +125,25 @@ func main() {
 	if cfg.KPiece == 0 {
 		cfg.KPiece = cfg.K
 	}
-	
+	if *netRowsVal > 0 {
+		cfg.NetRows = *netRowsVal
+	}
+	if cfg.NetRows <= 0 {
+		cfg.NetRows = 8
+	}
+	if *netColsVal > 0 {
+		cfg.NetCols = *netColsVal
+	}
+	if cfg.NetCols <= 0 {
+		cfg.NetCols = 8
+	}
+	if *peerTTLVal != "" {
+		cfg.PeerTTL = *peerTTLVal
+	}
+	if envTTL := os.Getenv("CDA_PEER_TTL"); envTTL != "" && *peerTTLVal == "" {
+		cfg.PeerTTL = envTTL
+	}
+
 	// Apply CLI prune overrides if specified
 	// We check if flag was explicitly provided
 	flag.Visit(func(f *flag.Flag) {
@@ -134,7 +155,8 @@ func main() {
 		}
 	})
 
-	log.Printf("Starting Bootstrap Node for ColumnID=%d, APIPort=%d, K=%d, KPiece=%d", cfg.ColumnID, cfg.APIPort, cfg.K, cfg.KPiece)
+	log.Printf("Starting Bootstrap Node for ColumnID=%d, APIPort=%d, K=%d, KPiece=%d, NetRows=%d, NetCols=%d, PeerTTL=%s",
+		cfg.ColumnID, cfg.APIPort, cfg.K, cfg.KPiece, cfg.NetRows, cfg.NetCols, cfg.PeerTTL)
 
 	// 1. Initialize KZG Provider for verification and proof generation
 	srsSize := uint64(1024)
@@ -186,7 +208,12 @@ func main() {
 	if errTTL != nil {
 		parsedTTL = 5 * time.Minute
 	}
+	parsedPeerTTL, errPeerTTL := time.ParseDuration(cfg.PeerTTL)
+	if errPeerTTL != nil || parsedPeerTTL <= 0 {
+		parsedPeerTTL = 15 * time.Second
+	}
 	receiver := p2p.NewReceiver(p2pHost, kzg, cfg.PublisherAddr, cfg.KPiece, cache, proofGen, encoder, broadcaster, *crashOnFail, cfg.ColumnID, cfg.PruneEnable, parsedTTL)
+	receiver.SetNetworkMatrixConfig(cfg.NetRows, parsedPeerTTL)
 
 	// Hub fans BlockReady GossipSub events out to HTTP SSE subscribers
 	hub := newBlockReadyHub()
@@ -335,13 +362,20 @@ func main() {
 		}
 	}
 
-	// Expose HTTP server for external queries (like /bootstrap/peers) on APIPort
+	// Expose HTTP server for external queries (like /bootstrap/peers and /bootstrap/sync/) on APIPort
 	mux := http.NewServeMux()
+	syncSvc := p2p.NewSyncService(cache)
+	syncSvc.RegisterHandlers(mux)
+
 	mux.HandleFunc("/bootstrap/peers", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		peers := receiver.GetActivePeers()
+		custodyMap, netRows, activeCount := receiver.GetCustodySummary()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"peers": peers,
+			"peers":               peers,
+			"row_custody_map":     custodyMap,
+			"net_rows":            netRows,
+			"active_peers_in_col": activeCount,
 		})
 	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

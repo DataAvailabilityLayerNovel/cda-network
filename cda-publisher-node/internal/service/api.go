@@ -48,9 +48,10 @@ type APIService struct {
 	latestPublishedHeight int
 	latestCompletedHeight int
 	inFlightCount         int
-	inFlightBlocks        map[string]int                  // BlockID -> Height
-	storeReadyMap         map[string]map[int]map[int]bool // BlockID -> NetColIdx -> set of RowIdx
-	columnReadyMap        map[string]map[int]bool          // BlockID -> set of NetColIdx
+	inFlightBlocks        map[string]int                     // BlockID -> Height
+	storeReadyMap         map[string]map[int]map[int]bool    // BlockID -> NetColIdx -> set of covered NetRowIdx
+	storeReadyPeers       map[string]map[int]map[string]bool // BlockID -> NetColIdx -> set of ready PeerID
+	columnReadyMap        map[string]map[int]bool             // BlockID -> set of NetColIdx
 	blockReadyEmitted     map[string]bool
 	blockK                map[string]int
 	blockStartTime        map[string]time.Time
@@ -117,6 +118,7 @@ func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.Pub
 		numCols:           numColsVal,
 		kVal:              kVal,
 		storeReadyMap:     make(map[string]map[int]map[int]bool),
+		storeReadyPeers:   make(map[string]map[int]map[string]bool),
 		columnReadyMap:    make(map[string]map[int]bool),
 		blockReadyEmitted: make(map[string]bool),
 		blockK:            make(map[string]int),
@@ -274,6 +276,9 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 	if s.storeReadyMap == nil {
 		s.storeReadyMap = make(map[string]map[int]map[int]bool)
 	}
+	if s.storeReadyPeers == nil {
+		s.storeReadyPeers = make(map[string]map[int]map[string]bool)
+	}
 	if s.columnReadyMap == nil {
 		s.columnReadyMap = make(map[string]map[int]bool)
 	}
@@ -302,10 +307,22 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 	}
 
 	rowIdx := payload.RowIdx
-	storesPerCol := payload.StoresPerCol
-	if storesPerCol <= 0 {
-		storesPerCol = 8
+	netRows := payload.NetRows
+	if netRows <= 0 {
+		netRows = payload.StoresPerCol
 	}
+	if netRows <= 0 {
+		netRows = 8
+	}
+
+	activePeersInCol := payload.ActivePeersInCol
+	if activePeersInCol <= 0 {
+		activePeersInCol = payload.StoresPerCol
+	}
+	if activePeersInCol <= 0 {
+		activePeersInCol = netRows
+	}
+
 	height := payload.Height
 	if height <= 0 {
 		height = p2pcommon.ParseHeightFromBlockID(blockID)
@@ -317,8 +334,28 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 	if s.storeReadyMap[blockID][netColIdx] == nil {
 		s.storeReadyMap[blockID][netColIdx] = make(map[int]bool)
 	}
-	s.storeReadyMap[blockID][netColIdx][rowIdx] = true
-	readyStoreCount := len(s.storeReadyMap[blockID][netColIdx])
+	if rowIdx >= 0 {
+		s.storeReadyMap[blockID][netColIdx][rowIdx%netRows] = true
+	}
+	for _, r := range payload.CustodyNetRows {
+		if r >= 0 {
+			s.storeReadyMap[blockID][netColIdx][r%netRows] = true
+		}
+	}
+	coveredRowsCount := len(s.storeReadyMap[blockID][netColIdx])
+
+	if s.storeReadyPeers[blockID] == nil {
+		s.storeReadyPeers[blockID] = make(map[int]map[string]bool)
+	}
+	if s.storeReadyPeers[blockID][netColIdx] == nil {
+		s.storeReadyPeers[blockID][netColIdx] = make(map[string]bool)
+	}
+	peerKey := payload.PeerID
+	if peerKey == "" {
+		peerKey = fmt.Sprintf("row_%d", rowIdx)
+	}
+	s.storeReadyPeers[blockID][netColIdx][peerKey] = true
+	readyPeersCount := len(s.storeReadyPeers[blockID][netColIdx])
 
 	expectedCols := s.activeCols
 	if expectedCols <= 0 {
@@ -329,20 +366,26 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 		s.columnReadyMap[blockID] = make(map[int]bool)
 	}
 
-	quorumStores := storesPerCol
+	quorumRows := netRows
+	quorumPeers := activePeersInCol
 	if envQuorum := os.Getenv("STORE_READY_QUORUM"); envQuorum != "" {
-		if val, err := strconv.Atoi(envQuorum); err == nil && val > 0 && val <= storesPerCol {
-			quorumStores = val
+		if val, err := strconv.Atoi(envQuorum); err == nil && val > 0 {
+			if val < quorumRows {
+				quorumRows = val
+			}
+			if val < quorumPeers {
+				quorumPeers = val
+			}
 		}
 	}
 
-	if readyStoreCount >= quorumStores {
+	if coveredRowsCount >= quorumRows && readyPeersCount >= quorumPeers {
 		s.columnReadyMap[blockID][netColIdx] = true
 	}
 	readyColCount := len(s.columnReadyMap[blockID])
 
-	log.Printf("[Height: %d] [Publisher] Received StoreReady from Col %d Row %d (%d/%d Store Nodes ready for Col %d, quorum: %d). Block %s: %d/%d active columns complete",
-		height, netColIdx, rowIdx, readyStoreCount, storesPerCol, netColIdx, quorumStores, blockID, readyColCount, expectedCols)
+	log.Printf("[Height: %d] [Publisher] Received StoreReady from Col %d Row %d Peer %s (RowsCovered=%d/%d, ReadyPeers=%d/%d, quorumRows=%d, quorumPeers=%d). Block %s: %d/%d active columns complete",
+		height, netColIdx, rowIdx, peerKey, coveredRowsCount, netRows, readyPeersCount, activePeersInCol, quorumRows, quorumPeers, blockID, readyColCount, expectedCols)
 
 	if readyColCount >= expectedCols && !s.blockReadyEmitted[blockID] {
 		s.blockReadyEmitted[blockID] = true

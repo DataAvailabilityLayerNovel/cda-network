@@ -72,13 +72,20 @@ func main() {
 		}
 	}
 
-	gridRows := 2 * cfg.K
-	gridCols := 2 * cfg.K
+	netRows := cfg.StoresPerCol
+	if netRows <= 0 {
+		netRows = 8
+	}
+	netCols := cfg.NumCols
+	if netCols <= 0 {
+		netCols = 8
+	}
 
 	if privKey == nil {
 		if cfg.RowIdx >= 0 && cfg.ColIdx >= 0 {
-			// Targeted cell key generation (for deterministic testing)
-			privKey, pid, err = p2pcommon.GenerateKeypairForCell(cfg.RowIdx, cfg.ColIdx, gridRows, gridCols, "cda-salt-2026")
+			// Targeted cell key generation (supports multiple nodes in the same cell via instanceID)
+			instanceID := fmt.Sprintf("%s-%d", cfg.MyAddr, cfg.Port)
+			privKey, pid, err = p2pcommon.GenerateKeypairForCellInstance(cfg.RowIdx, cfg.ColIdx, netRows, netCols, "cda-salt-2026", instanceID)
 			if err != nil {
 				log.Fatalf("Failed to generate deterministic keypair for cell coordinate: %v", err)
 			}
@@ -103,12 +110,13 @@ func main() {
 		}
 	}
 
-	// Calculate and assign custody coordinates from PeerID
-	autoRow, autoCol := p2pcommon.CalculateCell(pid, gridRows, gridCols, "cda-salt-2026")
+	// Calculate and assign custody coordinates from PeerID within the NetRows x NetCols network matrix
+	autoRow, autoCol := p2pcommon.CalculateCell(pid, netRows, netCols, "cda-salt-2026")
 	if cfg.RowIdx < 0 || cfg.ColIdx < 0 {
 		cfg.RowIdx = autoRow
 		cfg.ColIdx = autoCol
-		log.Printf("[P2P Identity] Auto-derived custody coordinates: Row=%d, Col=%d from PeerID %s", cfg.RowIdx, cfg.ColIdx, pid.String())
+		log.Printf("[P2P Identity] Auto-derived network matrix coordinates: Row=%d (of %d), Col=%d (of %d) from PeerID %s",
+			cfg.RowIdx, netRows, cfg.ColIdx, netCols, pid.String())
 	} else {
 		log.Printf("[P2P Identity] Using custody coordinates: Row=%d, Col=%d (PeerID=%s)", cfg.RowIdx, cfg.ColIdx, pid.String())
 	}
@@ -270,6 +278,8 @@ func main() {
 		log.Fatalf("Failed to parse bootstrap PeerInfo: %v", err)
 	}
 
+	receiver.SetBootstrapHTTPAddr(cfg.BootstrapAddr)
+
 	registerAndSyncPeers := func() {
 		connCtx, connCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer connCancel()
@@ -308,7 +318,7 @@ func main() {
 			return
 		}
 
-		receiver.SetPeers(resp.RowPeers, resp.ColPeers)
+		receiver.SetRoutingState(resp.RowPeers, resp.ColPeers, resp.RowCustodyMap, resp.NetRows, resp.ActivePeersInCol)
 
 		// Connect to row and column peers (Persistent Cliques)
 		allPeers := append([]p2pcommon.PeerInfo(nil), resp.RowPeers...)
