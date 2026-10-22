@@ -36,14 +36,17 @@ Toàn bộ các thành phần trong hệ thống đã được đồng bộ chu�
 | :--- | :--- | :--- |
 | **Cell Size** | **512 bytes** | Kích thước chuẩn của một ô trong ma trận ODS/EDS (đồng bộ trong CometBFT CDA Engine, Publisher, Store Node và Submitter Bot). |
 | **$k_{\text{piece}}$** | **4 fragments / cell** | Mỗi ô dữ liệu (cell 512B) được chia thành 4 fragments ($512\text{B} / 4 = 128\text{B}$). Một mảnh RLNC piece là một tổ hợp tuyến tính của 4 fragments này (payload = 128B). Cần tối thiểu 4 mảnh độc lập tuyến tính để giải mã phục hồi 1 cell hoàn chỉnh. |
-| **Store Nodes Quorum** | **8 nodes** | Số lượng storage node tối thiểu trong mỗi cột mạng để lưu trữ bảo chứng và tái tạo dữ liệu. |
+| **Network Matrix ($R_{\text{net}} \times C_{\text{net}}$)** | **$4-8$ rows $\times 8$ cols** | Ma trận mạng P2P 2 chiều (`--net-rows`, `--net-cols`). Mỗi ô mạng $(r_{\text{net}}, c_{\text{net}})$ có thể chứa $M \ge 1$ Custody Store Nodes (`--nodes-per-cell`). |
+| **Kênh GossipSub Kép** | **`/seed` & `/recode`** | Bootstrap phát bể $2 \cdot k_{\text{piece}}$ hạt giống lên `/cda/1.0.0/col/<c>/row/<r>/seed`; Custody Nodes lấy mẫu ngẫu nhiên $S_{\text{node}} = \max(2, \lceil 2k_{\text{piece}}/M \rceil)$ mảnh và phát $Q = \max(1, \lceil k_{\text{piece}}/M \rceil) + 1$ mảnh recode lên `/cda/1.0.0/col/<c>/row/<r>/recode`. |
 | **RPC Max Body Size** | **10 MB** (`10000000`) | Giới hạn payload HTTP tiếp nhận của CometBFT RPC để hỗ trợ các giao dịch dung lượng lớn. |
 | **In-Flight Queue** | **Tối đa 32 blocks** | Hàng đợi pipeline xử lý song song của CDA Publisher trước khi áp dụng backpressure. |
 
 > [!NOTE]
-> **Quy tắc phân rã Cell và Lưu ký Custody**:
+> **Quy tắc phân rã Cell, Lưu ký Custody & Tái mã hóa phân cấp**:
 > - **Kích thước Fragment**: $\text{Fragment Size} = \frac{\text{Cell Size}}{k_{\text{piece}}} = \frac{512\text{ bytes}}{4} = 128\text{ bytes}$.
-> - **Ngưỡng Custody (Full Rank)**: Một Store Node đạt hoàn thành lưu ký (Custody Storage) cho ô dữ liệu $[r, c]$ khi và chỉ khi tích lũy đủ $\text{Rank} \ge k_{\text{piece}}$ mảnh RLNC độc lập tuyến tính cho ô đó.
+> - **Native Custody (Full Rank)**: Mỗi Custody Node trong ô mạng $(r_{\text{net}}, c_{\text{net}})$ thu thập mảnh từ kênh `/seed` và `/recode` cho đến khi tích lũy đủ $\text{Rank} \ge k_{\text{piece}}$ mảnh RLNC độc lập tuyến tính và lưu trữ dài hạn.
+> - **Borrowed Backup Custody**: Khi một ô mạng thiếu node, hệ thống tự động mượn 1 Backup Node từ hàng kế cận `(r + 1) % NetRows`. Backup Node phát đủ hạn ngạch $Q$ mảnh recode lên `/recode` rồi cắt tỉa (prune) ngay lập tức về 1 mảnh recode.
+> - **Non-Custody Store Nodes**: Thu thập $\ge 2$ mảnh độc lập tuyến tính từ $\ge 2$ nguồn (`minSources >= 2`) trên kênh `/recode` và thực hiện **Recode lần 2** thành 1 mảnh mới trước khi khóa ô (hoặc lưu trực tiếp 1 mảnh nếu hết thời gian chờ ngắn mà chỉ nhận được 1 mảnh).
 
 ---
 
@@ -76,19 +79,26 @@ bash scripts/cleanup.sh
 python3 scripts/init_cometbft_cluster.py --validators 4
 
 # Bước 3: Tự động sinh cấu hình Docker Compose, Prometheus và Dashboard Grafana
+# Ví dụ mặc định (8 net-cols x 8 net-rows x 1 node/cell, chạy cột 0):
 python3 scripts/generate_compose.py
 
-# Bước 4: Khởi động toàn bộ 17 containers ở chế độ chạy nền
+# Hoặc sinh cấu hình đa node trên mỗi ô mạng (ví dụ: 8 net-cols x 4 net-rows x 2 nodes/cell):
+python3 scripts/generate_compose.py --net-cols 8 --net-rows 4 --nodes-per-cell 2 --active-cols 1
+
+# Bước 4: Khởi động toàn bộ containers ở chế độ chạy nền
 docker compose -f docker-compose.json up -d --build
 ```
 
 ---
 
-### 2.2. Kiểm Tra Trạng Thái Sức Khỏe Cụm Node
+### 2.2. Kiểm Tra Trạng Thái Sức Khỏe & Bảng Định Tuyến Ma Trận Mạng
 
 ```bash
 # Xem danh sách và trạng thái toàn bộ containers
 docker compose -f docker-compose.json ps
+
+# Kiểm tra bảng phân bổ Custody (row_custody_map) trên Bootstrap Node
+curl -s http://localhost:9200/bootstrap/peers | jq .
 
 # Kiểm tra chiều cao khối hiện tại của CometBFT
 curl -s http://localhost:26657/status | grep -o '"latest_block_height":"[^"]*"'
@@ -200,16 +210,60 @@ curl -s -X POST "http://localhost:26657/broadcast_tx_commit?tx=${RAW_TX}"
 
 | Cờ Tham Số | Giá Trị Mặc Định | Ý Nghĩa & Mục Đích |
 | :--- | :--- | :--- |
+| `--stream` | `False` | **Chế độ bơm liên tục (Continuous Streaming)**: Bơm giao dịch liên tục vào Mempool CometBFT mà không đợi đóng block hay đợi CDA; luồng monitor nền tự động quan sát block và trạng thái CDA. |
 | `--tx-count` | `64` | Số lượng giao dịch được broadcast đồng thời trong một batch. |
 | `--payload-size` | `512` | Kích thước dữ liệu payload (bytes) của mỗi giao dịch. |
 | `--cell-size` | `512` | Kích thước ô (bytes) dùng để tính toán số cells và dự đoán chiều $K$. |
 | `--tx-format` | `kv` | Định dạng giao dịch: `kv` (key=value, an toàn cho ABCI kvstore) hoặc `raw_hex`. |
-| `--interval` | `2.0` | Thời gian nghỉ (giây) giữa các đợt gửi giao dịch. |
+| `--interval` | `2.0` | Thời gian nghỉ (giây) giữa các đợt gửi giao dịch (đặt `0.1`–`0.5s` khi stream, hoặc `0.0` để bơm tối đa công suất). |
 | `--batches` | `0` | Tổng số đợt nộp (`0` = chạy liên tục vô hạn đến khi bấm Ctrl+C). |
 | `--workers` | `32` | Số lượng luồng worker chạy song song khi nộp HTTP broadcast. |
-| `--wait-cda` | `False` | Tự động đồng bộ: đợi block đạt trạng thái `CDA BlockReady` mới gửi batch tiếp. |
+| `--pipeline` | `False` | Chế độ gối đầu: nộp block liên tiếp qua từng block CometBFT; kiểm tra CDA BlockReady chạy nền. |
+| `--max-in-flight` | `2` | Giới hạn số block CDA đang xử lý song song trong chế độ pipeline (đặt `0` = không giới hạn). |
+| `--wait-cda` / `--no-wait-cda` | `True` | Tự động đồng bộ: kiểm tra block đạt trạng thái `CDA BlockReady` (dùng `--no-wait-cda` để bỏ qua). |
 | `--cometbft` | `http://localhost:26657` | Địa chỉ RPC endpoint của CometBFT node. |
 | `--publisher` | `http://localhost:8080` | Địa chỉ REST API của CDA Publisher node. |
+
+---
+
+### 3.5. Bot Phân Rã, Lưu Trữ & Khôi Phục File Lớn (`file_pipeline_bot.py`)
+
+Bot [`scripts/bots/file_pipeline_bot.py`](file:///home/ubuntu/cda-network/scripts/bots/file_pipeline_bot.py) được thiết kế chuyên biệt để giải quyết bài toán: **Lưu trữ một file bất kỳ (dung lượng từ vài MB đến hàng trăm MB) lên CDA Network bằng cách chia nhỏ thành các chunk $\sim 500\text{ KB}$, sinh Manifest JSON ghi nhớ metadata và hỗ trợ khôi phục (retrieve) nguyên vẹn file với kiểm tra SHA-256.**
+
+#### A. Cú pháp nộp (Upload/Chunking):
+```bash
+# 1. Nộp một file có sẵn trên đĩa:
+python3 scripts/bots/file_pipeline_bot.py \
+  --file /path/to/my_data.bin \
+  --chunk-size 500KB \
+  --manifest my_data.manifest.json
+
+# 2. Tự động sinh file ngẫu nhiên (ví dụ 5 MB) để benchmark:
+python3 scripts/bots/file_pipeline_bot.py \
+  --size 5MB \
+  --chunk-size 500KB \
+  --manifest benchmark_5MB.manifest.json
+```
+
+#### B. Cú pháp khôi phục (Retrieve & Reassemble):
+```bash
+python3 scripts/bots/file_pipeline_bot.py \
+  --retrieve \
+  --manifest benchmark_5MB.manifest.json \
+  --output restored_data.bin
+```
+
+| Cờ Tham Số | Giá Trị Mặc Định | Ý Nghĩa & Mục Đích |
+| :--- | :--- | :--- |
+| `--file` | `""` | Đường dẫn file thực tế trên đĩa cần nộp. |
+| `--size` | `2MB` | Kích thước dữ liệu mẫu cần sinh nếu không dùng `--file` (hỗ trợ `500KB`, `2MB`, `10M`...). |
+| `--chunk-size` | `500KB` | Kích thước mỗi phần (chunk) tương ứng 1 block CometBFT ($K=32$ CDA). |
+| `--slice-size` | `500` | Kích thước mỗi slice giao dịch trong chunk (bytes). |
+| `--manifest` | `<filename>.manifest.json` | Đường dẫn file Manifest JSON lưu trữ metadata tra cứu. |
+| `--retrieve` | `False` | Bật chế độ khôi phục file từ Manifest JSON. |
+| `--output` | `""` | Đường dẫn file đích khi khôi phục (`--retrieve`). |
+| `--workers` | `32` | Số worker broadcast hoặc tải về song song. |
+| `--wait-cda` / `--no-wait-cda` | `True` | Theo dõi trạng thái CDA BlockReady chạy nền. |
 
 ---
 

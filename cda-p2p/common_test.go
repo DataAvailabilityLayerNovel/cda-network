@@ -1,15 +1,56 @@
 package p2pcommon
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 )
 
-func TestTopicCellRow(t *testing.T) {
-	got := TopicCellRow(2, 5)
-	want := "/cda/1.0.0/col/2/row/5"
-	if got != want {
-		t.Fatalf("TopicCellRow(2, 5) = %q, want %q", got, want)
+func TestTopicCellRowSeedAndRecode(t *testing.T) {
+	gotSeed := TopicCellRowSeed(2, 5)
+	wantSeed := "/cda/1.0.0/col/2/row/5/seed"
+	if gotSeed != wantSeed {
+		t.Fatalf("TopicCellRowSeed(2, 5) = %q, want %q", gotSeed, wantSeed)
+	}
+
+	gotRecode := TopicCellRowRecode(2, 5)
+	wantRecode := "/cda/1.0.0/col/2/row/5/recode"
+	if gotRecode != wantRecode {
+		t.Fatalf("TopicCellRowRecode(2, 5) = %q, want %q", gotRecode, wantRecode)
+	}
+
+	if TopicCellRow(2, 5) != wantRecode {
+		t.Fatalf("TopicCellRow(2, 5) = %q, want %q", TopicCellRow(2, 5), wantRecode)
+	}
+}
+
+func TestEncodeDecodeBinaryBatchSeed(t *testing.T) {
+	req := &BinaryBatchSeedRequest{
+		BlockID:      "block-test-seed",
+		ColIdx:       3,
+		PieceCommits: [][]byte{[]byte("commit0"), []byte("commit1")},
+		SenderPeerID: "bootstrap-peer-0",
+		Seeds: []BinarySeedPiece{
+			{Row: 1, Col: 3, Data: []byte("data-0"), Coeffs: []byte{1, 2, 3, 4}, Proof: []byte("proof-0")},
+			{Row: 1, Col: 3, Data: []byte("data-1"), Coeffs: []byte{5, 6, 7, 8}, Proof: []byte("proof-1")},
+		},
+	}
+
+	raw, err := EncodeBinaryBatchSeed(req)
+	if err != nil {
+		t.Fatalf("EncodeBinaryBatchSeed failed: %v", err)
+	}
+
+	decoded, err := DecodeBinaryBatchSeed(raw)
+	if err != nil {
+		t.Fatalf("DecodeBinaryBatchSeed failed: %v", err)
+	}
+
+	if decoded.BlockID != req.BlockID || decoded.ColIdx != req.ColIdx || len(decoded.Seeds) != len(req.Seeds) {
+		t.Fatalf("decoded mismatch: got %+v, want %+v", decoded, req)
+	}
+	if !bytes.Equal(decoded.Seeds[1].Data, req.Seeds[1].Data) {
+		t.Fatalf("seed[1].Data mismatch")
 	}
 }
 
@@ -66,10 +107,6 @@ func TestComputeColumnCustodyMap_SingleNodePerCell(t *testing.T) {
 
 func TestComputeColumnCustodyMap_MultiNodeCellAndEmptyRow(t *testing.T) {
 	netRows := 4
-	// Row 0 has 3 nodes (multi-node cell M=3)
-	// Row 1 has 0 nodes (empty / left)
-	// Row 2 has 2 nodes (multi-node cell M=2)
-	// Row 3 has 1 node (single-node cell M=1)
 	peers := []PeerInfo{
 		{PeerID: "peer-r0-a", Row: 0, Col: 0},
 		{PeerID: "peer-r0-b", Row: 0, Col: 0},
@@ -81,22 +118,15 @@ func TestComputeColumnCustodyMap_MultiNodeCellAndEmptyRow(t *testing.T) {
 
 	custodyMap := ComputeColumnCustodyMap(peers, netRows)
 
-	// Row 0 should have all 3 in-cell peers
 	if len(custodyMap[0]) != 3 {
 		t.Fatalf("row 0: expected 3 custody peers, got %d", len(custodyMap[0]))
 	}
-
-	// Row 1 (empty) should borrow 2 peers from next active row (Row 2)
 	if len(custodyMap[1]) != 2 {
 		t.Fatalf("row 1 (empty): expected 2 borrowed custody peers, got %d", len(custodyMap[1]))
 	}
-
-	// Row 2 should have its 2 in-cell peers
 	if len(custodyMap[2]) != 2 {
 		t.Fatalf("row 2: expected 2 custody peers, got %d", len(custodyMap[2]))
 	}
-
-	// Row 3 (1 node) should have peer-r3-a + 1 borrowed peer from Row 0
 	if len(custodyMap[3]) != 2 {
 		t.Fatalf("row 3: expected 2 custody peers, got %d", len(custodyMap[3]))
 	}
@@ -106,20 +136,21 @@ func TestComputeSeedingPlan(t *testing.T) {
 	tests := []struct {
 		m           int
 		kPiece      int
-		wantPerPeer int
 		wantTotal   int
+		wantPerPeer int
+		wantRecodes int
 	}{
-		{m: 1, kPiece: 4, wantPerPeer: 8, wantTotal: 8},
-		{m: 2, kPiece: 4, wantPerPeer: 4, wantTotal: 8},
-		{m: 3, kPiece: 4, wantPerPeer: 3, wantTotal: 9},
-		{m: 4, kPiece: 4, wantPerPeer: 2, wantTotal: 8},
+		{m: 1, kPiece: 4, wantTotal: 8, wantPerPeer: 8, wantRecodes: 5},
+		{m: 2, kPiece: 4, wantTotal: 8, wantPerPeer: 4, wantRecodes: 3},
+		{m: 3, kPiece: 4, wantTotal: 8, wantPerPeer: 3, wantRecodes: 3},
+		{m: 4, kPiece: 4, wantTotal: 8, wantPerPeer: 2, wantRecodes: 2},
 	}
 
 	for _, tc := range tests {
-		total, perPeer, _ := ComputeSeedingPlan(tc.m, tc.kPiece)
-		if perPeer != tc.wantPerPeer || total != tc.wantTotal {
-			t.Fatalf("M=%d, kPiece=%d: got (perPeer=%d, total=%d), want (%d, %d)",
-				tc.m, tc.kPiece, perPeer, total, tc.wantPerPeer, tc.wantTotal)
+		total, perPeer, recodes := ComputeSeedingPlan(tc.m, tc.kPiece)
+		if total != tc.wantTotal || perPeer != tc.wantPerPeer || recodes != tc.wantRecodes {
+			t.Fatalf("M=%d, kPiece=%d: got (total=%d, perPeer=%d, recodes=%d), want (%d, %d, %d)",
+				tc.m, tc.kPiece, total, perPeer, recodes, tc.wantTotal, tc.wantPerPeer, tc.wantRecodes)
 		}
 	}
 }

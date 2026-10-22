@@ -32,7 +32,7 @@ def ensure_cometbft_bin(bin_path="./bin/cometbft"):
 
 
 def init_cometbft_cluster(num_validators=4, output_dir="./data/cometbft",
-                          timeout_commit="1s", clean=True, bin_path="./bin/cometbft"):
+                          timeout_commit="2.5s", clean=True, bin_path="./bin/cometbft"):
     output_dir = os.path.abspath(output_dir)
     cometbft_bin = ensure_cometbft_bin(bin_path)
 
@@ -130,7 +130,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Initialize CometBFT Cluster Configuration")
     parser.add_argument("-v", "--validators", type=int, default=4, help="Number of validator nodes (default: 4)")
     parser.add_argument("-o", "--output-dir", type=str, default="./data/cometbft", help="Output directory")
-    parser.add_argument("--timeout-commit", type=str, default="1s", help="timeout_commit duration (default: 1s)")
+    parser.add_argument("--timeout-commit", type=str, default="2.5s", help="timeout_commit duration (default: 2.5s)")
     parser.add_argument("--bin", dest="bin_path", type=str, default="./bin/cometbft", help="Path to cometbft binary")
     parser.add_argument("--no-clean", dest="clean", action="store_false", help="Do not delete existing output directory")
 

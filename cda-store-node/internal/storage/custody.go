@@ -521,6 +521,7 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 
 	s.memMu.Lock()
 	rawPieces := s.piecesCache[rawKeyStr]
+	alreadyHasRecoded := len(s.recodedCache[recodedKeyStr]) > 0
 	delete(s.piecesCache, rawKeyStr)
 	s.countMu.Lock()
 	s.pieceCountCache[rawKeyStr] = 0
@@ -528,26 +529,36 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 	s.memMu.Unlock()
 
 	deletedCount := len(rawPieces)
-	pieceCommits, _ := s.GetAnchoredCommitments(blockID, col)
+	if deletedCount == 0 && alreadyHasRecoded {
+		return 0
+	}
 
 	var compressedPiece cda.ReceivedPiece
-	if len(rawPieces) >= 2 && rm != nil {
-		recoded, err := rm.RecodePiecesWithVerify(rawPieces, pieceCommits, 5)
-		if err == nil && recoded != nil {
-			compressedPiece = *recoded
-		} else if len(rawPieces) > 0 {
+	if !alreadyHasRecoded && len(rawPieces) > 0 {
+		if len(rawPieces) >= 2 && rm != nil {
+			recoded, err := rm.RecodePieces(rawPieces)
+			if err == nil && recoded != nil {
+				compressedPiece = *recoded
+			} else {
+				pieceCommits, _ := s.GetAnchoredCommitments(blockID, col)
+				if recVer, vErr := rm.RecodePiecesWithVerify(rawPieces, pieceCommits, 3); vErr == nil && recVer != nil {
+					compressedPiece = *recVer
+				} else {
+					compressedPiece = rawPieces[0]
+				}
+			}
+		} else {
 			compressedPiece = rawPieces[0]
 		}
-	} else if len(rawPieces) > 0 {
-		compressedPiece = rawPieces[0]
-	}
 
-	s.memMu.Lock()
-	alreadyHasRecoded := len(s.recodedCache[recodedKeyStr]) > 0
-	if !alreadyHasRecoded && len(rawPieces) > 0 {
-		s.recodedCache[recodedKeyStr] = []cda.ReceivedPiece{compressedPiece}
+		s.memMu.Lock()
+		if len(s.recodedCache[recodedKeyStr]) == 0 {
+			s.recodedCache[recodedKeyStr] = []cda.ReceivedPiece{compressedPiece}
+		} else {
+			alreadyHasRecoded = true
+		}
+		s.memMu.Unlock()
 	}
-	s.memMu.Unlock()
 
 	if s.db != nil {
 		go func(rawKey, recKey []byte, pList []cda.ReceivedPiece, compPiece cda.ReceivedPiece, hadRecoded bool) {

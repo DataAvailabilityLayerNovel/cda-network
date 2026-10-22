@@ -213,7 +213,7 @@ func main() {
 		parsedPeerTTL = 15 * time.Second
 	}
 	receiver := p2p.NewReceiver(p2pHost, kzg, cfg.PublisherAddr, cfg.KPiece, cache, proofGen, encoder, broadcaster, *crashOnFail, cfg.ColumnID, cfg.PruneEnable, parsedTTL)
-	receiver.SetNetworkMatrixConfig(cfg.NetRows, parsedPeerTTL)
+	receiver.SetNetworkMatrixConfig(cfg.NetRows, parsedPeerTTL, cfg.NetCols, cfg.K)
 
 	// Hub fans BlockReady GossipSub events out to HTTP SSE subscribers
 	hub := newBlockReadyHub()

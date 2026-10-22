@@ -175,11 +175,21 @@ func TopicRow(row int) string {
 	return fmt.Sprintf("/cda/1.0.0/row/%d", row)
 }
 
-// TopicCellRow returns the GossipSub topic for a specific network cell (netCol, netRow).
-// All custody nodes (whether native to netRow or borrowed from another row) publish their recoded
-// RLNC pieces for data row r (where r % netRows == netRow) onto this deterministic channel.
+// TopicCellRowSeed returns the GossipSub topic where Bootstrap publishes the 2*kPiece seed pool
+// for network cell (netCol, netRow). Only Custody Store Nodes assigned to netRow subscribe to this channel.
+func TopicCellRowSeed(netCol, netRow int) string {
+	return fmt.Sprintf("/cda/1.0.0/col/%d/row/%d/seed", netCol, netRow)
+}
+
+// TopicCellRowRecode returns the GossipSub topic where Custody Store Nodes assigned to (netCol, netRow)
+// publish their recoded RLNC pieces. Both Custody Nodes and Non-Custody Nodes in the column subscribe.
+func TopicCellRowRecode(netCol, netRow int) string {
+	return fmt.Sprintf("/cda/1.0.0/col/%d/row/%d/recode", netCol, netRow)
+}
+
+// TopicCellRow returns the GossipSub recode topic for a specific network cell (netCol, netRow).
 func TopicCellRow(netCol, netRow int) string {
-	return fmt.Sprintf("/cda/1.0.0/col/%d/row/%d", netCol, netRow)
+	return TopicCellRowRecode(netCol, netRow)
 }
 
 // TopicNode returns the per-node GossipSub topic for a store node identified by its PeerID.
@@ -313,9 +323,9 @@ func ComputeColumnCustodyMap(colPeers []PeerInfo, netRows int) map[int][]PeerInf
 }
 
 // ComputeSeedingPlan returns:
-// - totalSeeds: total RLNC seeds Bootstrap should generate for a cell with M custody peers: max(2*kPiece, M * ceil(2*kPiece/M))
-// - seedsPerPeer: number of seeds each of the M custody peers receives: max(2, ceil(2*kPiece/M))
-// - recodesPerPeer: number of recoded pieces each custody peer should broadcast to TopicCellRow: max(1, ceil(2*kPiece/M))
+// - totalSeeds: fixed seed pool size S_pool = 2 * kPiece published by Bootstrap onto TopicCellRowSeed
+// - seedsPerPeer: random subset size S_node = max(2, ceil(2*kPiece/M)) sampled by each of the M custody peers from TopicCellRowSeed
+// - recodesPerPeer: broadcast quota Q = max(1, ceil(kPiece/M)) + 1 recoded pieces each custody peer publishes onto TopicCellRowRecode
 func ComputeSeedingPlan(numCustodyPeers int, kPiece int) (totalSeeds int, seedsPerPeer int, recodesPerPeer int) {
 	if kPiece <= 0 {
 		kPiece = 4
@@ -323,20 +333,19 @@ func ComputeSeedingPlan(numCustodyPeers int, kPiece int) (totalSeeds int, seedsP
 	if numCustodyPeers <= 0 {
 		numCustodyPeers = 2
 	}
-	targetTotal := 2 * kPiece
-	seedsPerPeer = (targetTotal + numCustodyPeers - 1) / numCustodyPeers
+	totalSeeds = 2 * kPiece
+	seedsPerPeer = (totalSeeds + numCustodyPeers - 1) / numCustodyPeers
 	if seedsPerPeer < 2 {
 		seedsPerPeer = 2
 	}
-	totalSeeds = numCustodyPeers * seedsPerPeer
-	recodesPerPeer = (targetTotal + numCustodyPeers - 1) / numCustodyPeers
-	if recodesPerPeer < 1 {
-		recodesPerPeer = 1
+	if seedsPerPeer > totalSeeds {
+		seedsPerPeer = totalSeeds
 	}
-	// When M == 2 and kPiece == 4, each peer gets 4 seeds and broadcasts kPiece/2 = 2 recoded pieces (total 4 recoded pieces across the 2 peers, or 2 rounds each)
-	if numCustodyPeers == 2 && kPiece >= 2 {
-		recodesPerPeer = kPiece / 2
+	baseQuota := (kPiece + numCustodyPeers - 1) / numCustodyPeers
+	if baseQuota < 1 {
+		baseQuota = 1
 	}
+	recodesPerPeer = baseQuota + 1
 	return totalSeeds, seedsPerPeer, recodesPerPeer
 }
 
