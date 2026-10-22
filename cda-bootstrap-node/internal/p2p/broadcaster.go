@@ -122,6 +122,77 @@ func (b *Broadcaster) BroadcastAnchor(blockID string, colIdx int, pieceCommits [
 	return nil
 }
 
+// JoinSeedTopics pre-joins the GossipSub TopicCellRowSeed channels for all network rows in netColIdx
+// so GossipSub mesh grafts are established immediately when Store Nodes connect.
+func (b *Broadcaster) JoinSeedTopics(netColIdx, netRows int) {
+	if b.ps == nil || netRows <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.topics == nil {
+		b.topics = make(map[string]*pubsub.Topic)
+	}
+	for r := 0; r < netRows; r++ {
+		topicName := p2pcommon.TopicCellRowSeed(netColIdx, r)
+		if _, ok := b.topics[topicName]; !ok {
+			if topic, err := b.ps.Join(topicName); err == nil {
+				b.topics[topicName] = topic
+			}
+		}
+	}
+}
+
+// BroadcastRowSeedPool publishes a compact binary seed pool (2*kPiece seeds per cell)
+// onto the row-specific GossipSub channel TopicCellRowSeed(netColIdx, netRow).
+// Returns the number of GossipSub peers currently subscribed to that topic.
+func (b *Broadcaster) BroadcastRowSeedPool(netColIdx, netRow int, req p2pcommon.BinaryBatchSeedRequest) (int, error) {
+	if b.ps == nil {
+		return 0, fmt.Errorf("pubsub not initialized on broadcaster")
+	}
+	topicName := p2pcommon.TopicCellRowSeed(netColIdx, netRow)
+	b.mu.Lock()
+	if b.topics == nil {
+		b.topics = make(map[string]*pubsub.Topic)
+	}
+	topic, ok := b.topics[topicName]
+	var joinErr error
+	if !ok {
+		topic, joinErr = b.ps.Join(topicName)
+		if joinErr == nil {
+			b.topics[topicName] = topic
+		}
+	}
+	b.mu.Unlock()
+
+	if !ok && joinErr != nil {
+		return 0, fmt.Errorf("failed to join seed topic %s: %w", topicName, joinErr)
+	}
+
+	// Wait briefly (up to 150ms) if GossipSub mesh GRAFT for this seed topic is still settling after cold start
+	peers := topic.ListPeers()
+	for waitAttempt := 0; len(peers) == 0 && waitAttempt < 5; waitAttempt++ {
+		time.Sleep(30 * time.Millisecond)
+		peers = topic.ListPeers()
+	}
+	if len(peers) == 0 {
+		return 0, fmt.Errorf("no subscribed peers grafted on %s", topicName)
+	}
+
+	rawBytes, err := p2pcommon.EncodeBinaryBatchSeed(&req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to encode binary seed pool: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := topic.Publish(ctx, rawBytes); err != nil {
+		return 0, fmt.Errorf("failed to publish seed pool on %s: %w", topicName, err)
+	}
+	return len(peers), nil
+}
+
 // BroadcastPiece delivers an RLNC piece to the Store Node assigned for cell [row, col] and pieceIdx.
 // Uses the per-node stream protocol ProtoNodeSeed(peerID) instead of a shared protocol,
 // so each store node has its own dedicated channel for receiving seed pieces.

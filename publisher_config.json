@@ -1,0 +1,12 @@
+{
+  "api_port": 18080,
+  "k": 4,
+  "k_piece": 4,
+  "active_cols": 1,
+  "num_cols": 2,
+  "net_cols": 2,
+  "net_rows": 4,
+  "bootstrap_peers": {
+    "0": "http://localhost:18200"
+  }
+}

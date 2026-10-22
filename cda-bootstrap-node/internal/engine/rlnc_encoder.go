@@ -7,6 +7,7 @@ import (
 
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/rlnc"
+	bls12381 "github.com/consensys/gnark-crypto/ecc/bls12-381"
 	"github.com/consensys/gnark-crypto/ecc/bls12-381/fr"
 )
 
@@ -100,7 +101,13 @@ func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pie
 
 	// 1. Precompute zPowers once for the entire row and evaluate all k piece columns
 	n := len(columnData)
-	z := e.kzg.GetEvaluationPoint(row)
+	var z fr.Element
+	gnarkKZG, isGnark := e.kzg.(*cda.GnarkKZG)
+	if isGnark {
+		z = gnarkKZG.GnarkGetEvaluationPointForDomain(row, n)
+	} else {
+		z = e.kzg.GetEvaluationPoint(row)
+	}
 	zPowers := ComputeZPowersFromPoint(z, n)
 	frSize := len(columnData[0]) / e.k
 	fragments := make([][]byte, e.k)
@@ -111,6 +118,18 @@ func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pie
 	openingProofs := make([]cda.OpeningProof, e.k)
 	for i := 0; i < e.k; i++ {
 		openingProofs[i] = cda.OpeningProof(pieceProofs[i])
+	}
+
+	// Pre-decompress G1Affine proof points once per row when using GnarkKZG
+	var unpackedPts []bls12381.G1Affine
+	var unpackedVals []fr.Element
+	if isGnark {
+		pts, vals, err := gnarkKZG.GnarkUnpackProofs(openingProofs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unpack row %d opening proofs: %w", row, err)
+		}
+		unpackedPts = pts
+		unpackedVals = vals
 	}
 
 	pieces := make([]*cda.ReceivedPiece, count)
@@ -161,7 +180,13 @@ func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pie
 		}
 
 		// 4. Compute combined proof: P_i = sum(g_{i,j} * Pi_j)
-		combinedProof, err := e.kzg.CombineProofs(openingProofs, coeffs)
+		var combinedProof cda.OpeningProof
+		var err error
+		if isGnark && unpackedVals != nil {
+			combinedProof, err = gnarkKZG.GnarkCombineUnpackedProofs(unpackedPts, unpackedVals, coeffs)
+		} else {
+			combinedProof, err = e.kzg.CombineProofs(openingProofs, coeffs)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to combine proofs for seed %d: %w", seedIdx, err)
 		}

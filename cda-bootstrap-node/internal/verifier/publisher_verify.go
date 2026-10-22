@@ -7,12 +7,58 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 
 	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 )
 
 type BlockHeader = p2pcommon.BlockHeader
+
+var (
+	headerCacheMu sync.RWMutex
+	headerCache   = make(map[string]BlockHeader)
+	headerKeys    []string
+)
+
+func getOrFetchHeader(publisherAddr, blockID string) (BlockHeader, error) {
+	cacheKey := publisherAddr + "|" + blockID
+	headerCacheMu.RLock()
+	if hdr, ok := headerCache[cacheKey]; ok {
+		headerCacheMu.RUnlock()
+		return hdr, nil
+	}
+	headerCacheMu.RUnlock()
+
+	resp, err := http.Get(fmt.Sprintf("%s/header/%s", publisherAddr, blockID))
+	if err != nil {
+		return BlockHeader{}, fmt.Errorf("failed to fetch header from publisher: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return BlockHeader{}, fmt.Errorf("publisher returned status %d", resp.StatusCode)
+	}
+
+	var header BlockHeader
+	if err := json.NewDecoder(resp.Body).Decode(&header); err != nil {
+		return BlockHeader{}, fmt.Errorf("failed to decode block header: %w", err)
+	}
+
+	headerCacheMu.Lock()
+	if _, exists := headerCache[cacheKey]; !exists {
+		if len(headerKeys) >= 256 {
+			oldest := headerKeys[0]
+			headerKeys = headerKeys[1:]
+			delete(headerCache, oldest)
+		}
+		headerKeys = append(headerKeys, cacheKey)
+		headerCache[cacheKey] = header
+	}
+	headerCacheMu.Unlock()
+
+	return header, nil
+}
 
 // VerifyPublisherData performs all verifications specified in plan.md Section II.2 Step 1.
 func VerifyPublisherData(
@@ -25,20 +71,10 @@ func VerifyPublisherData(
 	merkleProofs []cda.MerkleProof,
 	k int,
 ) (bool, error) {
-	// 1. Fetch Block Header from Publisher
-	resp, err := http.Get(fmt.Sprintf("%s/header/%s", publisherAddr, blockID))
+	// 1. Fetch Block Header from Publisher (cached per blockID)
+	header, err := getOrFetchHeader(publisherAddr, blockID)
 	if err != nil {
-		return false, fmt.Errorf("failed to fetch header from publisher: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("publisher returned status %d", resp.StatusCode)
-	}
-
-	var header BlockHeader
-	if err := json.NewDecoder(resp.Body).Decode(&header); err != nil {
-		return false, fmt.Errorf("failed to decode block header: %w", err)
+		return false, err
 	}
 
 	if colIdx < 0 || colIdx >= len(header.ColumnComm) {

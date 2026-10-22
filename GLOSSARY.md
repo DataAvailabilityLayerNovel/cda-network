@@ -45,22 +45,48 @@ Tài liệu này là nguồn chuẩn hóa duy nhất (Single Source of Truth) đ
 | **EDS Dimension** | $N$ | Số hàng và số cột của ma trận mở rộng EDS ($N = 2K$). | $2K$ |
 | **RLNC Degree** | $k_{\text{piece}}$ | **Số fragments cấu thành 1 Cell**, đồng thời là **hạng tuyến tính (Rank) tối thiểu** của tập hợp các mảnh RLNC cần thiết để giải mã khôi phục lại Cell gốc. | `4` |
 | **Cell Size** | - | Dung lượng dữ liệu của 1 cell ma trận. | `512 bytes` |
-| **Network Columns** | $C_{\text{net}}$ | Số lượng cột mạng logic phân tán độc lập trên mạng P2P. | `8` |
-| **Stores per Column** | $S$ | Số lượng Store Nodes lưu trữ bảo chứng (custody) trong mỗi cột. | `8` |
+| **Network Columns** | $C_{\text{net}}$ | Số lượng cột mạng logic phân tán độc lập trên mạng P2P (`--net-cols`). | `8` |
+| **Network Rows** | $R_{\text{net}}$ | Số lượng hàng mạng logic (ô mạng / Network Cells) trong mỗi cột mạng (`--net-rows`). | `4` – `8` |
+| **Nodes per Cell** | $M$ | Số lượng Custody Store Nodes cùng tham gia bảo chứng trong một ô mạng $(r_{\text{net}}, c_{\text{net}})$ (`--nodes-per-cell`, $M \ge 1$). | `1` – `3+` |
 
 ---
 
-## 3. Quy Trình Lưu Trữ & Đồng Thuận DA
+## 3. Quy Trình Lưu Trữ, Kênh GossipSub Kép & Đồng Thuận DA
 
-### Custody Storage (Lưu Trữ Bảo Chứng)
-- Một Store Node trong cột $c$ được phân công bảo chứng lưu trữ một tập hợp các ô dữ liệu $[r, c]$.
-- **Ngưỡng hoàn thành lưu ký (Full Rank Quorum)**:
-  Store Node chỉ được xem là hoàn thành lưu trữ (Custody Complete) cho ô $[r, c]$ khi và chỉ khi:
+### Network Matrix Cell (Ô Mạng Lưu Trữ)
+- Không gian mạng P2P được tổ chức thành ma trận 2 chiều $R_{\text{net}} \times C_{\text{net}}$.
+- Mỗi ô dữ liệu $[r, c]$ trong ma trận EDS ($2K \times 2K$) được ánh xạ về ô mạng $(r_{\text{net}}, c_{\text{net}})$ với:
+  $$r_{\text{net}} = r \bmod R_{\text{net}}, \qquad c_{\text{net}} = \left\lfloor \frac{c}{2K / C_{\text{net}}} \right\rfloor$$
+- Một ô mạng $(r_{\text{net}}, c_{\text{net}})$ có thể chứa $M \ge 1$ Store Nodes cùng đóng vai trò **Custody Nodes** (mỗi node có `PeerID` và khóa Ed25519 riêng biệt).
+- Nếu một ô mạng bị trống ($M = 0$) hoặc chỉ còn $1$ node duy nhất ($M = 1$) do node rời mạng/sự cố, hệ thống tự động mượn **1 Borrowed Backup Custody Node** từ ô mạng kế cận $((r_{\text{net}} + 1) \bmod R_{\text{net}})$ trong cùng cột thông qua bảng định tuyến động `row_custody_map`.
+
+### Dual-Channel Row GossipSub (`TopicCellRowSeed` & `TopicCellRowRecode`)
+Mỗi hàng mạng $r_{\text{net}}$ trong cột $c_{\text{net}}$ sử dụng **2 kênh GossipSub tách biệt**:
+1. **Kênh Seed (`TopicCellRowSeed`) — `/cda/1.0.0/col/<netCol>/row/<netRow>/seed`**:
+   - Dành riêng cho **Bootstrap Node** phát tán bể hạt giống (Seed Pool) gồm $S_{\text{pool}} = 2 \cdot k_{\text{piece}}$ mảnh RLNC cho mỗi ô dữ liệu $[r, c]$ thuộc hàng mạng $r_{\text{net}}$.
+   - **Chỉ các Custody Store Nodes** được phân công bảo chứng cho hàng $r_{\text{net}}$ (bao gồm cả Native Custody và Borrowed Backup) mới subscribe vào kênh này.
+   - **Lấy mẫu ngẫu nhiên (Randomized Seed Sub-Sampling)**: Từ bể $2 \cdot k_{\text{piece}}$ mảnh trên kênh Seed, mỗi Custody Node tự lấy ngẫu nhiên (shuffle theo `PeerID`, `blockID`, `row`, `col`) một tập con gồm:
+     $$S_{\text{node}} = \max\left(2, \left\lceil \frac{2 \cdot k_{\text{piece}}}{M} \right\rceil\right)$$
+     mảnh để tránh trùng lặp bộ seed giữa các node trong cùng ô mạng.
+2. **Kênh Recode (`TopicCellRowRecode`) — `/cda/1.0.0/col/<netCol>/row/<netRow>/recode`**:
+   - Dành cho các **Custody Store Nodes** phát tán các mảnh đã tái mã hóa (Recoded RLNC Pieces).
+   - **Toàn bộ các Store Nodes trong cột $c_{\text{net}}$** (cả Custody Nodes cùng ô mạng lẫn Non-Custody Nodes ở các hàng mạng khác) đều subscribe vào kênh này.
+   - Mỗi Custody Node phát tán một hạn ngạch (Quota) gồm:
+     $$Q = \max\left(1, \left\lceil \frac{k_{\text{piece}}}{M} \right\rceil\right) + 1$$
+     mảnh recode lên kênh `TopicCellRowRecode`.
+
+### Custody Storage, Borrowed Backup Pruning & Non-Custody Re-Mixing
+- **Native Custody Nodes (Full Rank Quorum)**:
+  Thu thập mảnh từ `TopicCellRowSeed` và trao đổi mảnh recode với các node cùng ô trên `TopicCellRowRecode` cho đến khi tích lũy đủ **Full Rank**:
   $$\text{Rank}(\text{Stored Pieces for } [r, c]) \ge k_{\text{piece}}$$
-  Nghĩa là node đã lưu trữ ít nhất $k_{\text{piece}}$ mảnh RLNC độc lập tuyến tính với nhau.
+  và giữ nguyên $k_{\text{piece}}$ mảnh độc lập tuyến tính để lưu trữ dài hạn.
+- **Borrowed Backup Custody Nodes (Immediate Pruning)**:
+  Tham gia nhận seed và phát đủ hạn ngạch $Q$ mảnh recode lên `TopicCellRowRecode`, sau đó **cắt tỉa (prune) ngay lập tức** các mảnh thô về đúng **1 mảnh recode** (trừ trường hợp cột mạng quá thưa với `activePeersInCol <= kPiece` thì giữ nguyên $k_{\text{piece}}$ mảnh để đảm bảo khả năng khôi phục cột).
+- **Non-Custody Store Nodes (Hierarchical RLNC Re-Mixing)**:
+  Chỉ lắng nghe trên `TopicCellRowRecode`. Khi thu thập được $\ge 2$ mảnh độc lập tuyến tính từ $\ge 2$ nguồn (`minSources >= 2`), node thực hiện **Recode lần 2** (`RecodePiecesWithVerify`) để sinh ra **1 mảnh RLNC mới** có độ độc lập tuyến tính cao hơn rồi khóa ô (`nonCustodyLocked`) và xóa mảnh tạm. Nếu hết thời gian chờ ngắn mà chỉ nhận được 1 mảnh, node lưu trực tiếp 1 mảnh đó và khóa ô để không làm chậm tiến độ hoàn thành khối.
 
 ### CDA BlockReady
-- Tín hiệu sự kiện phát ra từ CDA Publisher / Bootstrap Relay khi toàn bộ các Store Nodes trong mạng đã đạt 100% quorum lưu ký custody cho khối.
+- Tín hiệu sự kiện phát ra từ CDA Publisher / Bootstrap Relay khi toàn bộ các hàng mạng `0 .. NetRows-1` trong các cột mạng hoạt động đã có ít nhất một Custody Store Node hoàn thành lưu ký (`StoreReady`) cho khối.
 - Đánh dấu khối đã sẵn sàng khả dụng dữ liệu để các Light Clients bắt đầu lấy mẫu kiểm chứng.
 
 ### DAS (Data Availability Sampling)

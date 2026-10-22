@@ -36,14 +36,10 @@ func (pg *ProofGenerator) GenerateColumnProofs(colIdx int, columnData [][]byte) 
 
 	// Fast-path: FK20 via GnarkKZG
 	if gnarkKZG, ok := pg.kzg.(*cda.GnarkKZG); ok {
-		// Ensure FK20 engine is initialized for domain size n
-		if gnarkKZG.FK20() == nil || gnarkKZG.FK20().Domain().Cardinality != uint64(n) {
-			if err := gnarkKZG.InitFK20(n); err != nil {
-				return nil, fmt.Errorf("failed to initialize FK20 engine for size %d: %w", n, err)
-			}
+		engine, err := gnarkKZG.GetOrInitFK20(n)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize FK20 engine for size %d: %w", n, err)
 		}
-
-		engine := gnarkKZG.FK20()
 		if engine != nil {
 			cellSize := len(columnData[0])
 			pieceSize := cellSize / pg.k

@@ -15,8 +15,10 @@ import base64
 import concurrent.futures
 import json
 import os
+import queue
 import random
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -66,7 +68,10 @@ def broadcast_tx_batch(cometbft_rpc, txs, max_workers=32, timeout=30):
         tx_res = res.get("result", {})
         code = tx_res.get("code", 0)
         if code != 0:
-            raise RuntimeError(f"CheckTx rejected tx with code {code}: {tx_res.get('log')}")
+            log_msg = str(tx_res.get('log', ''))
+            if "mempool is full" in log_msg.lower():
+                raise RuntimeError("MempoolIsFull")
+            raise RuntimeError(f"CheckTx rejected tx with code {code}: {log_msg}")
         return tx_res.get("hash", "")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -79,7 +84,10 @@ def broadcast_tx_batch(cometbft_rpc, txs, max_workers=32, timeout=30):
             tx_res = res.get("result", {})
             code = tx_res.get("code", 0)
             if code != 0:
-                raise RuntimeError(f"CheckTx rejected tx with code {code}: {tx_res.get('log')}")
+                log_msg = str(tx_res.get('log', ''))
+                if "mempool is full" in log_msg.lower():
+                    raise RuntimeError("MempoolIsFull")
+                raise RuntimeError(f"CheckTx rejected tx with code {code}: {log_msg}")
             last_tx_hash = tx_res.get("hash", "")
     return last_tx_hash
 
@@ -188,6 +196,117 @@ def fetch_publisher_block_info(publisher_url, block_id, max_retries=20):
     return None
 
 
+def run_stream_mode(args):
+    stop_event = threading.Event()
+    last_block_time = time.time()
+    blocks_committed = 0
+    total_txs_in_blocks = 0
+    cda_blocks_ready = 0
+
+    def chain_monitor_worker():
+        nonlocal last_block_time, blocks_committed, total_txs_in_blocks, cda_blocks_ready
+        last_h = 0
+        last_cda_block = ""
+        while not stop_event.is_set():
+            try:
+                st = http_get_json(f"{args.cometbft}/status", timeout=2)
+                cur_h = int(st.get("result", {}).get("sync_info", {}).get("latest_block_height", 0))
+                if last_h == 0:
+                    last_h = cur_h
+                elif cur_h > last_h:
+                    now = time.time()
+                    dur = now - last_block_time
+                    last_block_time = now
+                    for h in range(last_h + 1, cur_h + 1):
+                        blk = http_get_json(f"{args.cometbft}/block?height={h}", timeout=2)
+                        tx_list = blk.get("result", {}).get("block", {}).get("data", {}).get("txs") or []
+                        n_tx = len(tx_list)
+                        blocks_committed += 1
+                        total_txs_in_blocks += n_tx
+                        print(f"  📦 [CometBFT] Block #{h} committed ({n_tx} txs) in {dur:.2f}s")
+                    last_h = cur_h
+            except Exception:
+                pass
+
+            try:
+                cda = http_get_json(f"{args.bootstrap}/block-ready/latest", timeout=2)
+                if cda and cda.get("block_id"):
+                    b_id = cda.get("block_id")
+                    if b_id != last_cda_block:
+                        last_cda_block = b_id
+                        h = cda.get("height", 0)
+                        k = cda.get("k", 0)
+                        cda_blocks_ready += 1
+                        print(f"  🎉 [CDA Ready] {b_id} (Height #{h}) reached BlockReady | K={k}")
+            except Exception:
+                pass
+
+            time.sleep(0.3)
+
+    if args.watch:
+        mon_thread = threading.Thread(target=chain_monitor_worker, daemon=True)
+        mon_thread.start()
+
+    batch_idx = 0
+    total_submitted = 0
+    start_time = time.time()
+    print(f"\n🚀 Continuous Transaction Stream active. Submitting batches of {args.tx_count} txs...")
+    print(f"   (Press Ctrl+C to stop streaming at any time)\n")
+
+    try:
+        while True:
+            batch_idx += 1
+            if args.batches > 0 and batch_idx > args.batches:
+                break
+
+            txs = generate_transactions(args.tx_count, payload_size=args.payload_size, tx_format=args.tx_format, cell_size=args.cell_size)
+            total_bytes = sum(len(tx) for tx in txs)
+
+            t_bcast = time.time()
+            submitted = False
+            while not submitted and not stop_event.is_set():
+                try:
+                    broadcast_tx_batch(args.cometbft, txs, max_workers=args.workers, timeout=30)
+                    dur_bcast = time.time() - t_bcast
+                    total_submitted += len(txs)
+                    submitted = True
+                except RuntimeError as e:
+                    if "MempoolIsFull" in str(e):
+                        print(f"  ⚠️ CometBFT Mempool is full (5000 limit), waiting 0.3s for block clearance...")
+                        time.sleep(0.3)
+                    else:
+                        print(f"  ❌ Broadcast error: {e}")
+                        time.sleep(0.5)
+                        break
+                except Exception as e:
+                    print(f"  ❌ Broadcast error: {e}")
+                    time.sleep(0.5)
+                    break
+
+            if not submitted:
+                continue
+
+            rate = len(txs) / max(0.001, dur_bcast)
+            overall_rate = total_submitted / max(0.001, time.time() - start_time)
+            print(f"[Batch #{batch_idx:04d}] Broadcast {len(txs)} txs ({total_bytes / 1024:.1f} KB) in {dur_bcast:.3f}s ({rate:.0f} tx/s) | Total: {total_submitted} txs (avg {overall_rate:.0f} tx/s)")
+
+            if args.interval > 0:
+                time.sleep(args.interval)
+
+    except KeyboardInterrupt:
+        print("\n\n🛑 Stream stopped by user.")
+    finally:
+        stop_event.set()
+
+    elapsed = time.time() - start_time
+    print("\n" + "=" * 80)
+    print(f"STREAM SUMMARY: {batch_idx - 1} batches ({total_submitted} transactions) in {elapsed:.1f}s")
+    print(f"Average Ingestion Rate : {total_submitted / max(0.001, elapsed):.1f} tx/s")
+    if args.watch:
+        print(f"Observed Activity      : {blocks_committed} blocks committed ({total_txs_in_blocks} txs included), {cda_blocks_ready} CDA blocks ready")
+    print("=" * 80)
+
+
 def main():
     parser = argparse.ArgumentParser(description="CDA Network - CometBFT Transaction Submitter Bot")
     parser.add_argument("--cometbft", type=str, default="http://localhost:26657", help="CometBFT RPC endpoint")
@@ -197,21 +316,34 @@ def main():
     parser.add_argument("--payload-size", type=int, default=512, help="Payload data bytes per transaction (default: 512)")
     parser.add_argument("--cell-size", type=int, default=512, help="Cell size in bytes (default: 512)")
     parser.add_argument("--tx-format", type=str, default="kv", choices=["kv", "raw_hex"], help="Tx format: 'kv' (key=value) or 'raw_hex' (512B cell)")
-    parser.add_argument("--interval", type=float, default=2.0, help="Interval between batches in seconds (default: 2.0)")
+    parser.add_argument("--interval", type=float, default=2.0, help="Interval between batches in seconds (default: 2.0; set to 0.0 for continuous consecutive blocks)")
     parser.add_argument("--batches", type=int, default=0, help="Number of batches to submit (0 = continuous, default: 0)")
     parser.add_argument("--workers", type=int, default=32, help="Concurrency workers for broadcasting (default: 32)")
-    parser.add_argument("--wait-cda", action="store_true", default=True, help="Wait for CDA BlockReady before next batch")
+    parser.add_argument("--stream", "--continuous", dest="stream", action="store_true", default=False, help="Continuous streaming mode: injects transactions continuously into CometBFT without waiting for block commits")
+    parser.add_argument("--no-wait-commit", dest="stream", action="store_true", help="Alias for --stream: do not wait for block commit before submitting next transactions")
+    parser.add_argument("--watch", action=argparse.BooleanOptionalAction, default=True, help="Enable background monitoring of committed blocks and CDA readiness in stream mode")
+    parser.add_argument("--wait-cda", action=argparse.BooleanOptionalAction, default=True, help="Wait for CDA BlockReady (use --no-wait-cda to skip entirely)")
+    parser.add_argument("--pipeline", action="store_true", default=False, help="Enable pipelined continuous submission: submits txs consecutively without blocking on CDA BlockReady in the foreground")
+    parser.add_argument("--max-in-flight", type=int, default=2, help="Maximum in-flight blocks in CDA pipeline before throttling in pipeline mode (default: 2, 0=unlimited)")
     args = parser.parse_args()
+
+    mode_str = "CONTINUOUS STREAM (Non-blocking tx injection)" if args.stream else (
+        f"PIPELINED (Max in-flight: {args.max_in_flight})" if args.pipeline else "SYNCHRONOUS (Wait commit & CDA)"
+    )
 
     print("=" * 80)
     print("CDA NETWORK - COMETBFT TRANSACTION SUBMITTER BOT")
     print(f"CometBFT RPC    : {args.cometbft}")
     print(f"CDA Publisher   : {args.publisher}")
     print(f"CDA Bootstrap   : {args.bootstrap}")
+    print(f"Submission Mode : {mode_str}")
     print(f"Tx Count / Batch: {args.tx_count}")
     print(f"Payload / Tx    : {args.payload_size} bytes ({args.tx_format} format)")
     print(f"Cell Size       : {args.cell_size} bytes")
     print(f"Batch Interval  : {args.interval}s")
+    if not args.stream:
+        print(f"Pipelined Mode  : {'ENABLED (Max in-flight: ' + str(args.max_in_flight) + ')' if args.pipeline else 'DISABLED (Synchronous foreground wait)'}")
+        print(f"Wait CDA Ready  : {args.wait_cda}")
     print(f"Total Batches   : {'Continuous (Infinite)' if args.batches == 0 else args.batches}")
     print("=" * 80)
 
@@ -224,6 +356,46 @@ def main():
     except Exception as e:
         print(f"❌ Cannot connect to CometBFT at {args.cometbft}: {e}")
         sys.exit(1)
+
+    if args.stream:
+        run_stream_mode(args)
+        return
+
+    cda_queue = queue.Queue()
+    in_flight_cond = threading.Condition()
+    in_flight_count = 0
+    cda_completed_count = 0
+    cda_error_count = 0
+
+    def cda_monitor_worker():
+        nonlocal in_flight_count, cda_completed_count, cda_error_count
+        while True:
+            item = cda_queue.get()
+            if item is None:
+                cda_queue.task_done()
+                break
+            b_id, t_start, exp_k, b_idx, h = item
+            ready, dur_cda, ready_k = wait_for_block_ready(args.bootstrap, b_id, timeout=120)
+            tot_dur = time.time() - t_start
+            if ready:
+                cda_completed_count += 1
+                k_fin = ready_k
+                if k_fin <= 0:
+                    info = fetch_publisher_block_info(args.publisher, b_id, max_retries=3)
+                    k_fin = info['k'] if info else exp_k
+                print(f"  🎉 [BLOCK_COMPLETED] {b_id} (Height #{h}, Batch #{b_idx}) reached CDA BlockReady in {dur_cda:.3f}s | K={k_fin} | Total Batch Time: {tot_dur:.3f}s")
+            else:
+                cda_error_count += 1
+                print(f"  ⚠️ Timeout waiting for CDA BlockReady for {b_id} (Height #{h}, Batch #{b_idx}) after {dur_cda:.3f}s")
+
+            with in_flight_cond:
+                in_flight_count -= 1
+                in_flight_cond.notify_all()
+            cda_queue.task_done()
+
+    if args.wait_cda and args.pipeline:
+        monitor_thread = threading.Thread(target=cda_monitor_worker, daemon=True)
+        monitor_thread.start()
 
     batch_idx = 0
     total_submitted = 0
@@ -250,7 +422,7 @@ def main():
                 total_submitted += len(txs)
             except Exception as e:
                 print(f"  ❌ Broadcast failed: {e}")
-                time.sleep(args.interval)
+                time.sleep(args.interval if args.interval > 0 else 0.5)
                 continue
 
             # 2. Query CometBFT to discover block height
@@ -262,22 +434,27 @@ def main():
                 print(f"  ✅ CometBFT committed into Height #{height} ({block_id}) | Consensus Latency: {dur_consensus:.3f}s")
             except Exception as e:
                 print(f"  ❌ Tx commit timeout: {e}")
-                time.sleep(args.interval)
+                time.sleep(args.interval if args.interval > 0 else 0.5)
                 continue
 
-            # 3. Query Publisher for CDA dynamic parameters
-            info = fetch_publisher_block_info(args.publisher, block_id)
-            k_str = f"K={info['k']} (ODS: {info['k']}x{info['k']}, EDS: {info['n']}x{info['n']})" if info else "K=Dynamic"
-
-            # 4. Wait for CDA Network BlockReady
+            # 3. Wait for CDA Network BlockReady
             if args.wait_cda:
-                ready, dur_cda, ready_k = wait_for_block_ready(args.bootstrap, block_id, timeout=120)
-                total_dur = time.time() - t_batch_start
-                if ready:
-                    k_final = ready_k if ready_k > 0 else (info['k'] if info else 'Dynamic')
-                    print(f"  🎉 [BLOCK_COMPLETED] {block_id} reached CDA BlockReady in {dur_cda:.3f}s | K={k_final} | Total Batch Time: {total_dur:.3f}s")
+                if args.pipeline:
+                    with in_flight_cond:
+                        if args.max_in_flight > 0:
+                            while in_flight_count >= args.max_in_flight:
+                                in_flight_cond.wait(timeout=0.2)
+                        in_flight_count += 1
+                    cda_queue.put((block_id, t_batch_start, expected_k, batch_idx, height))
                 else:
-                    print(f"  ⚠️ Timeout waiting for CDA BlockReady for {block_id} after {dur_cda:.3f}s")
+                    ready, dur_cda, ready_k = wait_for_block_ready(args.bootstrap, block_id, timeout=120)
+                    total_dur = time.time() - t_batch_start
+                    info = fetch_publisher_block_info(args.publisher, block_id, max_retries=5)
+                    k_fin = ready_k if ready_k > 0 else (info['k'] if info else expected_k)
+                    if ready:
+                        print(f"  🎉 [BLOCK_COMPLETED] {block_id} reached CDA BlockReady in {dur_cda:.3f}s | K={k_fin} | Total Batch Time: {total_dur:.3f}s")
+                    else:
+                        print(f"  ⚠️ Timeout waiting for CDA BlockReady for {block_id} after {dur_cda:.3f}s")
 
             # 5. Sleep interval before next batch
             if args.interval > 0:
@@ -286,9 +463,15 @@ def main():
     except KeyboardInterrupt:
         print("\nBot stopped by user.")
 
+    if args.wait_cda and args.pipeline and not cda_queue.empty():
+        print(f"\n[Pipelined Submission Finished] Waiting for remaining in-flight CDA blocks to complete...")
+        cda_queue.join()
+
     elapsed = time.time() - start_time
     print("\n" + "=" * 80)
     print(f"Summary: {batch_idx - 1} batches ({total_submitted} total transactions) submitted in {elapsed:.1f}s")
+    if args.wait_cda and args.pipeline:
+        print(f"CDA Verification: {cda_completed_count} blocks completed, {cda_error_count} timeouts")
     print("=" * 80)
 
 

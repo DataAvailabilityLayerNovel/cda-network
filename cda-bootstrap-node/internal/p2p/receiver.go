@@ -20,7 +20,6 @@ import (
 
 	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
-	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/rlnc"
 	"github.com/dgraph-io/badger/v4"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -52,7 +51,10 @@ type Receiver struct {
 	peersMu      sync.RWMutex
 	activePeers  map[peer.ID]p2pcommon.PeerInfo
 	lastSeenPeer map[peer.ID]time.Time
+	colID        int
+	kBlock       int
 	netRows      int
+	netCols      int
 	peerTTL      time.Duration
 
 	pruneEnable bool
@@ -63,6 +65,9 @@ type Receiver struct {
 	pipelineCond            *sync.Cond
 	latestCompletedHeight   int
 	currentDispatchedHeight int
+	prevDispatchedHeight    int
+	dispatchedDeadline      time.Time
+	phase2Sem               chan struct{}
 }
 
 func NewReceiver(
@@ -84,6 +89,8 @@ func NewReceiver(
 		kzg:           kzg,
 		publisherAddr: publisherAddr,
 		k:             k,
+		colID:         colID,
+		kBlock:        16,
 		cache:         cache,
 		proofGen:      proofGen,
 		encoder:       encoder,
@@ -92,9 +99,11 @@ func NewReceiver(
 		activePeers:   make(map[peer.ID]p2pcommon.PeerInfo),
 		lastSeenPeer:  make(map[peer.ID]time.Time),
 		netRows:       getEnvInt("CDA_NET_ROWS", 8),
+		netCols:       getEnvInt("CDA_NET_COLS", 8),
 		peerTTL:       15 * time.Second,
 		pruneEnable:   pruneEnable,
 		pruneTTL:      pruneTTL,
+		phase2Sem:     make(chan struct{}, getEnvInt("BOOTSTRAP_PHASE2_CONCURRENCY", 4)),
 	}
 	rcv.pipelineCond = sync.NewCond(&rcv.pipelineMu)
 	// Connect broadcaster back to registry
@@ -142,8 +151,8 @@ func NewReceiver(
 	return rcv
 }
 
-// SetNetworkMatrixConfig configures the network row dimension and peer heartbeat expiry TTL.
-func (rcv *Receiver) SetNetworkMatrixConfig(netRows int, peerTTL time.Duration) {
+// SetNetworkMatrixConfig configures the network row/col dimensions and peer heartbeat expiry TTL.
+func (rcv *Receiver) SetNetworkMatrixConfig(netRows int, peerTTL time.Duration, netColsAndK ...int) {
 	rcv.peersMu.Lock()
 	defer rcv.peersMu.Unlock()
 	if netRows > 0 {
@@ -152,6 +161,36 @@ func (rcv *Receiver) SetNetworkMatrixConfig(netRows int, peerTTL time.Duration) 
 	if peerTTL > 0 {
 		rcv.peerTTL = peerTTL
 	}
+	if len(netColsAndK) > 0 && netColsAndK[0] > 0 {
+		rcv.netCols = netColsAndK[0]
+	}
+	if len(netColsAndK) > 1 && netColsAndK[1] > 0 {
+		rcv.kBlock = netColsAndK[1]
+	}
+}
+
+func (rcv *Receiver) getNetColIdx(colIdx int, n int) int {
+	rcv.peersMu.RLock()
+	netCols := rcv.netCols
+	kBlock := rcv.kBlock
+	rcv.peersMu.RUnlock()
+	if netCols <= 0 {
+		netCols = 8
+	}
+	if n <= 0 {
+		if kBlock <= 0 {
+			kBlock = 16
+		}
+		n = 2 * kBlock
+	}
+	colsPerNetCol := n / netCols
+	if colsPerNetCol <= 0 {
+		colsPerNetCol = 1
+	}
+	if colIdx >= netCols || (colsPerNetCol > 1 && colIdx%colsPerNetCol == 0 && colIdx >= colsPerNetCol) {
+		return colIdx / colsPerNetCol
+	}
+	return colIdx / colsPerNetCol
 }
 
 func (rcv *Receiver) Close() error {
@@ -165,6 +204,21 @@ func (rcv *Receiver) Close() error {
 func (rcv *Receiver) Start(ctx context.Context) {
 	rcv.host.SetStreamHandler(p2pcommon.ProtoPublisherPush, rcv.handleReceiveColumn)
 	rcv.host.SetStreamHandler(p2pcommon.ProtoBootstrapRouting, rcv.handleRouting)
+
+	// Pre-join GossipSub TopicCellRowSeed channels for this Bootstrap's network column
+	rcv.peersMu.RLock()
+	netRows := rcv.netRows
+	kBlock := rcv.kBlock
+	colID := rcv.colID
+	rcv.peersMu.RUnlock()
+	if netRows <= 0 {
+		netRows = 8
+	}
+	if colID < 0 {
+		colID = 0
+	}
+	netColIdx := rcv.getNetColIdx(colID, 2*kBlock)
+	rcv.broadcaster.JoinSeedTopics(netColIdx, netRows)
 
 	// Periodically clean up stale peers (older than peerTTL, default 15s)
 	go func() {
@@ -317,6 +371,16 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 	go func() {
 		log.Printf("[Height: %d] [P2P] Starting Phase 2 Async: computing proofs and seeding RLNC pieces for Column %d", height, colIdx)
 
+		if rcv.phase2Sem != nil {
+			rcv.phase2Sem <- struct{}{}
+		}
+		releasePhase2Sem := sync.OnceFunc(func() {
+			if rcv.phase2Sem != nil {
+				<-rcv.phase2Sem
+			}
+		})
+		defer releasePhase2Sem()
+
 		// Generate KZG Opening Proofs for Column
 		start := time.Now()
 		proofs, err := rcv.proofGen.GenerateColumnProofs(colIdx, columnData)
@@ -355,40 +419,39 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 		if workerLimit <= 0 {
 			workerLimit = 1
 		}
-		encodeSem := make(chan struct{}, workerLimit)
 
-		for r := 0; r < n; r++ {
-			encodeSem <- struct{}{}
+		for w := 0; w < workerLimit; w++ {
 			encodeWg.Add(1)
-			go func(rowIdx int) {
+			go func(workerID int) {
 				defer encodeWg.Done()
-				defer func() { <-encodeSem }()
+				for rowIdx := workerID; rowIdx < n; rowIdx += workerLimit {
+					targetNetRow := rowIdx % netRows
+					custodyPeers := custodyMap[targetNetRow]
+					totalSeeds, _, _ := p2pcommon.ComputeSeedingPlan(len(custodyPeers), rcv.k)
+					if overrideSeeds > totalSeeds {
+						totalSeeds = overrideSeeds
+					}
 
-				targetNetRow := rowIdx % netRows
-				custodyPeers := custodyMap[targetNetRow]
-				totalSeeds, _, _ := p2pcommon.ComputeSeedingPlan(len(custodyPeers), rcv.k)
-				if overrideSeeds > totalSeeds {
-					totalSeeds = overrideSeeds
+					codedPieces, err := rcv.encoder.EncodeRowNSeeds(rowIdx, colIdx, columnData, proofs[rowIdx], totalSeeds)
+					if err != nil {
+						encodeErrOnce.Do(func() {
+							encodeErr = fmt.Errorf("async RLNC encoding error for row %d (col %d): %w", rowIdx, colIdx, err)
+						})
+						return
+					}
+					piecesByRow[rowIdx] = codedPieces
 				}
-
-				codedPieces, err := rcv.encoder.EncodeRowNSeeds(rowIdx, colIdx, columnData, proofs[rowIdx], totalSeeds)
-				if err != nil {
-					encodeErrOnce.Do(func() {
-						encodeErr = fmt.Errorf("async RLNC encoding error for row %d (col %d): %w", rowIdx, colIdx, err)
-					})
-					return
-				}
-				piecesByRow[rowIdx] = codedPieces
-			}(r)
+			}(w)
 		}
 		encodeWg.Wait()
+		releasePhase2Sem()
 
 		if encodeErr != nil {
 			log.Printf("[Height: %d] %v", height, encodeErr)
 			return
 		}
 
-		var precomputedPieces []precomputedPiece
+		precomputedPieces := make([]precomputedPiece, 0, n*2*rcv.k)
 		for row := 0; row < n; row++ {
 			for pieceIdx, piece := range piecesByRow[row] {
 				precomputedPieces = append(precomputedPieces, precomputedPiece{
@@ -405,25 +468,22 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 		// Sequential Completion Gate: Wait until store nodes complete the PREVIOUS in-flight block before dispatching.
 		rcv.pipelineMu.Lock()
 		if height > rcv.currentDispatchedHeight {
-			prevHeight := rcv.currentDispatchedHeight
-			if prevHeight > 0 && prevHeight > rcv.latestCompletedHeight {
-				log.Printf("[Height: %d] [Bootstrap Pipeline] Pre-computed buffer ready! Waiting for in-flight block-%d to complete before dispatching...",
-					height, prevHeight)
-				deadline := time.Now().Add(3 * time.Second)
-				for rcv.latestCompletedHeight < prevHeight && time.Now().Before(deadline) {
-					rcv.pipelineMu.Unlock()
-					time.Sleep(20 * time.Millisecond)
-					rcv.pipelineMu.Lock()
-				}
-				if rcv.latestCompletedHeight < prevHeight {
-					log.Printf("[Height: %d] [Bootstrap Pipeline] Warning: Safety timeout reached waiting for block-%d. Proceeding with block-%d dispatch.",
-						height, prevHeight, height)
-				} else {
-					log.Printf("[Height: %d] [Bootstrap Pipeline] In-flight block-%d finished! Instantly dispatching pre-computed seeds for block-%d...",
-						height, prevHeight, height)
-				}
-			}
+			rcv.prevDispatchedHeight = rcv.currentDispatchedHeight
 			rcv.currentDispatchedHeight = height
+			rcv.dispatchedDeadline = time.Now().Add(8 * time.Second)
+			if rcv.prevDispatchedHeight > 0 && rcv.prevDispatchedHeight > rcv.latestCompletedHeight {
+				log.Printf("[Height: %d] [Bootstrap Pipeline] Pre-computed buffer ready! Waiting for in-flight block-%d to complete before dispatching...",
+					height, rcv.prevDispatchedHeight)
+			}
+		}
+		prevHeight := rcv.prevDispatchedHeight
+		deadline := rcv.dispatchedDeadline
+		if height == rcv.currentDispatchedHeight && prevHeight > 0 && prevHeight > rcv.latestCompletedHeight {
+			for rcv.latestCompletedHeight < prevHeight && time.Now().Before(deadline) {
+				rcv.pipelineMu.Unlock()
+				time.Sleep(20 * time.Millisecond)
+				rcv.pipelineMu.Lock()
+			}
 		}
 		rcv.pipelineMu.Unlock()
 
@@ -432,18 +492,11 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 			log.Printf("[Height: %d] Failed to broadcast anchor for Column %d: %v", height, colIdx, err)
 		}
 
-		// Group precomputed pieces by target Store Node
-		nodeBatches := make(map[string][]p2pcommon.BinarySeedPiece)
-		nodePeers := make(map[string]p2pcommon.PeerInfo)
-
+		// Group precomputed 2*kPiece seed pools by network row (netRow = item.row % netRows)
+		// and publish each pool onto TopicCellRowSeed(netColIdx, netRow).
+		rowSeedPools := make(map[int][]p2pcommon.BinarySeedPiece, netRows)
 		for _, item := range precomputedPieces {
-			peers := rcv.GetPeersForCell(item.row, colIdx, item.pieceIdx)
-			if len(peers) == 0 {
-				continue
-			}
-			targetPeer := peers[0]
-			nodePeers[targetPeer.PeerID] = targetPeer
-
+			targetNetRow := item.row % netRows
 			seedReq := p2pcommon.BinarySeedPiece{
 				Row:    uint16(item.row),
 				Col:    uint16(colIdx),
@@ -451,53 +504,52 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 				Coeffs: item.piece.Data.Coeffs,
 				Proof:  item.piece.Proof,
 			}
-			nodeBatches[targetPeer.PeerID] = append(nodeBatches[targetPeer.PeerID], seedReq)
+			rowSeedPools[targetNetRow] = append(rowSeedPools[targetNetRow], seedReq)
 		}
 
-		// Dispatch batches concurrently to each store node
+		netColIdx := rcv.getNetColIdx(colIdx, n)
+		latestCustodyMap, _, _ := rcv.getCustodySnapshot()
+
 		var wg sync.WaitGroup
 		seedingLimit := getEnvInt("BOOTSTRAP_SEEDING_SEM", 128)
 		sem := make(chan struct{}, seedingLimit)
-		chunkSize := getEnvInt("BOOTSTRAP_BATCH_CHUNK_SIZE", 256)
-		for peerID, seeds := range nodeBatches {
-			targetPeer := nodePeers[peerID]
+		for targetNetRow, sList := range rowSeedPools {
+			if len(sList) == 0 {
+				continue
+			}
 			wg.Add(1)
 			sem <- struct{}{}
-			go func(tp p2pcommon.PeerInfo, sList []p2pcommon.BinarySeedPiece) {
+			go func(nRow int, seeds []p2pcommon.BinarySeedPiece) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				// Chunks of seeds per batch stream
-				for i := 0; i < len(sList); i += chunkSize {
-					end := i + chunkSize
-					if end > len(sList) {
-						end = len(sList)
-					}
-					batchReq := p2pcommon.BinaryBatchSeedRequest{
-						BlockID:      payload.BlockID,
-						ColIdx:       uint16(colIdx),
-						PieceCommits: pieceCommits,
-						Seeds:        sList[i:end],
-						SenderPeerID: rcv.host.ID().String(),
-					}
-					if err := rcv.broadcaster.BroadcastBinaryBatchPieces(tp, batchReq); err != nil {
-						log.Printf("[Height: %d] Fallback: broadcast binary batch to %s failed: %v. Sending individually...", height, tp.PeerID, err)
-						for _, s := range sList[i:end] {
-							pc := cda.ReceivedPiece{
-								Row:   int(s.Row),
-								Col:   int(s.Col),
-								Data:  rlnc.PieceData{Data: s.Data, Coeffs: s.Coeffs},
-								Proof: cda.OpeningProof(s.Proof),
-							}
-							_ = rcv.broadcaster.BroadcastPiece(payload.BlockID, int(s.Row), colIdx, 0, &pc, pieceCommits)
-						}
+				batchReq := p2pcommon.BinaryBatchSeedRequest{
+					BlockID:      payload.BlockID,
+					ColIdx:       uint16(colIdx),
+					PieceCommits: pieceCommits,
+					Seeds:        seeds,
+					SenderPeerID: rcv.host.ID().String(),
+				}
+
+				custodyPeers := latestCustodyMap[nRow]
+				subCount, err := rcv.broadcaster.BroadcastRowSeedPool(netColIdx, nRow, batchReq)
+				if err == nil && subCount >= len(custodyPeers) && subCount > 0 {
+					log.Printf("[Height: %d] [GossipSub SeedPool] Published %d seeds for Col %d NetRow %d onto %s (%d subscribers)",
+						height, len(seeds), colIdx, nRow, p2pcommon.TopicCellRowSeed(netColIdx, nRow), subCount)
+					return
+				}
+
+				// Fallback if GossipSub GRAFT has not settled for all assigned custody peers on this row topic
+				for _, tp := range custodyPeers {
+					if bErr := rcv.broadcaster.BroadcastBinaryBatchPieces(tp, batchReq); bErr != nil {
+						log.Printf("[Height: %d] Cold-start fallback seed stream to %s (NetRow %d) failed: %v", height, tp.PeerID, nRow, bErr)
 					}
 				}
-			}(targetPeer, seeds)
+			}(targetNetRow, sList)
 		}
 		wg.Wait()
-		log.Printf("[Height: %d] Async Phase 2 finished successfully: seeded %d pieces total across %d store nodes for Column %d",
-			height, len(precomputedPieces), len(nodeBatches), colIdx)
+		log.Printf("[Height: %d] Async Phase 2 finished successfully: published %d seed pool pieces across %d network rows for Column %d",
+			height, len(precomputedPieces), len(rowSeedPools), colIdx)
 	}()
 }
 

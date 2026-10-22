@@ -1,6 +1,7 @@
 package p2pcommon
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -10,6 +11,20 @@ const (
 	// BinarySeedMagic identifies the binary seeding wire protocol
 	BinarySeedMagic uint32 = 0x43444101 // "CDA\x01"
 )
+
+// EncodeBinaryBatchSeed serializes a BinaryBatchSeedRequest into a byte slice for GossipSub TopicCellRowSeed.
+func EncodeBinaryBatchSeed(req *BinaryBatchSeedRequest) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := WriteBinaryBatchSeed(&buf, req); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// DecodeBinaryBatchSeed deserializes a BinaryBatchSeedRequest from a byte slice received on GossipSub TopicCellRowSeed.
+func DecodeBinaryBatchSeed(data []byte) (*BinaryBatchSeedRequest, error) {
+	return ReadBinaryBatchSeed(bytes.NewReader(data))
+}
 
 // BinarySeedPiece represents a raw binary RLNC piece with KZG proof
 type BinarySeedPiece struct {
