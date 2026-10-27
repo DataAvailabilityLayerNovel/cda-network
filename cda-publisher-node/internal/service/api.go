@@ -55,6 +55,10 @@ type APIService struct {
 	blockReadyEmitted     map[string]bool
 	blockK                map[string]int
 	blockStartTime        map[string]time.Time
+
+	rejectedBlocksMu     sync.RWMutex
+	rejectedBlocks       map[string]string // blockID -> reason
+	latestRejectedHeight int64
 }
 
 type HeaderPayload struct {
@@ -124,6 +128,7 @@ func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.Pub
 		blockK:            make(map[string]int),
 		blockStartTime:    make(map[string]time.Time),
 		inFlightBlocks:    make(map[string]int),
+		rejectedBlocks:    make(map[string]string),
 	}
 	svc.publishCond = sync.NewCond(&svc.colReadyMu)
 
@@ -225,6 +230,35 @@ func (s *APIService) SetReconstructor(r *engine.BlockReconstructor) {
 
 func (s *APIService) SetCometBFTRPC(rpc string) {
 	s.cometbftRPC = rpc
+}
+
+func (s *APIService) markBlockRejected(blockID string, height int64, reason string) {
+	s.rejectedBlocksMu.Lock()
+	if s.rejectedBlocks == nil {
+		s.rejectedBlocks = make(map[string]string)
+	}
+	s.rejectedBlocks[blockID] = reason
+	if height > s.latestRejectedHeight {
+		s.latestRejectedHeight = height
+	}
+	s.rejectedBlocksMu.Unlock()
+
+	if s.db != nil {
+		_ = s.db.Update(func(txn *badger.Txn) error {
+			_ = txn.Set([]byte("status_"+blockID), []byte("STATUS_INVALID_REJECTED"))
+			_ = txn.Set([]byte("block_status_"+blockID), []byte("STATUS_INVALID_REJECTED"))
+			_ = txn.Set([]byte(fmt.Sprintf("block_status_height_%d", height)), []byte("STATUS_INVALID_REJECTED"))
+			_ = txn.Set([]byte("reject_reason_"+blockID), []byte(reason))
+			return nil
+		})
+	}
+
+	log.Printf("[Height: %d] [Publisher] 🚫 Block %s REJECTED as STATUS_INVALID_REJECTED: %s. Denying DA BlockReady. Consensus and pipeline continue running.",
+		height, blockID, reason)
+}
+
+func (s *APIService) MarkBlockRejectedForTest(blockID string, height int64, reason string) {
+	s.markBlockRejected(blockID, height, reason)
 }
 
 func (s *APIService) listenStoreReady(sub *pubsub.Subscription) {
@@ -527,12 +561,19 @@ func (s *APIService) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	s.rejectedBlocksMu.RLock()
+	rejCount := len(s.rejectedBlocks)
+	latestRejH := s.latestRejectedHeight
+	s.rejectedBlocksMu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":                  "healthy",
 		"in_flight_count":         inFlight,
 		"latest_published_height": pubH,
 		"latest_completed_height": completedH,
+		"latest_rejected_height":  latestRejH,
+		"rejected_count":          rejCount,
 		"active_cols":             s.activeCols,
 		"num_cols":                s.numCols,
 		"default_k":               s.kVal,
@@ -639,6 +680,8 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := VerifySignature(req.BlockID, req.Data, req.Signature, s.sequencerPubKey); err != nil {
+			log.Printf("[Publisher] Signature verification failed for block %s: %v", req.BlockID, err)
+			s.markBlockRejected(req.BlockID, req.Height, "Signature verification failed: "+err.Error())
 			http.Error(w, "Signature verification failed: "+err.Error(), http.StatusUnauthorized)
 			return
 		}
@@ -784,6 +827,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	if req.Header != nil {
 		if err := VerifyCDAHeader(header, req.Header); err != nil {
 			log.Printf("[Height: %d] [Publisher] Header verification FAILED for BlockID %s: %v", height, req.BlockID, err)
+			s.markBlockRejected(req.BlockID, height, fmt.Sprintf("Header verification failed: %v", err))
 			http.Error(w, "Header verification failed: "+err.Error(), http.StatusUnprocessableEntity)
 			return
 		}
@@ -1557,8 +1601,31 @@ func (s *APIService) handleGetBlockData(w http.ResponseWriter, r *http.Request) 
 
 	k := s.kVal
 	var header *engine.BlockHeader
+
+	s.rejectedBlocksMu.RLock()
+	reason, isRejected := s.rejectedBlocks[blockID]
+	s.rejectedBlocksMu.RUnlock()
+
 	if s.db != nil {
 		_ = s.db.View(func(txn *badger.Txn) error {
+			if !isRejected {
+				if item, err := txn.Get([]byte("block_status_" + blockID)); err == nil {
+					_ = item.Value(func(val []byte) error {
+						if string(val) == "STATUS_INVALID_REJECTED" {
+							isRejected = true
+						}
+						return nil
+					})
+				}
+				if isRejected {
+					if item, err := txn.Get([]byte("reject_reason_" + blockID)); err == nil {
+						_ = item.Value(func(val []byte) error {
+							reason = string(val)
+							return nil
+						})
+					}
+				}
+			}
 			if item, err := txn.Get([]byte("header_" + blockID)); err == nil {
 				_ = item.Value(func(val []byte) error {
 					var h engine.BlockHeader
@@ -1573,6 +1640,16 @@ func (s *APIService) handleGetBlockData(w http.ResponseWriter, r *http.Request) 
 			}
 			return nil
 		})
+	}
+
+	if isRejected {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"block_id": blockID,
+			"height":   height,
+			"status":   "STATUS_INVALID_REJECTED",
+			"error":    reason,
+		})
+		return
 	}
 
 	if header == nil {

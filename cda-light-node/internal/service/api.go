@@ -21,6 +21,7 @@ import (
 	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/rlnc"
+	"github.com/klauspost/reedsolomon"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -59,6 +60,9 @@ type APIService struct {
 	dasQueue       chan string
 	dasTriggeredMu sync.Mutex
 	dasTriggered   map[string]bool
+
+	blacklistMu      sync.RWMutex
+	blacklistedPeers map[string]time.Time
 }
 
 type BlockHeader = p2pcommon.BlockHeader
@@ -104,8 +108,41 @@ func NewAPIService(
 		waitingHeaders: make(map[string]chan struct{}),
 		dasQueue:       make(chan string, 1024),
 		dasTriggered:   make(map[string]bool),
+		blacklistedPeers: make(map[string]time.Time),
 	}
 	return svc
+}
+
+// BlacklistPeer records a peer as isolated for the given duration
+func (s *APIService) BlacklistPeer(peerID string, duration time.Duration) {
+	if peerID == "" {
+		return
+	}
+	s.blacklistMu.Lock()
+	defer s.blacklistMu.Unlock()
+	if s.blacklistedPeers == nil {
+		s.blacklistedPeers = make(map[string]time.Time)
+	}
+	expiry := time.Now().Add(duration)
+	s.blacklistedPeers[peerID] = expiry
+	log.Printf("[LightNode] 🚫 Blacklisted peer %s until %s", peerID, expiry.Format(time.RFC3339))
+}
+
+// IsPeerBlacklisted returns true if the peer is currently blacklisted
+func (s *APIService) IsPeerBlacklisted(peerID string) bool {
+	if peerID == "" {
+		return false
+	}
+	s.blacklistMu.RLock()
+	defer s.blacklistMu.RUnlock()
+	expiry, exists := s.blacklistedPeers[peerID]
+	if !exists {
+		return false
+	}
+	if time.Now().After(expiry) {
+		return false
+	}
+	return true
 }
 
 func (s *APIService) CacheHeader(header *BlockHeader) {
@@ -758,6 +795,12 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 	s.routingCacheMu.RUnlock()
 
 	var recvPieces []cda.ReceivedPiece
+	type originPiece struct {
+		piece        cda.ReceivedPiece
+		sourcePID    string
+		pieceCommits []string
+	}
+	var originPieces []originPiece
 	var queryErrors []string
 	var querySuccess bool
 
@@ -771,6 +814,27 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 		Data        string                 `json:"data,omitempty"`
 		PiecesCount int                    `json:"pieces_count"`
 		Pieces      []p2pcommon.CodedPiece `json:"pieces"`
+	}
+
+	var allCandidateStores []p2pcommon.PeerInfo
+	seenCandidatePID := make(map[string]bool)
+	candNetRows := cachedInfo.netRows
+	if candNetRows <= 0 {
+		candNetRows = 8
+	}
+	if cachedInfo.rowCustodyMap != nil {
+		for _, p := range cachedInfo.rowCustodyMap[row%candNetRows] {
+			if !seenCandidatePID[p.PeerID] {
+				seenCandidatePID[p.PeerID] = true
+				allCandidateStores = append(allCandidateStores, p)
+			}
+		}
+	}
+	for _, p := range activeStores {
+		if !seenCandidatePID[p.PeerID] {
+			seenCandidatePID[p.PeerID] = true
+			allCandidateStores = append(allCandidateStores, p)
+		}
 	}
 
 	maxAttempts := 5
@@ -812,6 +876,10 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 		maxTries := len(shuffledStores)
 		for idx := 0; idx < maxTries; idx++ {
 			selectedStore := shuffledStores[idx]
+			if s.IsPeerBlacklisted(selectedStore.PeerID) {
+				p2pcommon.LogDebug("[DAS] Skipping blacklisted store node %s", selectedStore.PeerID)
+				continue
+			}
 			storePID, err := peer.Decode(selectedStore.PeerID)
 			if err != nil {
 				queryErrors = append(queryErrors, fmt.Sprintf("invalid store Peer ID %s: %v", selectedStore.PeerID, err))
@@ -898,7 +966,7 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 				}
 
 				if verifier.IsLinearlyIndependent(existingCoeffs, decCoeffs, targetK) {
-					recvPieces = append(recvPieces, cda.ReceivedPiece{
+					newPiece := cda.ReceivedPiece{
 						Row: p.Row,
 						Col: p.Col,
 						Data: rlnc.PieceData{
@@ -906,6 +974,12 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 							Coeffs: decCoeffs,
 						},
 						Proof: cda.OpeningProof(decProof),
+					}
+					recvPieces = append(recvPieces, newPiece)
+					originPieces = append(originPieces, originPiece{
+						piece:        newPiece,
+						sourcePID:    selectedStore.PeerID,
+						pieceCommits: p.PieceCommits,
 					})
 				}
 			}
@@ -935,8 +1009,21 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 	}
 
 	if !querySuccess || len(recvPieces) < s.verifier.K() {
+		log.Printf("[DAS Tier-2 Self-Healing] Insufficient pieces for cell [%d, %d] (%d/%d). Activating Tier-2 2D Reed-Solomon row reconstruction...", row, col, len(recvPieces), s.verifier.K())
+		repairedCell, tier2Success, repairErr := s.attemptTier2RSRepair(ctx, blockID, row, col, header)
+		if tier2Success {
+			recordDASAttempt(true)
+			log.Printf("[DAS Tier-2 Self-Healing] 🎉 Successfully recovered cell [%d, %d] of block %s via 2D Reed-Solomon row reconstruction!", row, col, blockID)
+			return SampleResult{
+				Row:      row,
+				Col:      col,
+				Verified: true,
+				CellData: repairedCell,
+			}
+		}
+
 		recordDASAttempt(false)
-		errMsg := fmt.Sprintf("insufficient independent pieces collected across stores: got %d, expected %d", len(recvPieces), s.verifier.K())
+		errMsg := fmt.Sprintf("insufficient independent pieces collected across stores: got %d, expected %d (Tier-2 RS repair failed: %v)", len(recvPieces), s.verifier.K(), repairErr)
 		if len(queryErrors) > 0 {
 			errMsg += fmt.Sprintf("; store query details: %s", strings.Join(queryErrors, "; "))
 		}
@@ -961,21 +1048,71 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("verification error: %v", err)}
 	}
 
-	if !verified {
-		recordDASAttempt(false)
-		ByzantineDetectionsTotal.Inc()
-		if s.crashOnFail {
-			log.Fatalf("DAS verification failed (CRASH) for cell [%d, %d]: algebraic direct verification failed", row, col)
-		}
-		return SampleResult{Row: row, Col: col, Verified: false, Error: "algebraic direct verification failed"}
-	}
-
-	recordDASAttempt(true)
-
 	height := p2pcommon.ParseHeightFromBlockID(blockID)
 	if height <= 0 && header != nil && header.Height > 0 {
 		height = int(header.Height)
 	}
+
+	if !verified {
+		recordDASAttempt(false)
+		ByzantineDetectionsTotal.Inc()
+
+		// Broadcast self-verifiable ByzantineNodeReport and blacklist participating piece providers
+		for _, op := range originPieces {
+			s.BlacklistPeer(op.sourcePID, 30*time.Minute)
+			s.broadcastByzantineReport(p2pcommon.ByzantineNodeReport{
+				BlockID:        blockID,
+				Height:         height,
+				Row:            row,
+				Col:            col,
+				ReportedPeerID: op.sourcePID,
+				ReporterPeerID: s.host.ID().String(),
+				Data:           hex.EncodeToString(op.piece.Data.Data),
+				Coeffs:         hex.EncodeToString(op.piece.Data.Coeffs),
+				Proof:          hex.EncodeToString(op.piece.Proof),
+				PieceCommits:   op.pieceCommits,
+				Reason:         "das_algebraic_verification_failed",
+				Timestamp:      time.Now().Unix(),
+			})
+		}
+
+		log.Printf("[DAS Tier-1 Self-Healing] Byzantine pieces detected in cell [%d, %d] of block %s! Isolated peer(s). Initiating Tier-1 fallback...", row, col, blockID)
+
+		// Tier-1: Cell-level RLNC piece fetch from honest / backup custody nodes
+		healedCell, tier1Success := s.attemptTier1CellRecovery(ctx, blockID, row, col, header, cachedInfo, allCandidateStores)
+		if tier1Success {
+			recordDASAttempt(true)
+			log.Printf("[DAS Tier-1 Self-Healing] 🎉 Successfully recovered cell [%d, %d] via honest custody/backup nodes!", row, col)
+			return SampleResult{
+				Row:      row,
+				Col:      col,
+				Verified: true,
+				CellData: healedCell,
+			}
+		}
+
+		// Tier-2: Matrix-level 2D Reed-Solomon cross-repair if entire cell or custody set is lost/byzantine
+		log.Printf("[DAS Tier-2 Self-Healing] Tier-1 failed for cell [%d, %d]. Activating Tier-2 2D Reed-Solomon row reconstruction...", row, col)
+		repairedCell, tier2Success, repairErr := s.attemptTier2RSRepair(ctx, blockID, row, col, header)
+		if tier2Success {
+			recordDASAttempt(true)
+			log.Printf("[DAS Tier-2 Self-Healing] 🎉 Successfully recovered cell [%d, %d] of block %s via 2D Reed-Solomon row reconstruction!", row, col, blockID)
+			return SampleResult{
+				Row:      row,
+				Col:      col,
+				Verified: true,
+				CellData: repairedCell,
+			}
+		}
+
+		if s.crashOnFail {
+			log.Fatalf("DAS verification failed (CRASH) for cell [%d, %d]: algebraic direct verification failed (Tier-1 and Tier-2 healing failed: %v)", row, col, repairErr)
+		}
+		return SampleResult{Row: row, Col: col, Verified: false, Error: fmt.Sprintf("algebraic direct verification failed (RS repair: %v)", repairErr)}
+	}
+
+	recordDASAttempt(true)
+
 	if p2pcommon.IsDebug() {
 		log.Printf("[DAS] [Height: %d] Cell [%d, %d] algebraic verification succeeded! Reconstructed cell data (hex): %x", height, row, col, recoveredCell)
 	} else {
@@ -1002,4 +1139,331 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 		Verified: true,
 		CellData: recoveredCell,
 	}
+}
+
+func (s *APIService) broadcastByzantineReport(report p2pcommon.ByzantineNodeReport) {
+	if s.ps == nil {
+		return
+	}
+	topic, err := s.ps.Join(p2pcommon.TopicByzantineReport)
+	if err != nil {
+		log.Printf("[Byzantine Alert] Failed to join %s: %v", p2pcommon.TopicByzantineReport, err)
+		return
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		log.Printf("[Byzantine Alert] Failed to marshal report: %v", err)
+		return
+	}
+	if err := topic.Publish(context.Background(), data); err != nil {
+		log.Printf("[Byzantine Alert] Failed to publish byzantine report: %v", err)
+		return
+	}
+	log.Printf("[Byzantine Alert] Broadcasted ByzantineNodeReport against %s for block %s cell [%d, %d] onto GossipSub",
+		report.ReportedPeerID, report.BlockID, report.Row, report.Col)
+}
+
+func (s *APIService) attemptTier1CellRecovery(
+	ctx context.Context,
+	blockID string,
+	row, col int,
+	header *BlockHeader,
+	cachedInfo cachedRoutingInfo,
+	allStores []p2pcommon.PeerInfo,
+) (string, bool) {
+	targetK := s.verifier.K()
+	var cleanPieces []cda.ReceivedPiece
+	type cleanOrigin struct {
+		piece     cda.ReceivedPiece
+		sourcePID string
+	}
+	var cleanOrigins []cleanOrigin
+
+	for _, store := range allStores {
+		if s.IsPeerBlacklisted(store.PeerID) {
+			continue
+		}
+		storePID, err := peer.Decode(store.PeerID)
+		if err != nil {
+			continue
+		}
+
+		for _, mStr := range store.Multiaddrs {
+			if m, err := multiaddr.NewMultiaddr(mStr); err == nil {
+				s.host.Peerstore().AddAddr(storePID, m, 10*time.Minute)
+			}
+		}
+
+		storeStreamCtx, storeStreamCancel := context.WithTimeout(ctx, 4*time.Second)
+		storeStream, err := s.host.NewStream(storeStreamCtx, storePID, p2pcommon.ProtoStoreGetPieces)
+		if err != nil {
+			storeStreamCancel()
+			continue
+		}
+
+		fetchReq := p2pcommon.StoreFetchRequest{
+			BlockID:     blockID,
+			Row:         row,
+			Col:         col,
+			IsRemoteHop: false,
+		}
+		if err := json.NewEncoder(storeStream).Encode(fetchReq); err != nil {
+			storeStream.Close()
+			storeStreamCancel()
+			continue
+		}
+
+		var combinedResp struct {
+			Pieces []p2pcommon.CodedPiece `json:"pieces"`
+			Error  string                 `json:"error,omitempty"`
+		}
+		if err := json.NewDecoder(storeStream).Decode(&combinedResp); err != nil {
+			storeStream.Close()
+			storeStreamCancel()
+			continue
+		}
+		storeStream.Close()
+		storeStreamCancel()
+
+		if combinedResp.Error != "" {
+			continue
+		}
+
+		for _, p := range combinedResp.Pieces {
+			decData, err1 := hex.DecodeString(p.Data)
+			decCoeffs, err2 := hex.DecodeString(p.Coeffs)
+			decProof, err3 := hex.DecodeString(p.Proof)
+			if err1 != nil || err2 != nil || err3 != nil {
+				continue
+			}
+
+			existingCoeffs := make([][]byte, len(cleanPieces))
+			for i, cp := range cleanPieces {
+				existingCoeffs[i] = cp.Data.Coeffs
+			}
+			if verifier.IsLinearlyIndependent(existingCoeffs, decCoeffs, targetK) {
+				newPiece := cda.ReceivedPiece{
+					Row: p.Row,
+					Col: p.Col,
+					Data: rlnc.PieceData{
+						Data:   decData,
+						Coeffs: decCoeffs,
+					},
+					Proof: cda.OpeningProof(decProof),
+				}
+				cleanPieces = append(cleanPieces, newPiece)
+				cleanOrigins = append(cleanOrigins, cleanOrigin{
+					piece:     newPiece,
+					sourcePID: store.PeerID,
+				})
+			}
+		}
+
+		if len(cleanPieces) >= targetK {
+			break
+		}
+	}
+
+	if len(cleanPieces) < targetK {
+		return "", false
+	}
+
+	columnCommitment := header.ColumnComm[col]
+	recCell, ok, err := s.verifier.VerifyReconstructedCell(cleanPieces, columnCommitment, header.Coeffs, row, len(header.ColumnComm))
+	if err == nil && ok {
+		return recCell, true
+	}
+
+	// If these fallback pieces also failed algebraic verification, blacklist those sources too
+	for _, co := range cleanOrigins {
+		s.BlacklistPeer(co.sourcePID, 30*time.Minute)
+	}
+	return "", false
+}
+
+func (s *APIService) attemptTier2RSRepair(
+	ctx context.Context,
+	blockID string,
+	row, targetCol int,
+	header *BlockHeader,
+) (string, bool, error) {
+	n := len(header.ColumnComm)
+	if n <= 0 {
+		return "", false, fmt.Errorf("invalid header column commitments count")
+	}
+	k := n / 2
+	if k <= 0 {
+		k = 8
+		n = 16
+	}
+
+	// RS codeword requires >= k valid cells along row 'row'
+	rowShares := make([][]byte, n)
+	validCount := 0
+
+	for c := 0; c < n; c++ {
+		if c == targetCol {
+			continue
+		}
+		cellHex, ok := s.fetchCellDirectly(ctx, blockID, row, c, header)
+		if ok && cellHex != "" {
+			cellBytes, err := hex.DecodeString(cellHex)
+			if err == nil && len(cellBytes) > 0 {
+				rowShares[c] = cellBytes
+				validCount++
+				if validCount >= k {
+					break
+				}
+			}
+		}
+	}
+
+	if validCount < k {
+		return "", false, fmt.Errorf("insufficient cells for Tier-2 RS reconstruction: got %d, need %d", validCount, k)
+	}
+
+	rsEncoder, err := reedsolomon.New(k, k, reedsolomon.WithLeopardGF(true))
+	if err != nil {
+		return "", false, fmt.Errorf("failed to initialize Leopard RS decoder: %w", err)
+	}
+
+	if err := rsEncoder.Reconstruct(rowShares); err != nil {
+		return "", false, fmt.Errorf("Reed-Solomon row reconstruction failed: %w", err)
+	}
+
+	reconstructedTargetCell := rowShares[targetCol]
+	if len(reconstructedTargetCell) == 0 {
+		return "", false, fmt.Errorf("reconstructed target cell is empty")
+	}
+
+	return hex.EncodeToString(reconstructedTargetCell), true, nil
+}
+
+func (s *APIService) fetchCellDirectly(
+	ctx context.Context,
+	blockID string,
+	row, col int,
+	header *BlockHeader,
+) (string, bool) {
+	n := len(header.ColumnComm)
+	numCols := s.numCols
+	if numCols <= 0 {
+		numCols = 8
+	}
+	colsPerNetCol := n / numCols
+	if colsPerNetCol == 0 {
+		colsPerNetCol = 1
+	}
+	netColIdx := col / colsPerNetCol
+	if netColIdx >= numCols {
+		netColIdx = numCols - 1
+	}
+
+	stores, err := s.getRoutingInfo(netColIdx, colsPerNetCol, row, col)
+	if err != nil {
+		return "", false
+	}
+
+	s.routingCacheMu.RLock()
+	routingInfo := s.routingCache[netColIdx]
+	s.routingCacheMu.RUnlock()
+
+	targetK := s.verifier.K()
+	var pieces []cda.ReceivedPiece
+
+	netRows := routingInfo.netRows
+	if netRows <= 0 {
+		netRows = 8
+	}
+	var storesToQuery []p2pcommon.PeerInfo
+	if routingInfo.rowCustodyMap != nil {
+		storesToQuery = append(storesToQuery, routingInfo.rowCustodyMap[row%netRows]...)
+	}
+	storesToQuery = append(storesToQuery, stores...)
+
+	for _, store := range storesToQuery {
+		if s.IsPeerBlacklisted(store.PeerID) {
+			continue
+		}
+		pid, err := peer.Decode(store.PeerID)
+		if err != nil {
+			continue
+		}
+		for _, mStr := range store.Multiaddrs {
+			if m, err := multiaddr.NewMultiaddr(mStr); err == nil {
+				s.host.Peerstore().AddAddr(pid, m, 10*time.Minute)
+			}
+		}
+		sCtx, sCancel := context.WithTimeout(ctx, 3*time.Second)
+		stream, err := s.host.NewStream(sCtx, pid, p2pcommon.ProtoStoreGetPieces)
+		if err != nil {
+			sCancel()
+			continue
+		}
+		fetchReq := p2pcommon.StoreFetchRequest{
+			BlockID:     blockID,
+			Row:         row,
+			Col:         col,
+			IsRemoteHop: false,
+		}
+		if err := json.NewEncoder(stream).Encode(fetchReq); err != nil {
+			stream.Close()
+			sCancel()
+			continue
+		}
+		var resp struct {
+			Pieces []p2pcommon.CodedPiece `json:"pieces"`
+			Error  string                 `json:"error,omitempty"`
+		}
+		if err := json.NewDecoder(stream).Decode(&resp); err != nil {
+			stream.Close()
+			sCancel()
+			continue
+		}
+		stream.Close()
+		sCancel()
+
+		if resp.Error != "" {
+			continue
+		}
+
+		for _, p := range resp.Pieces {
+			decData, err1 := hex.DecodeString(p.Data)
+			decCoeffs, err2 := hex.DecodeString(p.Coeffs)
+			decProof, err3 := hex.DecodeString(p.Proof)
+			if err1 != nil || err2 != nil || err3 != nil {
+				continue
+			}
+
+			existingCoeffs := make([][]byte, len(pieces))
+			for i, cp := range pieces {
+				existingCoeffs[i] = cp.Data.Coeffs
+			}
+			if verifier.IsLinearlyIndependent(existingCoeffs, decCoeffs, targetK) {
+				pieces = append(pieces, cda.ReceivedPiece{
+					Row: p.Row,
+					Col: p.Col,
+					Data: rlnc.PieceData{
+						Data:   decData,
+						Coeffs: decCoeffs,
+					},
+					Proof: cda.OpeningProof(decProof),
+				})
+			}
+		}
+		if len(pieces) >= targetK {
+			break
+		}
+	}
+
+	if len(pieces) < targetK {
+		return "", false
+	}
+
+	columnCommitment := header.ColumnComm[col]
+	recCell, ok, err := s.verifier.VerifyReconstructedCell(pieces, columnCommitment, header.Coeffs, row, len(header.ColumnComm))
+	if err == nil && ok {
+		return recCell, true
+	}
+	return "", false
 }

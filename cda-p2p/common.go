@@ -160,9 +160,10 @@ func ProtoNodeBinaryPersistentSeed(peerID string) string {
 
 // GossipSub Topics
 const (
-	TopicHeader     = "/cda/1.0.0/header"
-	TopicStoreReady = "/cda/1.0.0/store-ready"
-	TopicBlockReady = "/cda/1.0.0/block-ready"
+	TopicHeader          = "/cda/1.0.0/header"
+	TopicStoreReady      = "/cda/1.0.0/store-ready"
+	TopicBlockReady      = "/cda/1.0.0/block-ready"
+	TopicByzantineReport = "/cda/1.0.0/byzantine-report"
 )
 
 // TopicCol returns GossipSub column topic name (used for anchor commitment broadcast)
@@ -518,4 +519,20 @@ type GossipBlockReadyPayload struct {
 	BlockID string `json:"block_id"`
 	Height  int    `json:"height"`
 	K       int    `json:"k,omitempty"`
+}
+
+// ByzantineNodeReport contains self-verifiable cryptographic evidence of a peer distributing an invalid piece.
+type ByzantineNodeReport struct {
+	BlockID        string   `json:"block_id"`
+	Height         int      `json:"height"`
+	Row            int      `json:"row"`
+	Col            int      `json:"col"`
+	ReportedPeerID string   `json:"reported_peer_id"` // Node that served the bad piece
+	ReporterPeerID string   `json:"reporter_peer_id"` // Node reporting the violation
+	Data           string   `json:"data"`             // Hex-encoded piece data
+	Coeffs         string   `json:"coeffs"`           // Hex-encoded piece coefficients
+	Proof          string   `json:"proof"`            // Hex-encoded piece proof
+	PieceCommits   []string `json:"piece_commits"`    // Hex-encoded piece commitments
+	Reason         string   `json:"reason"`           // Reason description
+	Timestamp      int64    `json:"timestamp"`
 }

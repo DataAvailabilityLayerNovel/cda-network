@@ -198,6 +198,26 @@ func main() {
 		}()
 	}
 
+	// 6c. Subscribe to Byzantine Report GossipSub topic — auto-blacklists malicious nodes
+	byzTopic, err := ps.Join(p2pcommon.TopicByzantineReport)
+	if err == nil {
+		byzSub, errSub := byzTopic.Subscribe()
+		if errSub == nil {
+			go func() {
+				for {
+					msg, err := byzSub.Next(ctx)
+					if err != nil {
+						return
+					}
+					var report p2pcommon.ByzantineNodeReport
+					if err := json.Unmarshal(msg.Data, &report); err == nil && report.ReportedPeerID != "" {
+						apiService.BlacklistPeer(report.ReportedPeerID, 30*time.Minute)
+					}
+				}
+			}()
+		}
+	}
+
 	mux := http.NewServeMux()
 	apiService.RegisterHandlers(mux)
 

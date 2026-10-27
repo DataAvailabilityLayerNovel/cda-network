@@ -6,6 +6,6 @@ use (
 	./cda-p2p
 	./cda-publisher-node
 	./cda-store-node
-	./rlnc-rsmt2d
 	./cometbft
+	./rlnc-rsmt2d
 )

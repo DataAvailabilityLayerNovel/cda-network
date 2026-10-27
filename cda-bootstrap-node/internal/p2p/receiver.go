@@ -68,6 +68,10 @@ type Receiver struct {
 	prevDispatchedHeight    int
 	dispatchedDeadline      time.Time
 	phase2Sem               chan struct{}
+
+	// Byzantine Blacklist & Peer Isolation
+	blacklistMu      sync.RWMutex
+	blacklistedPeers map[peer.ID]time.Time
 }
 
 func NewReceiver(
@@ -101,9 +105,10 @@ func NewReceiver(
 		netRows:       getEnvInt("CDA_NET_ROWS", 8),
 		netCols:       getEnvInt("CDA_NET_COLS", 8),
 		peerTTL:       15 * time.Second,
-		pruneEnable:   pruneEnable,
-		pruneTTL:      pruneTTL,
-		phase2Sem:     make(chan struct{}, getEnvInt("BOOTSTRAP_PHASE2_CONCURRENCY", 4)),
+		pruneEnable:      pruneEnable,
+		pruneTTL:         pruneTTL,
+		phase2Sem:        make(chan struct{}, getEnvInt("BOOTSTRAP_PHASE2_CONCURRENCY", 4)),
+		blacklistedPeers: make(map[peer.ID]time.Time),
 	}
 	rcv.pipelineCond = sync.NewCond(&rcv.pipelineMu)
 	// Connect broadcaster back to registry
@@ -271,6 +276,35 @@ func (rcv *Receiver) Start(ctx context.Context) {
 				}
 			}
 		}()
+	}
+
+	// Subscribe to TopicByzantineReport for automatic peer isolation & griefing defense
+	if rcv.broadcaster != nil && rcv.broadcaster.PubSub() != nil {
+		ps := rcv.broadcaster.PubSub()
+		byzTopic, err := ps.Join(p2pcommon.TopicByzantineReport)
+		if err == nil {
+			byzSub, err := byzTopic.Subscribe()
+			if err == nil {
+				go func() {
+					for {
+						msg, err := byzSub.Next(ctx)
+						if err != nil {
+							return
+						}
+						// Skip reports sent by ourselves
+						if msg.ReceivedFrom == rcv.host.ID() {
+							continue
+						}
+						var report p2pcommon.ByzantineNodeReport
+						if err := json.Unmarshal(msg.Data, &report); err == nil {
+							log.Printf("[Byzantine Monitor] Received report from %s against %s for block %s cell [%d, %d]",
+								report.ReporterPeerID, report.ReportedPeerID, report.BlockID, report.Row, report.Col)
+							_, _ = rcv.VerifyAndHandleByzantineReport(report)
+						}
+					}
+				}()
+			}
+		}
 	}
 }
 
@@ -581,6 +615,17 @@ func (rcv *Receiver) handleRouting(stream network.Stream) {
 		return
 	}
 
+	if rcv.IsPeerBlacklisted(pid) {
+		log.Printf("[P2P Registry] Rejected blacklisted peer %s from joining network matrix", pid)
+		rcv.broadcaster.ClosePersistentStream(pid)
+		_ = rcv.host.Network().ClosePeer(pid)
+		_ = json.NewEncoder(stream).Encode(p2pcommon.BootstrapRoutingResponse{
+			RowPeers: nil,
+			ColPeers: nil,
+		})
+		return
+	}
+
 	isLightNode := req.Peer.Row == -1 && req.Peer.Col == -1
 
 	// Update registry
@@ -729,5 +774,136 @@ func (rcv *Receiver) respondWithError(stream network.Stream, errMsg string) {
 		Success: false,
 		Error:   errMsg,
 	})
+}
+
+// BlacklistPeer adds a peer ID to the blacklist for a specified duration (or permanent if <= 0)
+// and closes all active streams/connections to that peer.
+func (rcv *Receiver) BlacklistPeer(pid peer.ID, duration time.Duration, reason string) {
+	rcv.blacklistMu.Lock()
+	if rcv.blacklistedPeers == nil {
+		rcv.blacklistedPeers = make(map[peer.ID]time.Time)
+	}
+	expiry := time.Now().Add(duration)
+	if duration <= 0 {
+		expiry = time.Now().Add(24 * 365 * time.Hour) // ~1 year (effectively permanent)
+	}
+	rcv.blacklistedPeers[pid] = expiry
+	rcv.blacklistMu.Unlock()
+
+	// Evict from active peers registry
+	rcv.peersMu.Lock()
+	delete(rcv.activePeers, pid)
+	delete(rcv.lastSeenPeer, pid)
+	if rcv.db != nil {
+		_ = rcv.db.Update(func(txn *badger.Txn) error {
+			return txn.Delete([]byte("peer_" + pid.String()))
+		})
+	}
+	rcv.peersMu.Unlock()
+
+	// Close persistent streams and disconnect network connections
+	rcv.broadcaster.ClosePersistentStream(pid)
+	_ = rcv.host.Network().ClosePeer(pid)
+
+	log.Printf("[Byzantine Blacklist] Peer %s blacklisted until %v. Reason: %s", pid, expiry.Format(time.RFC3339), reason)
+}
+
+// IsPeerBlacklisted checks whether a peer is currently in the active blacklist.
+func (rcv *Receiver) IsPeerBlacklisted(pid peer.ID) bool {
+	rcv.blacklistMu.RLock()
+	defer rcv.blacklistMu.RUnlock()
+	if rcv.blacklistedPeers == nil {
+		return false
+	}
+	expiry, exists := rcv.blacklistedPeers[pid]
+	if !exists {
+		return false
+	}
+	if time.Now().After(expiry) {
+		return false
+	}
+	return true
+}
+
+// GetBlacklist returns a snapshot of currently blacklisted peers and their expiry.
+func (rcv *Receiver) GetBlacklist() map[string]string {
+	rcv.blacklistMu.RLock()
+	defer rcv.blacklistMu.RUnlock()
+	res := make(map[string]string, len(rcv.blacklistedPeers))
+	now := time.Now()
+	for pid, exp := range rcv.blacklistedPeers {
+		if exp.After(now) {
+			res[pid.String()] = exp.Format(time.RFC3339)
+		}
+	}
+	return res
+}
+
+// VerifyAndHandleByzantineReport verifies a ByzantineNodeReport in O(1) time and takes disciplinary action.
+func (rcv *Receiver) VerifyAndHandleByzantineReport(report p2pcommon.ByzantineNodeReport) (bool, error) {
+	reportedPID, err := peer.Decode(report.ReportedPeerID)
+	if err != nil {
+		return false, fmt.Errorf("invalid reported peer ID %q: %w", report.ReportedPeerID, err)
+	}
+	reporterPID, err := peer.Decode(report.ReporterPeerID)
+	if err != nil {
+		return false, fmt.Errorf("invalid reporter peer ID %q: %w", report.ReporterPeerID, err)
+	}
+
+	dataBytes, err := hex.DecodeString(report.Data)
+	if err != nil {
+		return false, fmt.Errorf("invalid hex in report data: %w", err)
+	}
+	coeffsBytes, err := hex.DecodeString(report.Coeffs)
+	if err != nil {
+		return false, fmt.Errorf("invalid hex in report coeffs: %w", err)
+	}
+	proofBytes, err := hex.DecodeString(report.Proof)
+	if err != nil {
+		return false, fmt.Errorf("invalid hex in report proof: %w", err)
+	}
+
+	pieceCommitsBytes := make([]cda.PieceCommitment, len(report.PieceCommits))
+	for i, cHex := range report.PieceCommits {
+		b, err := hex.DecodeString(cHex)
+		if err != nil {
+			return false, fmt.Errorf("invalid hex in piece commit %d: %w", i, err)
+		}
+		pieceCommitsBytes[i] = cda.PieceCommitment(b)
+	}
+
+	if len(pieceCommitsBytes) == 0 {
+		return false, fmt.Errorf("empty piece commitments in byzantine report")
+	}
+
+	// 1. Combine commitments: C_piece = sum(g_j * C_j)
+	combinedCommit, err := rcv.kzg.Combine(pieceCommitsBytes, coeffsBytes)
+	if err != nil {
+		// If combining fails (e.g. invalid coeffs length), the piece served by reportedPID is genuinely invalid!
+		log.Printf("[Byzantine] Combine piece commitments failed for reported peer %s: %v. Confirming byzantine fault.", reportedPID, err)
+		rcv.BlacklistPeer(reportedPID, 24*time.Hour, fmt.Sprintf("invalid coefficients/commitments format: %v", err))
+		return true, nil
+	}
+
+	// 2. O(1) Pairing verification: does the piece verify against the combined commitment?
+	n := 2 * rcv.kBlock
+	if n <= 0 {
+		n = 32
+	}
+	isMathematicallyValid := rcv.kzg.VerifyForDomain(combinedCommit, report.Row, dataBytes, cda.OpeningProof(proofBytes), n)
+
+	if !isMathematicallyValid {
+		// Piece is genuinely INVALID! Accusation is TRUE!
+		log.Printf("[Byzantine Report VERIFIED] Peer %s distributed corrupted piece for block %s cell [%d, %d]! Isolating peer.",
+			reportedPID, report.BlockID, report.Row, report.Col)
+		rcv.BlacklistPeer(reportedPID, 24*time.Hour, fmt.Sprintf("distributed invalid piece for block %s cell [%d, %d] (reason: %s)", report.BlockID, report.Row, report.Col, report.Reason))
+		return true, nil
+	}
+
+	// Piece is actually VALID! Reporter attempted a FALSE ACCUSATION (Griefing Attack)!
+	log.Printf("[Byzantine Report REJECTED - GRIEFING DETECTED] Reporter %s falsely accused peer %s for valid piece on block %s cell [%d, %d]! Isolating reporter.",
+		reporterPID, reportedPID, report.BlockID, report.Row, report.Col)
+	rcv.BlacklistPeer(reporterPID, 24*time.Hour, fmt.Sprintf("false accusation/griefing against peer %s on block %s cell [%d, %d]", reportedPID, report.BlockID, report.Row, report.Col))
+	return false, nil
 }
 
