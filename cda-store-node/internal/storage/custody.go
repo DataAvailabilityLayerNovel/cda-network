@@ -515,7 +515,7 @@ func (s *CustodyStore) IsComplete(blockID string, colIdx, k int) bool {
 	return complete
 }
 
-func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.RecipientManager) int {
+func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.RecipientManager, domainSizes ...int) int {
 	rawKeyStr := fmt.Sprintf("received_%s_%d_%d", blockID, row, col)
 	recodedKeyStr := fmt.Sprintf("recoded_%s_%d_%d", blockID, row, col)
 
@@ -536,13 +536,17 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 	var compressedPiece cda.ReceivedPiece
 	if !alreadyHasRecoded && len(rawPieces) > 0 {
 		if len(rawPieces) >= 2 && rm != nil {
-			recoded, err := rm.RecodePieces(rawPieces)
-			if err == nil && recoded != nil {
-				compressedPiece = *recoded
-			} else {
-				pieceCommits, _ := s.GetAnchoredCommitments(blockID, col)
-				if recVer, vErr := rm.RecodePiecesWithVerify(rawPieces, pieceCommits, 3); vErr == nil && recVer != nil {
+			pieceCommits, _ := s.GetAnchoredCommitments(blockID, col)
+			if len(pieceCommits) > 0 {
+				if recVer, vErr := rm.RecodePiecesWithVerify(rawPieces, pieceCommits, 5, domainSizes...); vErr == nil && recVer != nil {
 					compressedPiece = *recVer
+				} else {
+					compressedPiece = rawPieces[0]
+				}
+			} else {
+				recoded, err := rm.RecodePieces(rawPieces)
+				if err == nil && recoded != nil {
+					compressedPiece = *recoded
 				} else {
 					compressedPiece = rawPieces[0]
 				}

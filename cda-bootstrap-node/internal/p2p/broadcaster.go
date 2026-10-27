@@ -63,6 +63,10 @@ func (b *Broadcaster) SetRegistry(reg Registry) {
 	b.reg = reg
 }
 
+func (b *Broadcaster) PubSub() *pubsub.PubSub {
+	return b.ps
+}
+
 // BroadcastAnchor publishes the commitments and proofs to the column's GossipSub topic
 func (b *Broadcaster) BroadcastAnchor(blockID string, colIdx int, pieceCommits [][]byte, merkleProofs []cda.MerkleProof) error {
 	log.Printf("[GossipSub] Broadcasting anchor for Column %d to GossipSub", colIdx)

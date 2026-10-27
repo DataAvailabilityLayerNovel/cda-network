@@ -96,6 +96,9 @@ type Receiver struct {
 	totalStoredPiecesMu sync.Mutex
 	cellMu              sync.Mutex
 
+	blacklistMu      sync.RWMutex
+	blacklistedPeers map[string]time.Time
+
 	// Pruning configurations and state
 	pruneEnable      bool
 	pruneTTL         time.Duration
@@ -251,11 +254,44 @@ func NewReceiver(
 		completionCheckChan: make(chan string, 1024),
 		disseminationSem:    make(chan struct{}, getEnvInt("STORE_DISSEMINATION_SEM", 16)),
 		blockN:              make(map[string]int),
+		blacklistedPeers:    make(map[string]time.Time),
 	}
 	if broadcaster != nil {
 		broadcaster.SetNetworkMatrix(rcv.getNetColIdx(), storesPerCol)
 	}
 	return rcv
+}
+
+// BlacklistPeer records a peer as isolated for the given duration
+func (rcv *Receiver) BlacklistPeer(peerID string, duration time.Duration) {
+	if peerID == "" {
+		return
+	}
+	rcv.blacklistMu.Lock()
+	defer rcv.blacklistMu.Unlock()
+	if rcv.blacklistedPeers == nil {
+		rcv.blacklistedPeers = make(map[string]time.Time)
+	}
+	expiry := time.Now().Add(duration)
+	rcv.blacklistedPeers[peerID] = expiry
+	log.Printf("[StoreNode] 🚫 Blacklisted byzantine peer %s until %s", peerID, expiry.Format(time.RFC3339))
+}
+
+// IsPeerBlacklisted returns true if the peer is currently blacklisted
+func (rcv *Receiver) IsPeerBlacklisted(peerID string) bool {
+	if peerID == "" {
+		return false
+	}
+	rcv.blacklistMu.RLock()
+	defer rcv.blacklistMu.RUnlock()
+	expiry, exists := rcv.blacklistedPeers[peerID]
+	if !exists {
+		return false
+	}
+	if time.Now().After(expiry) {
+		return false
+	}
+	return true
 }
 
 func (rcv *Receiver) SetBootstrapHTTPAddr(addr string) {
@@ -633,6 +669,28 @@ func (rcv *Receiver) Start(ctx context.Context) {
 				}
 			}
 		}(sub, c)
+	}
+
+	// 4. Subscribe to TopicByzantineReport to auto-isolate Byzantine nodes
+	if rcv.broadcaster != nil {
+		byzTopic, err := rcv.broadcaster.JoinTopic(p2pcommon.TopicByzantineReport)
+		if err == nil {
+			byzSub, errSub := byzTopic.Subscribe(pubsub.WithBufferSize(256))
+			if errSub == nil {
+				go func() {
+					for {
+						msg, err := byzSub.Next(ctx)
+						if err != nil {
+							return
+						}
+						var report p2pcommon.ByzantineNodeReport
+						if err := json.Unmarshal(msg.Data, &report); err == nil && report.ReportedPeerID != "" {
+							rcv.BlacklistPeer(report.ReportedPeerID, 30*time.Minute)
+						}
+					}
+				}()
+			}
+		}
 	}
 
 	rcv.initialSyncOnce.Do(func() {
@@ -1626,13 +1684,17 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 
 			var finalPiece *cda.ReceivedPiece
 			if len(piecesSnapshot) >= minPieces && numSources >= minSources {
-				recoded, err := rcv.rm.RecodePieces(piecesSnapshot[:minPieces])
-				if err == nil && recoded != nil {
-					finalPiece = recoded
-				} else {
-					pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
-					if recVer, vErr := rcv.rm.RecodePiecesWithVerify(piecesSnapshot[:minPieces], pieceCommits, 3); vErr == nil && recVer != nil {
+				pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
+				if len(pieceCommits) > 0 {
+					n := rcv.getBlockN(blockID)
+					if recVer, vErr := rcv.rm.RecodePiecesWithVerify(piecesSnapshot[:minPieces], pieceCommits, 5, n); vErr == nil && recVer != nil {
 						finalPiece = recVer
+					}
+				}
+				if finalPiece == nil {
+					recoded, err := rcv.rm.RecodePieces(piecesSnapshot[:minPieces])
+					if err == nil && recoded != nil {
+						finalPiece = recoded
 					} else {
 						finalPiece = &piecesSnapshot[0]
 					}
@@ -1780,12 +1842,17 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 				if len(targetPieces) > rcv.kPiece {
 					targetPieces = targetPieces[:rcv.kPiece]
 				}
+				n := rcv.getBlockN(bID)
 				pieceCommits, _ := rcv.cache.GetAnchoredCommitments(bID, c)
 				broadcastSucceeded := 0
 				for i := 0; i < numBroadcast; i++ {
-					recodedPiece, err := rcv.rm.RecodePieces(targetPieces)
-					if err != nil || recodedPiece == nil {
-						recodedPiece, err = rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 3)
+					var recodedPiece *cda.ReceivedPiece
+					var err error
+					if len(pieceCommits) > 0 {
+						recodedPiece, err = rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5, n)
+					}
+					if recodedPiece == nil {
+						recodedPiece, err = rcv.rm.RecodePieces(targetPieces)
 					}
 					if err != nil || recodedPiece == nil {
 						log.Printf("[GossipSub] Failed to recode pieces for cell [%d, %d] (round %d/%d): %v", r, c, i+1, numBroadcast, err)
@@ -1813,11 +1880,21 @@ func (rcv *Receiver) processVerifiedPiece(blockID string, row, col int, piece cd
 					}
 				}
 
+				if broadcastSucceeded == 0 {
+					cKey := fmt.Sprintf("%s_%d_%d", bID, r, c)
+					rcv.broadcastMu.Lock()
+					delete(rcv.cellDisseminating, cKey)
+					rcv.broadcastMu.Unlock()
+				}
+
 				if !nativeRetention && broadcastSucceeded > 0 {
 					// Generate 1 fresh independent recoded piece for local retention before pruning raw pieces
-					retainedPiece, rErr := rcv.rm.RecodePieces(targetPieces)
-					if rErr != nil || retainedPiece == nil {
-						retainedPiece, _ = rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 3)
+					var retainedPiece *cda.ReceivedPiece
+					if len(pieceCommits) > 0 {
+						retainedPiece, _ = rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5, n)
+					}
+					if retainedPiece == nil {
+						retainedPiece, _ = rcv.rm.RecodePieces(targetPieces)
 					}
 					if retainedPiece != nil {
 						rcv.cache.StoreRecodedPiece(bID, r, c, *retainedPiece)
@@ -2121,9 +2198,10 @@ func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, send
 					allPieces := rcv.cache.GetPieces(blockID, row, col)
 					rcv.cellMu.Unlock()
 					if len(allPieces) >= rcv.kPiece {
+						n := rcv.getBlockN(blockID)
 						targetPieces := allPieces[:rcv.kPiece]
 						for i := 0; i < numBroadcast; i++ {
-							recodedPiece, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5)
+							recodedPiece, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5, n)
 							if err == nil {
 								if err := rcv.broadcaster.BroadcastRecodedPiece(blockID, row, col, recodedPiece, pieceCommits); err == nil {
 									rcv.broadcastMu.Lock()
@@ -2190,9 +2268,10 @@ func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, send
 				allPieces := rcv.cache.GetPieces(blockID, row, col)
 				rcv.cellMu.Unlock()
 				if len(allPieces) >= rcv.kPiece {
+					n := rcv.getBlockN(blockID)
 					targetPieces := allPieces[:rcv.kPiece]
 					for i := 0; i < numBroadcast; i++ {
-						recodedPiece, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5)
+						recodedPiece, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5, n)
 						if err != nil {
 							continue
 						}
@@ -2271,9 +2350,10 @@ func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, send
 
 			var finalPiece *cda.ReceivedPiece
 			pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
+			n := rcv.getBlockN(blockID)
 
 			if len(latestPieces) >= minPieces && numSources >= minSources {
-				recoded, err := rcv.rm.RecodePiecesWithVerify(latestPieces[:minPieces], pieceCommits, 5)
+				recoded, err := rcv.rm.RecodePiecesWithVerify(latestPieces[:minPieces], pieceCommits, 5, n)
 				if err == nil && recoded != nil {
 					finalPiece = recoded
 				} else {
@@ -2281,7 +2361,7 @@ func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, send
 				}
 			} else if len(latestPieces) >= 1 {
 				if len(latestPieces) >= 2 {
-					recoded, err := rcv.rm.RecodePiecesWithVerify(latestPieces[:2], pieceCommits, 5)
+					recoded, err := rcv.rm.RecodePiecesWithVerify(latestPieces[:2], pieceCommits, 5, n)
 					if err == nil && recoded != nil {
 						finalPiece = recoded
 					} else {
@@ -2527,6 +2607,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 
 	if len(allPieces) >= rcv.kPiece {
 		pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
+		n := rcv.getBlockN(blockID)
 		isPullCustody, isPullNativeRetention, numCustodyPeers := rcv.evalCustody(row)
 
 		targetPieces := allPieces
@@ -2534,7 +2615,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 			targetPieces = targetPieces[:rcv.kPiece]
 		}
 
-		firstRecoded, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5)
+		firstRecoded, err := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5, n)
 		if err == nil {
 			if !isPullNativeRetention {
 				rcv.cellMu.Lock()
@@ -2551,7 +2632,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 				}
 				broadcastSucceeded := 0
 				for i := 0; i < numBroadcast; i++ {
-					recodedPiece, rerr := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5)
+					recodedPiece, rerr := rcv.rm.RecodePiecesWithVerify(targetPieces, pieceCommits, 5, n)
 					if rerr != nil {
 						log.Printf("[GossipSub] Active pull: recode round %d/%d failed for cell [%d, %d]: %v", i+1, numBroadcast, row, col, rerr)
 						continue
@@ -2682,9 +2763,10 @@ func (rcv *Receiver) pullNonCustodyPiece(blockID string, row, col int) {
 	}
 
 	pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
+	n := rcv.getBlockN(blockID)
 	var finalPiece *cda.ReceivedPiece
 	if len(pulledPieces) >= 2 {
-		recoded, err := rcv.rm.RecodePiecesWithVerify(pulledPieces[:2], pieceCommits, 5)
+		recoded, err := rcv.rm.RecodePiecesWithVerify(pulledPieces[:2], pieceCommits, 5, n)
 		if err == nil && recoded != nil {
 			finalPiece = recoded
 		} else {
@@ -2715,6 +2797,11 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 	defer stream.Close()
 
 	remotePeer := stream.Conn().RemotePeer()
+	if rcv.IsPeerBlacklisted(remotePeer.String()) {
+		log.Printf("[StoreNode] Rejected fetch request from blacklisted peer %s", remotePeer)
+		rcv.respondWithError(stream, "peer is blacklisted")
+		return
+	}
 	if !rcv.allowRequest(remotePeer) {
 		log.Printf("[RateLimiter] Rejected fetch request from peer %s (rate limit exceeded)", remotePeer)
 		rcv.respondWithError(stream, "rate limit exceeded")
@@ -2765,7 +2852,34 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 		copy(peersCopy, rcv.colPeers)
 		rcv.peersMu.RUnlock()
 
-		for _, pInfo := range peersCopy {
+		// Prioritize honest custody peers for req.Row % effNetRows, then remaining column peers
+		var prioritizedPeers []p2pcommon.PeerInfo
+		seenPID := make(map[string]bool)
+		cmap := rcv.rowCustodyMap
+		if cmap != nil {
+			effNetRows := rcv.kBlock * 2
+			if rcv.numCols > 0 {
+				effNetRows = (rcv.kBlock * 2) / rcv.numCols
+			}
+			if effNetRows <= 0 {
+				effNetRows = 8
+			}
+			custodyPeers := cmap[req.Row%effNetRows]
+			for _, cp := range custodyPeers {
+				if cp.PeerID != "" && cp.PeerID != rcv.selfPeerID && !rcv.IsPeerBlacklisted(cp.PeerID) && !seenPID[cp.PeerID] {
+					seenPID[cp.PeerID] = true
+					prioritizedPeers = append(prioritizedPeers, cp)
+				}
+			}
+		}
+		for _, p := range peersCopy {
+			if p.PeerID != "" && p.PeerID != rcv.selfPeerID && !rcv.IsPeerBlacklisted(p.PeerID) && !seenPID[p.PeerID] {
+				seenPID[p.PeerID] = true
+				prioritizedPeers = append(prioritizedPeers, p)
+			}
+		}
+
+		for _, pInfo := range prioritizedPeers {
 			pid, err := peer.Decode(pInfo.PeerID)
 			if err != nil {
 				continue
@@ -3121,13 +3235,17 @@ func (rcv *Receiver) nonCustodyFallbackLoop(ctx context.Context) {
 
 				var chosen *cda.ReceivedPiece
 				if len(currPieces) >= minPieces {
-					rec, err := rcv.rm.RecodePieces(currPieces[:minPieces])
-					if err == nil && rec != nil {
-						chosen = rec
-					} else {
-						pCommits, _ := rcv.cache.GetAnchoredCommitments(bID, c)
-						if recVer, vErr := rcv.rm.RecodePiecesWithVerify(currPieces[:minPieces], pCommits, 3); vErr == nil && recVer != nil {
+					pCommits, _ := rcv.cache.GetAnchoredCommitments(bID, c)
+					if len(pCommits) > 0 {
+						n := rcv.getBlockN(bID)
+						if recVer, vErr := rcv.rm.RecodePiecesWithVerify(currPieces[:minPieces], pCommits, 5, n); vErr == nil && recVer != nil {
 							chosen = recVer
+						}
+					}
+					if chosen == nil {
+						rec, err := rcv.rm.RecodePieces(currPieces[:minPieces])
+						if err == nil && rec != nil {
+							chosen = rec
 						} else {
 							chosen = &currPieces[0]
 						}

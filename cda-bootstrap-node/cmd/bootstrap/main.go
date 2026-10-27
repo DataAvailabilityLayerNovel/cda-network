@@ -378,6 +378,14 @@ func main() {
 			"active_peers_in_col": activeCount,
 		})
 	})
+	mux.HandleFunc("/bootstrap/blacklist", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		blacklist := receiver.GetBlacklist()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"blacklisted_peers": blacklist,
+			"count":             len(blacklist),
+		})
+	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("healthy"))

@@ -288,3 +288,64 @@ func TestHandleGetTx_ColdPath_CDA(t *testing.T) {
 		t.Errorf("expected payload %s, got %s", testPayload, respKey.Payload)
 	}
 }
+
+func TestPublisher_ByzantineBlockRejection(t *testing.T) {
+	db, err := badger.Open(badger.DefaultOptions("").WithInMemory(true).WithLogger(nil))
+	if err != nil {
+		t.Fatalf("failed to open test db: %v", err)
+	}
+	defer db.Close()
+
+	svc := &APIService{
+		db:             db,
+		kVal:           2,
+		rejectedBlocks: make(map[string]string),
+	}
+
+	blockID := "block-99"
+	height := int64(99)
+	reason := "BFT Header commits_root mismatch: expected abc got def"
+
+	// 1. Mark block as rejected byzantine block
+	svc.markBlockRejected(blockID, height, reason)
+
+	// 2. Query block data via handleGetBlockData
+	req, _ := http.NewRequest(http.MethodGet, "/block/"+blockID, nil)
+	rr := httptest.NewRecorder()
+	svc.handleGetBlockData(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200 with rejection JSON, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response JSON: %v", err)
+	}
+
+	if resp["status"] != "STATUS_INVALID_REJECTED" {
+		t.Errorf("expected status STATUS_INVALID_REJECTED, got %v", resp["status"])
+	}
+	if resp["error"] != reason {
+		t.Errorf("expected error %s, got %v", reason, resp["error"])
+	}
+	if resp["block_id"] != blockID {
+		t.Errorf("expected block_id %s, got %v", blockID, resp["block_id"])
+	}
+
+	// 3. Verify handleStatus reflects the rejection
+	statusReq, _ := http.NewRequest(http.MethodGet, "/status", nil)
+	statusRR := httptest.NewRecorder()
+	svc.handleStatus(statusRR, statusReq)
+
+	var statusResp map[string]interface{}
+	if err := json.Unmarshal(statusRR.Body.Bytes(), &statusResp); err != nil {
+		t.Fatalf("failed to parse status JSON: %v", err)
+	}
+	if int(statusResp["rejected_count"].(float64)) != 1 {
+		t.Errorf("expected rejected_count 1, got %v", statusResp["rejected_count"])
+	}
+	if int64(statusResp["latest_rejected_height"].(float64)) != height {
+		t.Errorf("expected latest_rejected_height %d, got %v", height, statusResp["latest_rejected_height"])
+	}
+}
