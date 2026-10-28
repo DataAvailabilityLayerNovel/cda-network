@@ -69,9 +69,26 @@ type Receiver struct {
 	dispatchedDeadline      time.Time
 	phase2Sem               chan struct{}
 
+	// Block-Level Aggregator Barrier
+	barrierMu      sync.Mutex
+	pendingBatches map[string]*pendingBlockBatch
+
 	// Byzantine Blacklist & Peer Isolation
 	blacklistMu      sync.RWMutex
 	blacklistedPeers map[peer.ID]time.Time
+}
+
+type pendingBlockBatch struct {
+	mu           sync.Mutex
+	blockID      string
+	height       int
+	n            int
+	expectedCols int
+	columns      map[int][][]byte
+	pieceCommits map[int][][]byte
+	merkleProofs map[int][]cda.MerkleProof
+	timer        *time.Timer
+	dispatched   bool
 }
 
 func NewReceiver(
@@ -109,6 +126,7 @@ func NewReceiver(
 		pruneTTL:         pruneTTL,
 		phase2Sem:        make(chan struct{}, getEnvInt("BOOTSTRAP_PHASE2_CONCURRENCY", 4)),
 		blacklistedPeers: make(map[peer.ID]time.Time),
+		pendingBatches:   make(map[string]*pendingBlockBatch),
 	}
 	rcv.pipelineCond = sync.NewCond(&rcv.pipelineMu)
 	// Connect broadcaster back to registry
@@ -401,190 +419,342 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 		Success bool `json:"success"`
 	}{Success: true})
 
-	// 4. Phase 2 (Async Heavy Task & Pipelined Pre-computation)
-	go func() {
-		log.Printf("[Height: %d] [P2P] Starting Phase 2 Async: computing proofs and seeding RLNC pieces for Column %d", height, colIdx)
+	// 4. Block-Level Aggregator Barrier & Async Phase 2
+	rcv.enqueueColumnForPhase2(payload.BlockID, height, colIdx, columnData, pieceCommits, merkleProofs)
+}
 
-		if rcv.phase2Sem != nil {
-			rcv.phase2Sem <- struct{}{}
+func (rcv *Receiver) enqueueColumnForPhase2(
+	blockID string,
+	height int,
+	colIdx int,
+	columnData [][]byte,
+	pieceCommits [][]byte,
+	merkleProofs []cda.MerkleProof,
+) {
+	n := len(columnData)
+	rcv.peersMu.RLock()
+	netCols := rcv.netCols
+	rcv.peersMu.RUnlock()
+	if netCols <= 0 {
+		netCols = 8
+	}
+	expectedCols := n / netCols
+	if expectedCols <= 0 {
+		expectedCols = 1
+	}
+
+	rcv.barrierMu.Lock()
+	batch, exists := rcv.pendingBatches[blockID]
+	fallbackTimeout := time.Duration(getEnvInt("BOOTSTRAP_BARRIER_TIMEOUT_MS", 2000)) * time.Millisecond
+	if !exists {
+		batch = &pendingBlockBatch{
+			blockID:      blockID,
+			height:       height,
+			n:            n,
+			expectedCols: expectedCols,
+			columns:      make(map[int][][]byte),
+			pieceCommits: make(map[int][][]byte),
+			merkleProofs: make(map[int][]cda.MerkleProof),
 		}
-		releasePhase2Sem := sync.OnceFunc(func() {
-			if rcv.phase2Sem != nil {
-				<-rcv.phase2Sem
-			}
+		rcv.pendingBatches[blockID] = batch
+		batch.timer = time.AfterFunc(fallbackTimeout, func() {
+			rcv.flushBlockBatch(blockID)
 		})
-		defer releasePhase2Sem()
-
-		// Generate KZG Opening Proofs for Column
-		start := time.Now()
-		proofs, err := rcv.proofGen.GenerateColumnProofs(colIdx, columnData)
-		duration := time.Since(start).Seconds()
-
-		if err != nil {
-			log.Printf("[Height: %d] Async Proof Generator error for Column %d: %v", height, colIdx, err)
-			return
+	} else {
+		// Debounce: reset the fallback timer on every arriving column so we don't prematurely flush
+		// while the publisher is actively transmitting the remaining columns of this block!
+		batch.mu.Lock()
+		if !batch.dispatched && batch.timer != nil {
+			batch.timer.Reset(fallbackTimeout)
 		}
-		KZGProofDuration.Observe(duration)
-		rcv.cache.SetProofsForCol(payload.BlockID, colIdx, proofs)
-		log.Printf("[Height: %d] Successfully generated opening proofs async for Column %d", height, colIdx)
+		batch.mu.Unlock()
+	}
+	rcv.barrierMu.Unlock()
 
-		// Snapshot the column custody map so seed generation matches active cell size M
-		custodyMap, netRows, _ := rcv.getCustodySnapshot()
+	batch.mu.Lock()
+	if batch.dispatched {
+		batch.mu.Unlock()
+		log.Printf("[Height: %d] Column %d arrived after batch dispatch, processing individually", height, colIdx)
+		go rcv.processPhase2Batch(blockID, height, map[int][][]byte{colIdx: columnData}, map[int][][]byte{colIdx: pieceCommits}, map[int][]cda.MerkleProof{colIdx: merkleProofs})
+		return
+	}
 
-		// Encode RLNC pieces and pre-compute all seeds in memory buffer for active Store Nodes
-		n := len(columnData)
+	batch.columns[colIdx] = columnData
+	batch.pieceCommits[colIdx] = pieceCommits
+	batch.merkleProofs[colIdx] = merkleProofs
+
+	shouldFlush := len(batch.columns) >= batch.expectedCols
+	if shouldFlush && batch.timer != nil {
+		batch.timer.Stop()
+	}
+	batch.mu.Unlock()
+
+	if shouldFlush {
+		go rcv.flushBlockBatch(blockID)
+	}
+}
+
+func (rcv *Receiver) flushBlockBatch(blockID string) {
+	rcv.barrierMu.Lock()
+	batch, exists := rcv.pendingBatches[blockID]
+	if !exists {
+		rcv.barrierMu.Unlock()
+		return
+	}
+	rcv.barrierMu.Unlock()
+
+	batch.mu.Lock()
+	if batch.dispatched || len(batch.columns) == 0 {
+		batch.mu.Unlock()
+		return
+	}
+	batch.dispatched = true
+	if batch.timer != nil {
+		batch.timer.Stop()
+	}
+	columns := batch.columns
+	pieceCommits := batch.pieceCommits
+	merkleProofs := batch.merkleProofs
+	height := batch.height
+	batch.mu.Unlock()
+
+	// Retain the batch in pendingBatches for 30s so late-arriving columns
+	// are cleanly routed to individual processing rather than recreating orphaned batches.
+	time.AfterFunc(30*time.Second, func() {
+		rcv.barrierMu.Lock()
+		delete(rcv.pendingBatches, blockID)
+		rcv.barrierMu.Unlock()
+	})
+
+	rcv.processPhase2Batch(blockID, height, columns, pieceCommits, merkleProofs)
+}
+
+func (rcv *Receiver) processPhase2Batch(
+	blockID string,
+	height int,
+	columnsData map[int][][]byte,
+	pieceCommitsMap map[int][][]byte,
+	merkleProofsMap map[int][]cda.MerkleProof,
+) {
+	numCols := len(columnsData)
+	log.Printf("[Height: %d] [P2P] Starting Phase 2 Async Batch: computing multi-column proofs and seeding RLNC pieces for %d columns in Block %s",
+		height, numCols, blockID)
+
+	if rcv.phase2Sem != nil {
+		rcv.phase2Sem <- struct{}{}
+	}
+	releasePhase2Sem := sync.OnceFunc(func() {
+		if rcv.phase2Sem != nil {
+			<-rcv.phase2Sem
+		}
+	})
+	defer releasePhase2Sem()
+
+	// 1. Generate KZG Opening Proofs for all columns in this batch with 1 Montgomery inversion!
+	start := time.Now()
+	allProofs, err := rcv.proofGen.GenerateMultiColumnProofs(columnsData)
+	duration := time.Since(start).Seconds()
+
+	if err != nil {
+		log.Printf("[Height: %d] Async Proof Generator error for block %s batch: %v", height, blockID, err)
+		return
+	}
+	KZGProofDuration.Observe(duration)
+
+	for colIdx, colProofs := range allProofs {
+		rcv.cache.SetProofsForCol(blockID, colIdx, colProofs)
+		log.Printf("[Height: %d] Successfully generated opening proofs for Column %d (part of %d-col batch)", height, colIdx, numCols)
+	}
+
+	// 2. Snapshot the column custody map
+	custodyMap, netRows, _ := rcv.getCustodySnapshot()
+
+	// 3. Encode RLNC pieces and precompute seeds for each column
+	type precomputedPiece struct {
+		colIdx   int
+		row      int
+		pieceIdx int
+		piece    *cda.ReceivedPiece
+	}
+
+	var allPrecomputedPieces []precomputedPiece
+	var piecesMu sync.Mutex
+
+	var encodeWg sync.WaitGroup
+	var encodeErr error
+	var encodeErrOnce sync.Once
+
+	for colIdx, colData := range columnsData {
+		colProofs := allProofs[colIdx]
+		n := len(colData)
 		overrideSeeds := getEnvInt("BOOTSTRAP_TOTAL_SEEDS_PER_ROW", 0)
 
-		type precomputedPiece struct {
-			row      int
-			pieceIdx int
-			piece    *cda.ReceivedPiece
-		}
+		encodeWg.Add(1)
+		go func(cIdx int, cData [][]byte, cProofs [][][]byte) {
+			defer encodeWg.Done()
+			workerLimit := getEnvInt("BOOTSTRAP_ENCODE_WORKERS", runtime.NumCPU())
+			if workerLimit > n {
+				workerLimit = n
+			}
+			if workerLimit <= 0 {
+				workerLimit = 1
+			}
 
-		piecesByRow := make([][]*cda.ReceivedPiece, n)
-		var encodeErr error
-		var encodeErrOnce sync.Once
-		var encodeWg sync.WaitGroup
+			piecesByRow := make([][]*cda.ReceivedPiece, n)
+			var rowWg sync.WaitGroup
+			for w := 0; w < workerLimit; w++ {
+				rowWg.Add(1)
+				go func(workerID int) {
+					defer rowWg.Done()
+					for rowIdx := workerID; rowIdx < n; rowIdx += workerLimit {
+						targetNetRow := rowIdx % netRows
+						custodyPeers := custodyMap[targetNetRow]
+						totalSeeds, _, _ := p2pcommon.ComputeSeedingPlan(len(custodyPeers), rcv.k)
+						if overrideSeeds > totalSeeds {
+							totalSeeds = overrideSeeds
+						}
 
-		workerLimit := getEnvInt("BOOTSTRAP_ENCODE_WORKERS", runtime.NumCPU())
-		if workerLimit > n {
-			workerLimit = n
-		}
-		if workerLimit <= 0 {
-			workerLimit = 1
-		}
-
-		for w := 0; w < workerLimit; w++ {
-			encodeWg.Add(1)
-			go func(workerID int) {
-				defer encodeWg.Done()
-				for rowIdx := workerID; rowIdx < n; rowIdx += workerLimit {
-					targetNetRow := rowIdx % netRows
-					custodyPeers := custodyMap[targetNetRow]
-					totalSeeds, _, _ := p2pcommon.ComputeSeedingPlan(len(custodyPeers), rcv.k)
-					if overrideSeeds > totalSeeds {
-						totalSeeds = overrideSeeds
+						codedPieces, err := rcv.encoder.EncodeRowNSeeds(rowIdx, cIdx, cData, cProofs[rowIdx], totalSeeds)
+						if err != nil {
+							encodeErrOnce.Do(func() {
+								encodeErr = fmt.Errorf("async RLNC encoding error for row %d (col %d): %w", rowIdx, cIdx, err)
+							})
+							return
+						}
+						piecesByRow[rowIdx] = codedPieces
 					}
+				}(w)
+			}
+			rowWg.Wait()
 
-					codedPieces, err := rcv.encoder.EncodeRowNSeeds(rowIdx, colIdx, columnData, proofs[rowIdx], totalSeeds)
-					if err != nil {
-						encodeErrOnce.Do(func() {
-							encodeErr = fmt.Errorf("async RLNC encoding error for row %d (col %d): %w", rowIdx, colIdx, err)
+			if encodeErr == nil {
+				colPieces := make([]precomputedPiece, 0, n*2*rcv.k)
+				for row := 0; row < n; row++ {
+					for pieceIdx, piece := range piecesByRow[row] {
+						colPieces = append(colPieces, precomputedPiece{
+							colIdx:   cIdx,
+							row:      row,
+							pieceIdx: pieceIdx,
+							piece:    piece,
 						})
-						return
 					}
-					piecesByRow[rowIdx] = codedPieces
 				}
-			}(w)
-		}
-		encodeWg.Wait()
-		releasePhase2Sem()
-
-		if encodeErr != nil {
-			log.Printf("[Height: %d] %v", height, encodeErr)
-			return
-		}
-
-		precomputedPieces := make([]precomputedPiece, 0, n*2*rcv.k)
-		for row := 0; row < n; row++ {
-			for pieceIdx, piece := range piecesByRow[row] {
-				precomputedPieces = append(precomputedPieces, precomputedPiece{
-					row:      row,
-					pieceIdx: pieceIdx,
-					piece:    piece,
-				})
+				piecesMu.Lock()
+				allPrecomputedPieces = append(allPrecomputedPieces, colPieces...)
+				piecesMu.Unlock()
 			}
-		}
+		}(colIdx, colData, colProofs)
+	}
+	encodeWg.Wait()
+	releasePhase2Sem()
 
-		log.Printf("[Height: %d] [Bootstrap Pre-computation] Successfully pre-computed %d opening proofs and %d RLNC seeds in buffer for Column %d, Block %s",
-			height, n, len(precomputedPieces), colIdx, payload.BlockID)
+	if encodeErr != nil {
+		log.Printf("[Height: %d] Encoding error in batch: %v", height, encodeErr)
+		return
+	}
 
-		// Sequential Completion Gate: Wait until store nodes complete the PREVIOUS in-flight block before dispatching.
-		rcv.pipelineMu.Lock()
-		if height > rcv.currentDispatchedHeight {
-			rcv.prevDispatchedHeight = rcv.currentDispatchedHeight
-			rcv.currentDispatchedHeight = height
-			rcv.dispatchedDeadline = time.Now().Add(8 * time.Second)
-			if rcv.prevDispatchedHeight > 0 && rcv.prevDispatchedHeight > rcv.latestCompletedHeight {
-				log.Printf("[Height: %d] [Bootstrap Pipeline] Pre-computed buffer ready! Waiting for in-flight block-%d to complete before dispatching...",
-					height, rcv.prevDispatchedHeight)
-			}
-		}
-		prevHeight := rcv.prevDispatchedHeight
-		deadline := rcv.dispatchedDeadline
-		if height == rcv.currentDispatchedHeight && prevHeight > 0 && prevHeight > rcv.latestCompletedHeight {
-			for rcv.latestCompletedHeight < prevHeight && time.Now().Before(deadline) {
-				rcv.pipelineMu.Unlock()
-				time.Sleep(20 * time.Millisecond)
-				rcv.pipelineMu.Lock()
-			}
-		}
-		rcv.pipelineMu.Unlock()
+	log.Printf("[Height: %d] [Bootstrap Pre-computation] Successfully pre-computed opening proofs and %d RLNC seeds for %d columns in Block %s",
+		height, len(allPrecomputedPieces), numCols, blockID)
 
-		// Dispatch Anchor to GossipSub now that previous block is complete and this block is active
-		if err := rcv.broadcaster.BroadcastAnchor(payload.BlockID, colIdx, pieceCommits, merkleProofs); err != nil {
+	// 4. Sequential Completion Gate: Wait until store nodes complete the PREVIOUS in-flight block before dispatching.
+	rcv.pipelineMu.Lock()
+	if height > rcv.currentDispatchedHeight {
+		rcv.prevDispatchedHeight = rcv.currentDispatchedHeight
+		rcv.currentDispatchedHeight = height
+		rcv.dispatchedDeadline = time.Now().Add(8 * time.Second)
+		if rcv.prevDispatchedHeight > 0 && rcv.prevDispatchedHeight > rcv.latestCompletedHeight {
+			log.Printf("[Height: %d] [Bootstrap Pipeline] Pre-computed batch ready! Waiting for in-flight block-%d to complete before dispatching...",
+				height, rcv.prevDispatchedHeight)
+		}
+	}
+	prevHeight := rcv.prevDispatchedHeight
+	deadline := rcv.dispatchedDeadline
+	if height == rcv.currentDispatchedHeight && prevHeight > 0 && prevHeight > rcv.latestCompletedHeight {
+		for rcv.latestCompletedHeight < prevHeight && time.Now().Before(deadline) {
+			rcv.pipelineMu.Unlock()
+			time.Sleep(20 * time.Millisecond)
+			rcv.pipelineMu.Lock()
+		}
+	}
+	rcv.pipelineMu.Unlock()
+
+	// 5. Broadcast Anchors for all columns in this batch
+	for colIdx := range columnsData {
+		pCommits := pieceCommitsMap[colIdx]
+		mProofs := merkleProofsMap[colIdx]
+		if err := rcv.broadcaster.BroadcastAnchor(blockID, colIdx, pCommits, mProofs); err != nil {
 			log.Printf("[Height: %d] Failed to broadcast anchor for Column %d: %v", height, colIdx, err)
 		}
+	}
 
-		// Group precomputed 2*kPiece seed pools by network row (netRow = item.row % netRows)
-		// and publish each pool onto TopicCellRowSeed(netColIdx, netRow).
-		rowSeedPools := make(map[int][]p2pcommon.BinarySeedPiece, netRows)
-		for _, item := range precomputedPieces {
-			targetNetRow := item.row % netRows
-			seedReq := p2pcommon.BinarySeedPiece{
-				Row:    uint16(item.row),
-				Col:    uint16(colIdx),
-				Data:   item.piece.Data.Data,
-				Coeffs: item.piece.Data.Coeffs,
-				Proof:  item.piece.Proof,
-			}
-			rowSeedPools[targetNetRow] = append(rowSeedPools[targetNetRow], seedReq)
+	// 6. Group precomputed seeds by (colIdx, targetNetRow) and broadcast to GossipSub / persistent streams
+	type colRowKey struct {
+		colIdx int
+		netRow int
+	}
+	seedsByColRow := make(map[colRowKey][]p2pcommon.BinarySeedPiece)
+	for _, item := range allPrecomputedPieces {
+		targetNetRow := item.row % netRows
+		k := colRowKey{colIdx: item.colIdx, netRow: targetNetRow}
+		seedReq := p2pcommon.BinarySeedPiece{
+			Row:    uint16(item.row),
+			Col:    uint16(item.colIdx),
+			Data:   item.piece.Data.Data,
+			Coeffs: item.piece.Data.Coeffs,
+			Proof:  item.piece.Proof,
 		}
+		seedsByColRow[k] = append(seedsByColRow[k], seedReq)
+	}
 
-		netColIdx := rcv.getNetColIdx(colIdx, n)
-		latestCustodyMap, _, _ := rcv.getCustodySnapshot()
+	latestCustodyMap, _, _ := rcv.getCustodySnapshot()
+	seedingLimit := getEnvInt("BOOTSTRAP_SEEDING_SEM", 128)
+	sem := make(chan struct{}, seedingLimit)
+	var seedWg sync.WaitGroup
 
-		var wg sync.WaitGroup
-		seedingLimit := getEnvInt("BOOTSTRAP_SEEDING_SEM", 128)
-		sem := make(chan struct{}, seedingLimit)
-		for targetNetRow, sList := range rowSeedPools {
-			if len(sList) == 0 {
-				continue
-			}
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(nRow int, seeds []p2pcommon.BinarySeedPiece) {
-				defer wg.Done()
-				defer func() { <-sem }()
-
-				batchReq := p2pcommon.BinaryBatchSeedRequest{
-					BlockID:      payload.BlockID,
-					ColIdx:       uint16(colIdx),
-					PieceCommits: pieceCommits,
-					Seeds:        seeds,
-					SenderPeerID: rcv.host.ID().String(),
-				}
-
-				custodyPeers := latestCustodyMap[nRow]
-				subCount, err := rcv.broadcaster.BroadcastRowSeedPool(netColIdx, nRow, batchReq)
-				if err == nil && subCount >= len(custodyPeers) && subCount > 0 {
-					log.Printf("[Height: %d] [GossipSub SeedPool] Published %d seeds for Col %d NetRow %d onto %s (%d subscribers)",
-						height, len(seeds), colIdx, nRow, p2pcommon.TopicCellRowSeed(netColIdx, nRow), subCount)
-					return
-				}
-
-				// Fallback if GossipSub GRAFT has not settled for all assigned custody peers on this row topic
-				for _, tp := range custodyPeers {
-					if bErr := rcv.broadcaster.BroadcastBinaryBatchPieces(tp, batchReq); bErr != nil {
-						log.Printf("[Height: %d] Cold-start fallback seed stream to %s (NetRow %d) failed: %v", height, tp.PeerID, nRow, bErr)
-					}
-				}
-			}(targetNetRow, sList)
+	for crKey, sList := range seedsByColRow {
+		if len(sList) == 0 {
+			continue
 		}
-		wg.Wait()
-		log.Printf("[Height: %d] Async Phase 2 finished successfully: published %d seed pool pieces across %d network rows for Column %d",
-			height, len(precomputedPieces), len(rowSeedPools), colIdx)
-	}()
+		seedWg.Add(1)
+		sem <- struct{}{}
+		go func(key colRowKey, seeds []p2pcommon.BinarySeedPiece) {
+			defer seedWg.Done()
+			defer func() { <-sem }()
+
+			cIdx := key.colIdx
+			nRow := key.netRow
+			pCommits := pieceCommitsMap[cIdx]
+			n := len(columnsData[cIdx])
+			netColIdx := rcv.getNetColIdx(cIdx, n)
+
+			batchReq := p2pcommon.BinaryBatchSeedRequest{
+				BlockID:      blockID,
+				ColIdx:       uint16(cIdx),
+				PieceCommits: pCommits,
+				Seeds:        seeds,
+				SenderPeerID: rcv.host.ID().String(),
+			}
+
+			custodyPeers := latestCustodyMap[nRow]
+			subCount, err := rcv.broadcaster.BroadcastRowSeedPool(netColIdx, nRow, batchReq)
+			if err == nil && subCount > 0 {
+				log.Printf("[Height: %d] [GossipSub SeedPool] Published %d seeds for Col %d NetRow %d onto %s (%d subscribers)",
+					height, len(seeds), cIdx, nRow, p2pcommon.TopicCellRowSeed(netColIdx, nRow), subCount)
+				return
+			}
+
+			// Fallback if GossipSub GRAFT has not settled for all assigned custody peers on this row topic
+			for _, tp := range custodyPeers {
+				if bErr := rcv.broadcaster.BroadcastBinaryBatchPieces(tp, batchReq); bErr != nil {
+					log.Printf("[Height: %d] Cold-start fallback seed stream to %s (NetRow %d) failed: %v", height, tp.PeerID, nRow, bErr)
+				}
+			}
+		}(crKey, sList)
+	}
+	seedWg.Wait()
+
+	log.Printf("[Height: %d] Async Phase 2 finished successfully: published %d seed pool pieces across %d columns for Block %s",
+		height, len(allPrecomputedPieces), numCols, blockID)
 }
 
 // OnBlockCompleted records completion of a block height to trigger immediate dispatch of pre-computed seeds for the next block.
