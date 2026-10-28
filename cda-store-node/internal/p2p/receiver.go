@@ -3182,7 +3182,7 @@ func (rcv *Receiver) completionCheckWorkerLoop(ctx context.Context) {
 // nonCustodyFallbackLoop sweeps pending non-custody cells that have waited >= STORE_NON_CUSTODY_RECODE_WAIT_MS
 // in a single background ticker, eliminating per-cell timer goroutine storms on large blocks (e.g. K=64).
 func (rcv *Receiver) nonCustodyFallbackLoop(ctx context.Context) {
-	waitMs := getEnvInt("STORE_NON_CUSTODY_RECODE_WAIT_MS", 100)
+	waitMs := getEnvInt("STORE_NON_CUSTODY_RECODE_WAIT_MS", 25)
 	waitDur := time.Duration(waitMs) * time.Millisecond
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()

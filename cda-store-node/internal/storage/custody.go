@@ -44,9 +44,10 @@ func NewCustodyStore(port int) *CustodyStore {
 
 		opts := badger.DefaultOptions(dbPath).
 			WithLogger(nil).
-			WithValueLogFileSize(12 * 1024 * 1024). // 12 MB value log file size
-			WithMemTableSize(8 * 1024 * 1024).     // 8 MB memtable size
-			WithValueThreshold(256)                 // values larger than 256 bytes go to vlog
+			WithSyncWrites(false).                  // Asynchronous buffered writes to eliminate host disk fsync contention
+			WithValueLogFileSize(16 * 1024 * 1024). // 16 MB value log file size
+			WithMemTableSize(16 * 1024 * 1024).     // 16 MB memtable size
+			WithValueThreshold(1024)                // Keep small pieces in memtable/LSM to avoid vlog file thrashing
 		db, err := badger.Open(opts)
 		if err != nil {
 			panic(fmt.Sprintf("failed to open badger db: %v", err))
