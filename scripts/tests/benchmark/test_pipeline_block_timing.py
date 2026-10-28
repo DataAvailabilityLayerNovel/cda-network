@@ -141,35 +141,50 @@ def run_pipeline_benchmark(publisher_url, bootstrap_url, k, count, timeout, cell
     benchmark_start = time.time()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
+    # Detect current published height dynamically to avoid collisions
+    start_height = 1
+    try:
+        req = urllib.request.Request(f"{publisher_url.rstrip('/')}/status", headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            status_data = json.loads(resp.read().decode('utf-8'))
+            pub_h = status_data.get("latest_published_height", 0)
+            if pub_h > 0:
+                start_height = pub_h + 1
+    except Exception:
+        pass
+
+    end_height = start_height + count - 1
+
     # Future for in-flight proactive block push
     ahead_future = None
-    next_ahead_height = 1
+    next_ahead_height = start_height
 
-    # Step 1: Push initial block-1
-    block1_id = "block-1"
-    print(f"[{time.strftime('%H:%M:%S')}] Pushing initial {block1_id} (height 1)...", end="", flush=True)
-    ok1, pub_lat1, err1 = publish_block(publish_api, block1_id, 1, k, timeout=timeout, cell_size=cell_size)
+    # Step 1: Push initial block
+    block1_id = f"block-{start_height}"
+    print(f"[{time.strftime('%H:%M:%S')}] Pushing initial {block1_id} (height {start_height})...", end="", flush=True)
+    ok1, pub_lat1, err1 = publish_block(publish_api, block1_id, start_height, k, timeout=timeout, cell_size=cell_size)
     if not ok1:
-        print(f" ❌ FAILED to publish block-1: {err1}")
+        print(f" ❌ FAILED to publish {block1_id}: {err1}")
         return
     print(f" Accepted ({pub_lat1:.2f}s).")
 
-    # Step 2: Proactively push block-2 ahead into pipeline if count >= 2
+    # Step 2: Proactively push next ahead block into pipeline if count >= 2
+    next_ahead_height = start_height + 1
     if count >= 2:
-        block2_id = "block-2"
-        print(f"[{time.strftime('%H:%M:%S')}] 🚀 [PIPELINE] Proactively pushing ahead {block2_id} (height 2) while block-1 is running...", end="", flush=True)
-        ahead_future = executor.submit(publish_block, publish_api, block2_id, 2, k, timeout, cell_size)
-        next_ahead_height = 3
+        block2_id = f"block-{next_ahead_height}"
+        print(f"[{time.strftime('%H:%M:%S')}] 🚀 [PIPELINE] Proactively pushing ahead {block2_id} (height {next_ahead_height}) while {block1_id} is running...", end="", flush=True)
+        ahead_future = executor.submit(publish_block, publish_api, block2_id, next_ahead_height, k, timeout, cell_size)
+        next_ahead_height += 1
 
-    # Main Loop: Process blocks 1 to count
-    for curr_height in range(1, count + 1):
+    # Main Loop: Process blocks start_height to end_height
+    for curr_height in range(start_height, end_height + 1):
         curr_block_id = f"block-{curr_height}"
         curr_start = time.time()
 
         print(f"[{time.strftime('%H:%M:%S')}] Waiting for {curr_block_id} BlockReady (Custody + Non-Custody)...", end="", flush=True)
 
         # If an ahead push was launched in background, check its status
-        if ahead_future is not None and curr_height > 1:
+        if ahead_future is not None and curr_height > start_height:
             try:
                 ok_ahead, lat_ahead, err_ahead = ahead_future.result(timeout=5.0)
                 if not ok_ahead:
@@ -204,7 +219,7 @@ def run_pipeline_benchmark(publisher_url, bootstrap_url, k, count, timeout, cell
             break
 
         # As soon as current block reaches BlockReady, proactively push next ahead block
-        if next_ahead_height <= count:
+        if next_ahead_height <= end_height:
             ahead_block_id = f"block-{next_ahead_height}"
             print(f"[{time.strftime('%H:%M:%S')}] 🚀 [PIPELINE] Proactively pushing ahead {ahead_block_id} (height {next_ahead_height}) into buffer...", end="", flush=True)
             ahead_future = executor.submit(publish_block, publish_api, ahead_block_id, next_ahead_height, k, timeout, cell_size)
