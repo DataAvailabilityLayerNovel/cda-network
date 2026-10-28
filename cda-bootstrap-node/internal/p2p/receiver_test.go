@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"cda-bootstrap-node/internal/engine"
+	"cda-bootstrap-node/internal/storage"
 	p2pcommon "cda-p2p"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	bls12381kzg "github.com/consensys/gnark-crypto/ecc/bls12-381/kzg"
@@ -163,4 +164,91 @@ func TestReceiver_VerifyAndHandleByzantineReport(t *testing.T) {
 	require.False(t, verifiedGrief, "Legit piece should reject byzantine report")
 	require.False(t, rcv.IsPeerBlacklisted(innocentPID), "Innocent peer must NOT be blacklisted")
 	require.True(t, rcv.IsPeerBlacklisted(griefingReporterPID), "Griefing reporter must be blacklisted")
+}
+
+func TestReceiver_BlockAggregatorBarrier(t *testing.T) {
+	t.Setenv("BOOTSTRAP_BARRIER_TIMEOUT_MS", "100")
+	n := 16
+	kPiece := 4
+	cellSize := 512
+	rcv, kzgProv := setupTestReceiver(t, n)
+
+	rcv.cache = storage.NewLocalCache()
+	rcv.proofGen = engine.NewProofGenerator(kPiece, kzgProv)
+	rcv.encoder = engine.NewRLNCEncoder(kPiece, kzgProv)
+	rcv.netCols = 4 // expectedCols = 16 / 4 = 4
+	rcv.netRows = 4
+	rcv.pendingBatches = make(map[string]*pendingBlockBatch)
+
+	// Scenario 1: All expected columns arrive -> triggers immediate batch flush
+	blockID1 := "block-barrier-1"
+	colDataList := make([][][]byte, 4)
+	pieceCommitsList := make([][][]byte, 4)
+	merkleProofsList := make([][]cda.MerkleProof, 4)
+
+	for c := 0; c < 4; c++ {
+		colData := make([][]byte, n)
+		for r := 0; r < n; r++ {
+			colData[r] = make([]byte, cellSize)
+			_, _ = rand.Read(colData[r])
+		}
+		colDataList[c] = colData
+
+		pieceCommits := make([][]byte, kPiece)
+		for p := 0; p < kPiece; p++ {
+			pieceCol := make([][]byte, n)
+			for r := 0; r < n; r++ {
+				pieceCol[r] = colData[r][p*128 : (p+1)*128]
+			}
+			commit, err := kzgProv.Commit(pieceCol)
+			require.NoError(t, err)
+			pieceCommits[p] = commit
+		}
+		pieceCommitsList[c] = pieceCommits
+		merkleProofsList[c] = []cda.MerkleProof{}
+
+		rcv.cache.Store(blockID1, c, colData, pieceCommits)
+		rcv.enqueueColumnForPhase2(blockID1, 1, c, colData, pieceCommits, merkleProofsList[c])
+	}
+
+	// Wait for async batch to complete
+	require.Eventually(t, func() bool {
+		for c := 0; c < 4; c++ {
+			entry, ok := rcv.cache.GetCol(blockID1, c)
+			if !ok || entry == nil || entry.Proofs == nil {
+				return false
+			}
+		}
+		return true
+	}, 3*time.Second, 20*time.Millisecond, "Batch proofs should be generated for all 4 columns")
+
+	for c := 0; c < 4; c++ {
+		entry, ok := rcv.cache.GetCol(blockID1, c)
+		require.True(t, ok)
+		require.NotNil(t, entry.Proofs)
+		require.Len(t, entry.Proofs, n)
+	}
+
+	// Scenario 2: Partial columns arrive (only 2 out of 4) -> fallback timer flushes automatically
+	blockID2 := "block-barrier-2"
+	for c := 0; c < 2; c++ {
+		colData := make([][]byte, n)
+		for r := 0; r < n; r++ {
+			colData[r] = make([]byte, cellSize)
+			_, _ = rand.Read(colData[r])
+		}
+		pieceCommits := make([][]byte, kPiece)
+		for p := 0; p < kPiece; p++ {
+			pieceCommits[p] = pieceCommitsList[0][p]
+		}
+		rcv.cache.Store(blockID2, c, colData, pieceCommits)
+		rcv.enqueueColumnForPhase2(blockID2, 2, c, colData, pieceCommits, []cda.MerkleProof{})
+	}
+
+	// Fallback timer is 100ms -> should complete within 1.5s
+	require.Eventually(t, func() bool {
+		e0, ok0 := rcv.cache.GetCol(blockID2, 0)
+		e1, ok1 := rcv.cache.GetCol(blockID2, 1)
+		return ok0 && ok1 && e0 != nil && e1 != nil && e0.Proofs != nil && e1.Proofs != nil
+	}, 2*time.Second, 20*time.Millisecond, "Fallback timer should flush partial batch for block 2")
 }

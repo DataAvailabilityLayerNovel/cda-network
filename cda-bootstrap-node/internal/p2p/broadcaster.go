@@ -97,6 +97,9 @@ func (b *Broadcaster) BroadcastAnchor(blockID string, colIdx int, pieceCommits [
 	}
 
 	topicName := p2pcommon.TopicCol(colIdx)
+	if b.ps == nil {
+		return nil
+	}
 	b.mu.Lock()
 	if b.topics == nil {
 		b.topics = make(map[string]*pubsub.Topic)
