@@ -53,6 +53,7 @@ type APIService struct {
 	storeReadyPeers       map[string]map[int]map[string]bool // BlockID -> NetColIdx -> set of ready PeerID
 	columnReadyMap        map[string]map[int]bool             // BlockID -> set of NetColIdx
 	blockReadyEmitted     map[string]bool
+	fullCustodyCompleted  map[string]bool
 	blockK                map[string]int
 	blockStartTime        map[string]time.Time
 
@@ -124,8 +125,9 @@ func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.Pub
 		storeReadyMap:     make(map[string]map[int]map[int]bool),
 		storeReadyPeers:   make(map[string]map[int]map[string]bool),
 		columnReadyMap:    make(map[string]map[int]bool),
-		blockReadyEmitted: make(map[string]bool),
-		blockK:            make(map[string]int),
+		blockReadyEmitted:    make(map[string]bool),
+		fullCustodyCompleted: make(map[string]bool),
+		blockK:               make(map[string]int),
 		blockStartTime:    make(map[string]time.Time),
 		inFlightBlocks:    make(map[string]int),
 		rejectedBlocks:    make(map[string]string),
@@ -321,11 +323,6 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 	}
 
 	blockID := payload.BlockID
-	if s.blockReadyEmitted[blockID] {
-		s.colReadyMu.Unlock()
-		return
-	}
-
 	netColIdx := payload.NetColIdx
 	kVal := s.blockK[blockID]
 	if kVal <= 0 {
@@ -400,23 +397,50 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 		s.columnReadyMap[blockID] = make(map[int]bool)
 	}
 
-	quorumRows := netRows
-	quorumPeers := activePeersInCol
+	// BFT Supermajority Quorum: ceil(2*N / 3) = (2*N + 2) / 3
+	bftQuorumRows := (2*netRows + 2) / 3
+	if bftQuorumRows <= 0 {
+		bftQuorumRows = 1
+	} else if bftQuorumRows > netRows {
+		bftQuorumRows = netRows
+	}
+
+	bftQuorumPeers := (2*activePeersInCol + 2) / 3
+	if bftQuorumPeers <= 0 {
+		bftQuorumPeers = 1
+	} else if bftQuorumPeers > activePeersInCol {
+		bftQuorumPeers = activePeersInCol
+	}
+
+	quorumRows := bftQuorumRows
+	quorumPeers := bftQuorumPeers
 	if envQuorum := os.Getenv("STORE_READY_QUORUM"); envQuorum != "" {
 		if val, err := strconv.Atoi(envQuorum); err == nil && val > 0 {
-			if val < quorumRows {
+			if val <= netRows {
 				quorumRows = val
 			}
-			if val < quorumPeers {
+			if val <= activePeersInCol {
 				quorumPeers = val
 			}
 		}
+	} else if os.Getenv("STORE_READY_STRICT_100") == "true" {
+		quorumRows = netRows
+		quorumPeers = activePeersInCol
 	}
 
 	if coveredRowsCount >= quorumRows && readyPeersCount >= quorumPeers {
 		s.columnReadyMap[blockID][netColIdx] = true
 	}
 	readyColCount := len(s.columnReadyMap[blockID])
+
+	// Track 100% full custody convergence
+	if coveredRowsCount >= netRows && readyPeersCount >= activePeersInCol {
+		if !s.fullCustodyCompleted[blockID] {
+			s.fullCustodyCompleted[blockID] = true
+			log.Printf("[Height: %d] [Publisher] 🎉 [FULL_CUSTODY_CONVERGED] Block %s: All %d/%d store nodes (100%%) have successfully completed custody verification!",
+				height, blockID, readyPeersCount, activePeersInCol)
+		}
+	}
 
 	log.Printf("[Height: %d] [Publisher] Received StoreReady from Col %d Row %d Peer %s (RowsCovered=%d/%d, ReadyPeers=%d/%d, quorumRows=%d, quorumPeers=%d). Block %s: %d/%d active columns complete",
 		height, netColIdx, rowIdx, peerKey, coveredRowsCount, netRows, readyPeersCount, activePeersInCol, quorumRows, quorumPeers, blockID, readyColCount, expectedCols)
@@ -426,6 +450,9 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 		s.colReadyMu.Unlock()
 
 		s.broadcastBlockReady(blockID, height, expectedCols)
+
+		// Start background reconciliation to monitor/verify lagging store nodes until 100% completion
+		go s.monitorStoreConvergence(blockID, height, netColIdx, netRows, activePeersInCol)
 		return
 	}
 	s.colReadyMu.Unlock()
@@ -503,6 +530,113 @@ func (s *APIService) broadcastBlockReady(blockID string, height int, activeCols 
 	} else {
 		log.Printf("[Height: %d] [Publisher] Successfully broadcasted BlockReady signal (K=%d) to Light Nodes for %s",
 			height, kVal, blockID)
+	}
+}
+
+func (s *APIService) monitorStoreConvergence(blockID string, height int, netColIdx, netRows, activePeersInCol int) {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.After(8 * time.Second)
+
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+
+	for {
+		select {
+		case <-timeout:
+			s.colReadyMu.Lock()
+			isFull := s.fullCustodyCompleted[blockID]
+			currPeers := 0
+			if s.storeReadyPeers[blockID] != nil {
+				currPeers = len(s.storeReadyPeers[blockID][netColIdx])
+			}
+			s.colReadyMu.Unlock()
+			if !isFull {
+				log.Printf("[Height: %d] [Publisher] ℹ️ [CUSTODY_CONVERGENCE_STATUS] Block %s: %d/%d store nodes converged (Quorum was reached, some peers took longer than 8s).",
+					height, blockID, currPeers, activePeersInCol)
+			}
+			return
+		case <-ticker.C:
+			s.colReadyMu.Lock()
+			isFull := s.fullCustodyCompleted[blockID]
+			reportedPeers := make(map[int]bool)
+			if s.storeReadyPeers[blockID] != nil && s.storeReadyPeers[blockID][netColIdx] != nil {
+				for peerKey := range s.storeReadyPeers[blockID][netColIdx] {
+					var rIdx int
+					if n, err := fmt.Sscanf(peerKey, "row_%d", &rIdx); err == nil && n == 1 {
+						reportedPeers[rIdx] = true
+					}
+				}
+			}
+			s.colReadyMu.Unlock()
+
+			if isFull {
+				return
+			}
+
+			// Active HTTP check on lagging store nodes
+			allDone := true
+			for r := 0; r < activePeersInCol; r++ {
+				if reportedPeers[r] {
+					continue
+				}
+				// Try querying store node directly (both Docker hostname and localhost port)
+				urls := []string{
+					fmt.Sprintf("http://store-%d-%d:8080/store/status/%s", netColIdx, r+1, blockID),
+					fmt.Sprintf("http://localhost:%d/store/status/%s", 9300+r, blockID),
+				}
+				storeDone := false
+				for _, u := range urls {
+					if resp, err := client.Get(u); err == nil {
+						if resp.StatusCode == http.StatusOK {
+							var res struct {
+								Completed bool `json:"completed"`
+							}
+							if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && res.Completed {
+								storeDone = true
+							}
+						}
+						resp.Body.Close()
+						if storeDone {
+							break
+						}
+					}
+				}
+
+				if storeDone {
+					s.colReadyMu.Lock()
+					if s.storeReadyPeers[blockID] == nil {
+						s.storeReadyPeers[blockID] = make(map[int]map[string]bool)
+					}
+					if s.storeReadyPeers[blockID][netColIdx] == nil {
+						s.storeReadyPeers[blockID][netColIdx] = make(map[string]bool)
+					}
+					s.storeReadyPeers[blockID][netColIdx][fmt.Sprintf("row_%d", r)] = true
+					s.storeReadyMap[blockID][netColIdx][r%netRows] = true
+					s.colReadyMu.Unlock()
+					log.Printf("[Height: %d] [Publisher Active Check] Verified lagging Store Node (Row %d) reached completed status for %s", height, r, blockID)
+				} else {
+					allDone = false
+				}
+			}
+
+			s.colReadyMu.Lock()
+			count := 0
+			if s.storeReadyPeers[blockID] != nil && s.storeReadyPeers[blockID][netColIdx] != nil {
+				count = len(s.storeReadyPeers[blockID][netColIdx])
+			}
+			if count >= activePeersInCol && !s.fullCustodyCompleted[blockID] {
+				s.fullCustodyCompleted[blockID] = true
+				log.Printf("[Height: %d] [Publisher] 🎉 [FULL_CUSTODY_CONVERGED] Block %s: All %d/%d store nodes (100%%) have successfully completed custody verification!",
+					height, blockID, count, activePeersInCol)
+				s.colReadyMu.Unlock()
+				return
+			}
+			s.colReadyMu.Unlock()
+
+			if allDone {
+				return
+			}
+		}
 	}
 }
 
@@ -920,7 +1054,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	n := int(eds.Width())
 	k := len(pubData.PieceComm) / n
 	var wg sync.WaitGroup
-	colSem := make(chan struct{}, 4)
+	colSem := make(chan struct{}, 8)
 	for c := 0; c < n; c++ {
 		wg.Add(1)
 		go func(colIdx int) {
@@ -1694,7 +1828,17 @@ func (s *APIService) handleGetBlockData(w http.ResponseWriter, r *http.Request) 
 		"block_id":    blockID,
 		"height":      height,
 		"k":           k,
-		"total_cells": len(ods),
+		"total_cells":      len(ods),
+		"da_quorum_ready": func() bool {
+			s.colReadyMu.Lock()
+			defer s.colReadyMu.Unlock()
+			return s.blockReadyEmitted[blockID]
+		}(),
+		"full_custody": func() bool {
+			s.colReadyMu.Lock()
+			defer s.colReadyMu.Unlock()
+			return s.fullCustodyCompleted[blockID]
+		}(),
 		"active_cols": s.activeCols,
 		"num_cols":    s.numCols,
 		"cells":       cellsHex,
