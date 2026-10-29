@@ -181,28 +181,36 @@ def generate_transactions(count, cell_size=64):
     return txs
 
 
-def wait_for_block_ready(bootstrap_url, expected_block_id, timeout=180, poll_interval=0.2):
+def wait_for_block_ready(bootstrap_url, expected_block_id, publisher_url=None, timeout=180, poll_interval=0.15):
     """
-    Polls /block-ready/latest on Bootstrap Node until expected_block_id is completed.
+    Polls Bootstrap /block-ready/latest and Publisher /block/{id} until expected_block_id reaches BlockReady.
     """
     latest_url = f"{bootstrap_url}/block-ready/latest"
     start = time.time()
     deadline = start + timeout
     while time.time() < deadline:
+        # 1. Exact match on Bootstrap /block-ready/latest
         try:
-            with urllib.request.urlopen(latest_url, timeout=3) as resp:
+            with urllib.request.urlopen(latest_url, timeout=2) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode('utf-8'))
-                    b_id = data.get("block_id")
-                    h = data.get("height", 0)
-                    try:
-                        exp_h = int(expected_block_id.split("-")[-1])
-                    except (ValueError, IndexError):
-                        exp_h = 0
-                    if b_id == expected_block_id or (exp_h > 0 and h >= exp_h):
+                    if data.get("block_id") == expected_block_id:
                         return True, time.time() - start
         except Exception:
             pass
+
+        # 2. Cross-check with Publisher da_quorum_ready
+        if publisher_url:
+            try:
+                b_url = f"{publisher_url}/block/{expected_block_id}"
+                with urllib.request.urlopen(b_url, timeout=2) as resp:
+                    if resp.status == 200:
+                        binfo = json.loads(resp.read().decode('utf-8'))
+                        if binfo.get("da_quorum_ready") is True:
+                            return True, time.time() - start
+            except Exception:
+                pass
+
         time.sleep(poll_interval)
     return False, time.time() - start
 
@@ -298,7 +306,7 @@ def run_e2e_pipeline(cometbft_rpc, publisher_url, bootstrap_url, store_ports, k,
             print(f"  📐 Publisher CDA Header: K={actual_k} (ODS: {actual_k}x{actual_k}={actual_k*actual_k} cells | EDS: {n_cols}x{n_cols}={n_cols*n_cols} cells)")
 
         print(f"[3/5] Waiting for BlockReady on CDA Network for {committed_block_id} (Publisher -> Bootstrap -> Store)...")
-        ready, ready_lat = wait_for_block_ready(bootstrap_url, committed_block_id, timeout=timeout)
+        ready, ready_lat = wait_for_block_ready(bootstrap_url, committed_block_id, publisher_url=publisher_url, timeout=timeout)
         total_block_time = time.time() - t_tx_start
 
         if ready:

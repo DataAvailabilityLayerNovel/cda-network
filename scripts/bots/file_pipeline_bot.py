@@ -153,27 +153,34 @@ def fetch_publisher_block_info(publisher_url, block_id, max_retries=15, poll_int
     return None
 
 
-def wait_for_block_ready(bootstrap_url, expected_block_id, timeout=120, poll_interval=0.2):
+def wait_for_block_ready(bootstrap_url, expected_block_id, publisher_url=None, timeout=120, poll_interval=0.15):
     latest_url = f"{bootstrap_url}/block-ready/latest"
     start = time.time()
     deadline = start + timeout
-    try:
-        exp_h = int(expected_block_id.split("-")[-1])
-    except (ValueError, IndexError):
-        exp_h = 0
 
     while time.time() < deadline:
+        # 1. Exact match on Bootstrap /block-ready/latest
         try:
-            with urllib.request.urlopen(latest_url, timeout=3) as resp:
+            with urllib.request.urlopen(latest_url, timeout=2) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode('utf-8'))
-                    b_id = data.get("block_id")
-                    h = data.get("height", 0)
-                    k = data.get("k", 0)
-                    if b_id == expected_block_id or (exp_h > 0 and h >= exp_h):
-                        return True, time.time() - start, k
+                    if data.get("block_id") == expected_block_id:
+                        return True, time.time() - start, data.get("k", 0)
         except Exception:
             pass
+
+        # 2. Cross-check with Publisher da_quorum_ready
+        if publisher_url:
+            try:
+                b_url = f"{publisher_url}/block/{expected_block_id}"
+                with urllib.request.urlopen(b_url, timeout=2) as resp:
+                    if resp.status == 200:
+                        binfo = json.loads(resp.read().decode('utf-8'))
+                        if binfo.get("da_quorum_ready") is True:
+                            return True, time.time() - start, binfo.get("k", 0)
+            except Exception:
+                pass
+
         time.sleep(poll_interval)
     return False, time.time() - start, 0
 
@@ -443,7 +450,7 @@ def main():
                 cda_queue.task_done()
                 break
             b_id, t_start, exp_k, c_idx, h = item
-            ready, dur_cda, ready_k = wait_for_block_ready(args.bootstrap, b_id, timeout=120)
+            ready, dur_cda, ready_k = wait_for_block_ready(args.bootstrap, b_id, publisher_url=args.publisher, timeout=120)
             tot_dur = time.time() - t_start
             info = fetch_publisher_block_info(args.publisher, b_id, max_retries=5)
             k_fin = ready_k if ready_k > 0 else (info['k'] if info else exp_k)
