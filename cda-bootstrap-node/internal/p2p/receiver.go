@@ -735,18 +735,21 @@ func (rcv *Receiver) processPhase2Batch(
 				SenderPeerID: rcv.host.ID().String(),
 			}
 
+			if encodedBatch, encErr := p2pcommon.EncodeBinaryBatchSeed(&batchReq); encErr == nil {
+				rcv.cache.SetSeedBatchForColRow(blockID, cIdx, nRow, encodedBatch)
+			}
+
 			custodyPeers := latestCustodyMap[nRow]
 			subCount, err := rcv.broadcaster.BroadcastRowSeedPool(netColIdx, nRow, batchReq)
 			if err == nil && subCount > 0 {
 				log.Printf("[Height: %d] [GossipSub SeedPool] Published %d seeds for Col %d NetRow %d onto %s (%d subscribers)",
 					height, len(seeds), cIdx, nRow, p2pcommon.TopicCellRowSeed(netColIdx, nRow), subCount)
-				return
 			}
 
-			// Fallback if GossipSub GRAFT has not settled for all assigned custody peers on this row topic
+			// Always deliver via persistent binary TCP stream to assigned custody peers so no (Col, NetRow) seed batch can be dropped under burst load
 			for _, tp := range custodyPeers {
 				if bErr := rcv.broadcaster.BroadcastBinaryBatchPieces(tp, batchReq); bErr != nil {
-					log.Printf("[Height: %d] Cold-start fallback seed stream to %s (NetRow %d) failed: %v", height, tp.PeerID, nRow, bErr)
+					log.Printf("[Height: %d] Persistent seed stream to %s (Col %d NetRow %d) failed: %v", height, tp.PeerID, cIdx, nRow, bErr)
 				}
 			}
 		}(crKey, sList)
@@ -1057,6 +1060,13 @@ func (rcv *Receiver) VerifyAndHandleByzantineReport(report p2pcommon.ByzantineNo
 
 	// 2. O(1) Pairing verification: does the piece verify against the combined commitment?
 	n := 2 * rcv.kBlock
+	if rcv.cache != nil {
+		if cachedCol, ok := rcv.cache.GetCol(report.BlockID, report.Col); ok && len(cachedCol.ColumnData) > 0 {
+			n = len(cachedCol.ColumnData)
+		} else if cachedPrimary, ok := rcv.cache.Get(report.BlockID); ok && len(cachedPrimary.ColumnData) > 0 {
+			n = len(cachedPrimary.ColumnData)
+		}
+	}
 	if n <= 0 {
 		n = 32
 	}
@@ -1066,14 +1076,14 @@ func (rcv *Receiver) VerifyAndHandleByzantineReport(report p2pcommon.ByzantineNo
 		// Piece is genuinely INVALID! Accusation is TRUE!
 		log.Printf("[Byzantine Report VERIFIED] Peer %s distributed corrupted piece for block %s cell [%d, %d]! Isolating peer.",
 			reportedPID, report.BlockID, report.Row, report.Col)
-		rcv.BlacklistPeer(reportedPID, 24*time.Hour, fmt.Sprintf("distributed invalid piece for block %s cell [%d, %d] (reason: %s)", report.BlockID, report.Row, report.Col, report.Reason))
+		rcv.BlacklistPeer(reportedPID, 2*time.Minute, fmt.Sprintf("distributed invalid piece for block %s cell [%d, %d] (reason: %s)", report.BlockID, report.Row, report.Col, report.Reason))
 		return true, nil
 	}
 
 	// Piece is actually VALID! Reporter attempted a FALSE ACCUSATION (Griefing Attack)!
 	log.Printf("[Byzantine Report REJECTED - GRIEFING DETECTED] Reporter %s falsely accused peer %s for valid piece on block %s cell [%d, %d]! Isolating reporter.",
 		reporterPID, reportedPID, report.BlockID, report.Row, report.Col)
-	rcv.BlacklistPeer(reporterPID, 24*time.Hour, fmt.Sprintf("false accusation/griefing against peer %s on block %s cell [%d, %d]", reportedPID, report.BlockID, report.Row, report.Col))
+	rcv.BlacklistPeer(reporterPID, 2*time.Minute, fmt.Sprintf("false accusation/griefing against peer %s on block %s cell [%d, %d]", reportedPID, report.BlockID, report.Row, report.Col))
 	return false, nil
 }
 

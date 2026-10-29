@@ -119,6 +119,71 @@ func (b *Broadcaster) BroadcastRecodedPiece(blockID string, row, col int, piece 
 	return nil
 }
 
+// BroadcastRecodedBatch packs multiple recoded pieces for a (colIdx, targetNetRow) into a single
+// compact BinaryBatchSeedRequest message and publishes it to TopicCellRowRecode(netColIdx, targetNetRow).
+func (b *Broadcaster) BroadcastRecodedBatch(blockID string, colIdx int, targetNetRow int, pieces []*cda.ReceivedPiece, pieceCommits [][]byte) error {
+	if len(pieces) == 0 {
+		return nil
+	}
+	b.mu.RLock()
+	netColIdx := b.netColIdx
+	netRows := b.netRows
+	b.mu.RUnlock()
+	if netRows <= 0 {
+		netRows = 8
+	}
+	targetNetRow = targetNetRow % netRows
+	if targetNetRow < 0 {
+		targetNetRow += netRows
+	}
+
+	topicName := p2pcommon.TopicCellRow(netColIdx, targetNetRow)
+	topic, err := b.JoinTopic(topicName)
+	if err != nil {
+		return fmt.Errorf("failed to join GossipSub topic %s: %w", topicName, err)
+	}
+
+	seeds := make([]p2pcommon.BinarySeedPiece, 0, len(pieces))
+	for _, p := range pieces {
+		if p == nil {
+			continue
+		}
+		seeds = append(seeds, p2pcommon.BinarySeedPiece{
+			Row:    uint16(p.Row),
+			Col:    uint16(p.Col),
+			Data:   p.Data.Data,
+			Coeffs: p.Data.Coeffs,
+			Proof:  p.Proof,
+		})
+	}
+	if len(seeds) == 0 {
+		return nil
+	}
+
+	batchReq := &p2pcommon.BinaryBatchSeedRequest{
+		BlockID:      blockID,
+		ColIdx:       uint16(colIdx),
+		PieceCommits: pieceCommits,
+		Seeds:        seeds,
+		SenderPeerID: b.selfPeerID,
+	}
+	payloadBytes, err := p2pcommon.EncodeBinaryBatchSeed(batchReq)
+	if err != nil {
+		return fmt.Errorf("failed to encode recoded batch: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := topic.Publish(ctx, payloadBytes); err != nil {
+		return fmt.Errorf("failed to publish recoded batch to GossipSub: %w", err)
+	}
+
+	recordGossipMessage()
+	p2pcommon.LogDebug("[GossipSub] Successfully gossiped binary recoded batch (%d pieces, col=%d, row=%d) to %s", len(seeds), colIdx, targetNetRow, topicName)
+	return nil
+}
+
 // BroadcastStoreReady publishes a StoreReady signal so the publisher can aggregate store custody completion
 func (b *Broadcaster) BroadcastStoreReady(blockID string, height int, netColIdx int, colIdx int, rowIdx int, netRows int, custodyNetRows []int, activePeersInCol int) error {
 	payload := p2pcommon.GossipStoreReadyPayload{
