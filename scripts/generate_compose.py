@@ -28,7 +28,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
     # Publisher
     pub_env = [
         'PUBLISHER_QUEUE_TIMEOUT=300s',
-        f'PUBLISHER_MAX_IN_FLIGHT={publisher_max_in_flight if publisher_max_in_flight is not None else 32}'
+        f'PUBLISHER_MAX_IN_FLIGHT={publisher_max_in_flight if publisher_max_in_flight is not None else 2}'
     ]
     if gomaxprocs is not None:
         pub_env.append(f'GOMAXPROCS={gomaxprocs}')
@@ -237,6 +237,10 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
     # Prometheus
     compose['services']['prometheus'] = {
         'image': 'prom/prometheus:latest',
+        'command': [
+            '--config.file=/etc/prometheus/prometheus.yml',
+            '--web.enable-lifecycle'
+        ],
         'volumes': ['./data/prometheus.yml:/etc/prometheus/prometheus.yml'],
         'ports': ['9090:9090'],
         'networks': ['cda-net']
@@ -384,7 +388,7 @@ providers:
                 "description": "Chiều cao khối hiện tại được đồng thuận bởi cụm validator CometBFT",
                 "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
                 "targets": [
-                    {"expr": "max(cometbft_consensus_height) or vector(0)", "legendFormat": "Consensus Height"}
+                    {"expr": "max({__name__=~\"cometbft_consensus_latest_block_height|cometbft_consensus_height|cda_publisher_latest_published_height|cda_publisher_latest_completed_height\"}) or vector(0)", "legendFormat": "Consensus Height"}
                 ],
                 "options": {
                     "colorMode": "value",
@@ -494,7 +498,7 @@ providers:
                 **line_graph_opts(),
                 "targets": [
                     {
-                        "expr": "max(cometbft_consensus_height)",
+                        "expr": "max({__name__=~\"cometbft_consensus_latest_block_height|cometbft_consensus_height|cda_publisher_latest_published_height|cda_publisher_latest_completed_height\"})",
                         "legendFormat": "CometBFT Consensus Height"
                     },
                     {
@@ -875,8 +879,8 @@ if __name__ == '__main__':
     parser.add_argument('--bootstrap-encode-workers', type=int, default=None, help='Bootstrap RLNC seed encoding parallel worker count')
     parser.add_argument('--bootstrap-seeding-sem', type=int, default=64, help='Bootstrap P2P seeding stream semaphore (default: 64)')
     parser.add_argument('--bootstrap-batch-chunk-size', type=int, default=64, help='Bootstrap P2P batch chunk size (default: 64)')
-    parser.add_argument('--publisher-max-in-flight', type=int, default=None, help='Publisher max in-flight blocks')
-    parser.add_argument('--cometbft-validators', type=int, default=0, help='Number of CometBFT validator nodes (default: 0)')
+    parser.add_argument('--publisher-max-in-flight', type=int, default=2, help='Publisher max in-flight blocks (default: 2)')
+    parser.add_argument('--cometbft-validators', type=int, default=None, help='Number of CometBFT validator nodes (auto-detects from ./data/cometbft if omitted)')
     parser.add_argument('--cell-size', type=int, default=512, help='Cell size in bytes for CDA (default: 512)')
     parser.add_argument('--gomaxprocs', type=int, default=4, help='GOMAXPROCS for Go runtime (default: 4)')
     parser.add_argument('--cpus', type=str, default=None, help='Docker container CPU limit (e.g. 4, 8, 12)')
@@ -884,7 +888,13 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
 
-    if args.cometbft_validators > 0:
+    if args.cometbft_validators is None:
+        detected_validators = 0
+        if os.path.isdir("./data/cometbft"):
+            while os.path.isdir(f"./data/cometbft/node{detected_validators}"):
+                detected_validators += 1
+        args.cometbft_validators = detected_validators
+    elif args.cometbft_validators > 0:
         import sys
         sys.path.append(os.path.dirname(os.path.abspath(__file__)))
         from init_cometbft_cluster import init_cometbft_cluster
