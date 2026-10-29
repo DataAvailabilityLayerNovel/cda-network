@@ -146,7 +146,14 @@ func (s *APIService) IsPeerBlacklisted(peerID string) bool {
 }
 
 func (s *APIService) CacheHeader(header *BlockHeader) {
+	if header == nil || header.BlockID == "" {
+		return
+	}
 	s.headersMu.Lock()
+	if existing, ok := s.headers[header.BlockID]; ok && existing != nil && len(existing.ColumnComm) > 0 {
+		s.headersMu.Unlock()
+		return
+	}
 	s.headers[header.BlockID] = header
 	s.headersMu.Unlock()
 
@@ -1054,29 +1061,33 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 	}
 
 	if !verified {
-		recordDASAttempt(false)
-		ByzantineDetectionsTotal.Inc()
-
-		// Broadcast self-verifiable ByzantineNodeReport and blacklist participating piece providers
+		// Verify each piece individually against its PieceCommits to pinpoint genuinely forged pieces
+		// and avoid false-positive blacklisting of honest Store Nodes on header/epoch mismatches.
+		domainSize := len(header.ColumnComm)
+		corruptedCount := 0
 		for _, op := range originPieces {
-			s.BlacklistPeer(op.sourcePID, 30*time.Minute)
-			s.broadcastByzantineReport(p2pcommon.ByzantineNodeReport{
-				BlockID:        blockID,
-				Height:         height,
-				Row:            row,
-				Col:            col,
-				ReportedPeerID: op.sourcePID,
-				ReporterPeerID: s.host.ID().String(),
-				Data:           hex.EncodeToString(op.piece.Data.Data),
-				Coeffs:         hex.EncodeToString(op.piece.Data.Coeffs),
-				Proof:          hex.EncodeToString(op.piece.Proof),
-				PieceCommits:   op.pieceCommits,
-				Reason:         "das_algebraic_verification_failed",
-				Timestamp:      time.Now().Unix(),
-			})
+			if len(op.pieceCommits) > 0 && !s.verifier.VerifySinglePiece(op.piece, op.pieceCommits, domainSize) {
+				corruptedCount++
+				ByzantineDetectionsTotal.Inc()
+				s.BlacklistPeer(op.sourcePID, 2*time.Minute)
+				s.broadcastByzantineReport(p2pcommon.ByzantineNodeReport{
+					BlockID:        blockID,
+					Height:         height,
+					Row:            row,
+					Col:            col,
+					ReportedPeerID: op.sourcePID,
+					ReporterPeerID: s.host.ID().String(),
+					Data:           hex.EncodeToString(op.piece.Data.Data),
+					Coeffs:         hex.EncodeToString(op.piece.Data.Coeffs),
+					Proof:          hex.EncodeToString(op.piece.Proof),
+					PieceCommits:   op.pieceCommits,
+					Reason:         "das_algebraic_verification_failed",
+					Timestamp:      time.Now().Unix(),
+				})
+			}
 		}
 
-		log.Printf("[DAS Tier-1 Self-Healing] Byzantine pieces detected in cell [%d, %d] of block %s! Isolated peer(s). Initiating Tier-1 fallback...", row, col, blockID)
+		log.Printf("[DAS Tier-1 Self-Healing] Cell [%d, %d] verification failed on block %s (corrupted pieces=%d). Initiating Tier-1 fallback...", row, col, blockID, corruptedCount)
 
 		// Tier-1: Cell-level RLNC piece fetch from honest / backup custody nodes
 		healedCell, tier1Success := s.attemptTier1CellRecovery(ctx, blockID, row, col, header, cachedInfo, allCandidateStores)
@@ -1105,6 +1116,7 @@ func (s *APIService) sampleCell(blockID string, row, col int, header *BlockHeade
 			}
 		}
 
+		recordDASAttempt(false)
 		if s.crashOnFail {
 			log.Fatalf("DAS verification failed (CRASH) for cell [%d, %d]: algebraic direct verification failed (Tier-1 and Tier-2 healing failed: %v)", row, col, repairErr)
 		}
@@ -1172,12 +1184,8 @@ func (s *APIService) attemptTier1CellRecovery(
 	allStores []p2pcommon.PeerInfo,
 ) (string, bool) {
 	targetK := s.verifier.K()
+	domainSize := len(header.ColumnComm)
 	var cleanPieces []cda.ReceivedPiece
-	type cleanOrigin struct {
-		piece     cda.ReceivedPiece
-		sourcePID string
-	}
-	var cleanOrigins []cleanOrigin
 
 	for _, store := range allStores {
 		if s.IsPeerBlacklisted(store.PeerID) {
@@ -1237,25 +1245,26 @@ func (s *APIService) attemptTier1CellRecovery(
 				continue
 			}
 
+			newPiece := cda.ReceivedPiece{
+				Row: p.Row,
+				Col: p.Col,
+				Data: rlnc.PieceData{
+					Data:   decData,
+					Coeffs: decCoeffs,
+				},
+				Proof: cda.OpeningProof(decProof),
+			}
+			if len(p.PieceCommits) > 0 && !s.verifier.VerifySinglePiece(newPiece, p.PieceCommits, domainSize) {
+				s.BlacklistPeer(store.PeerID, 2*time.Minute)
+				continue
+			}
+
 			existingCoeffs := make([][]byte, len(cleanPieces))
 			for i, cp := range cleanPieces {
 				existingCoeffs[i] = cp.Data.Coeffs
 			}
 			if verifier.IsLinearlyIndependent(existingCoeffs, decCoeffs, targetK) {
-				newPiece := cda.ReceivedPiece{
-					Row: p.Row,
-					Col: p.Col,
-					Data: rlnc.PieceData{
-						Data:   decData,
-						Coeffs: decCoeffs,
-					},
-					Proof: cda.OpeningProof(decProof),
-				}
 				cleanPieces = append(cleanPieces, newPiece)
-				cleanOrigins = append(cleanOrigins, cleanOrigin{
-					piece:     newPiece,
-					sourcePID: store.PeerID,
-				})
 			}
 		}
 
@@ -1269,15 +1278,11 @@ func (s *APIService) attemptTier1CellRecovery(
 	}
 
 	columnCommitment := header.ColumnComm[col]
-	recCell, ok, err := s.verifier.VerifyReconstructedCell(cleanPieces, columnCommitment, header.Coeffs, row, len(header.ColumnComm))
+	recCell, ok, err := s.verifier.VerifyReconstructedCell(cleanPieces, columnCommitment, header.Coeffs, row, domainSize)
 	if err == nil && ok {
 		return recCell, true
 	}
 
-	// If these fallback pieces also failed algebraic verification, blacklist those sources too
-	for _, co := range cleanOrigins {
-		s.BlacklistPeer(co.sourcePID, 30*time.Minute)
-	}
 	return "", false
 }
 
@@ -1297,41 +1302,78 @@ func (s *APIService) attemptTier2RSRepair(
 		n = 16
 	}
 
-	// RS codeword requires >= k valid cells along row 'row'
-	rowShares := make([][]byte, n)
-	validCount := 0
+	rsEncoder, err := reedsolomon.New(k, k, reedsolomon.WithLeopardGF(true))
+	if err != nil {
+		return "", false, fmt.Errorf("failed to initialize Leopard RS decoder: %w", err)
+	}
 
-	for c := 0; c < n; c++ {
-		if c == targetCol {
+	// 1. Try Row-wise RS reconstruction along row 'row' if enough active columns exist
+	numCols := s.numCols
+	if numCols <= 0 {
+		numCols = 8
+	}
+	colsPerNetCol := n / numCols
+	if colsPerNetCol <= 0 {
+		colsPerNetCol = 1
+	}
+	activeMatrixCols := len(s.bootstrapsMap) * colsPerNetCol
+
+	rowShares := make([][]byte, n)
+	validRowCount := 0
+	if activeMatrixCols >= k {
+		for c := 0; c < n; c++ {
+			if c == targetCol {
+				continue
+			}
+			cellHex, ok := s.fetchCellDirectly(ctx, blockID, row, c, header)
+			if ok && cellHex != "" {
+				cellBytes, err := hex.DecodeString(cellHex)
+				if err == nil && len(cellBytes) > 0 {
+					rowShares[c] = cellBytes
+					validRowCount++
+					if validRowCount >= k {
+						break
+					}
+				}
+			}
+		}
+		if validRowCount >= k {
+			if err := rsEncoder.Reconstruct(rowShares); err == nil && len(rowShares[targetCol]) > 0 {
+				return hex.EncodeToString(rowShares[targetCol]), true, nil
+			}
+		}
+	}
+
+	// 2. Fallback to Column-wise 2D Reed-Solomon reconstruction along column 'targetCol'
+	// (Works even with active_cols=1 whenever >= k rows out of n=2*k are available in targetCol!)
+	colShares := make([][]byte, n)
+	validColCount := 0
+	for r := 0; r < n; r++ {
+		if r == row {
 			continue
 		}
-		cellHex, ok := s.fetchCellDirectly(ctx, blockID, row, c, header)
+		cellHex, ok := s.fetchCellDirectly(ctx, blockID, r, targetCol, header)
 		if ok && cellHex != "" {
 			cellBytes, err := hex.DecodeString(cellHex)
 			if err == nil && len(cellBytes) > 0 {
-				rowShares[c] = cellBytes
-				validCount++
-				if validCount >= k {
+				colShares[r] = cellBytes
+				validColCount++
+				if validColCount >= k {
 					break
 				}
 			}
 		}
 	}
 
-	if validCount < k {
-		return "", false, fmt.Errorf("insufficient cells for Tier-2 RS reconstruction: got %d, need %d", validCount, k)
+	if validColCount < k {
+		return "", false, fmt.Errorf("insufficient cells for Tier-2 2D RS reconstruction (rowGot=%d, colGot=%d, need=%d)", validRowCount, validColCount, k)
 	}
 
-	rsEncoder, err := reedsolomon.New(k, k, reedsolomon.WithLeopardGF(true))
-	if err != nil {
-		return "", false, fmt.Errorf("failed to initialize Leopard RS decoder: %w", err)
+	if err := rsEncoder.Reconstruct(colShares); err != nil {
+		return "", false, fmt.Errorf("Reed-Solomon column reconstruction failed: %w", err)
 	}
 
-	if err := rsEncoder.Reconstruct(rowShares); err != nil {
-		return "", false, fmt.Errorf("Reed-Solomon row reconstruction failed: %w", err)
-	}
-
-	reconstructedTargetCell := rowShares[targetCol]
+	reconstructedTargetCell := colShares[row]
 	if len(reconstructedTargetCell) == 0 {
 		return "", false, fmt.Errorf("reconstructed target cell is empty")
 	}

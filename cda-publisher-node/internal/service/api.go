@@ -139,7 +139,34 @@ func NewAPIService(pipeline *engine.Pipeline, sender *p2p.Sender, ps *pubsub.Pub
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
+			var cbftHeight int
+			if body, status, err := svc.queryCometBFT("status"); err == nil && status == http.StatusOK {
+				var statusResp struct {
+					Result struct {
+						SyncInfo struct {
+							LatestBlockHeight string `json:"latest_block_height"`
+						} `json:"sync_info"`
+					} `json:"result"`
+				}
+				if json.Unmarshal(body, &statusResp) == nil && statusResp.Result.SyncInfo.LatestBlockHeight != "" {
+					if h, err := strconv.Atoi(statusResp.Result.SyncInfo.LatestBlockHeight); err == nil && h > 0 {
+						cbftHeight = h
+					}
+				}
+			}
+
 			svc.colReadyMu.Lock()
+			effectiveH := svc.latestPublishedHeight
+			if svc.latestCompletedHeight > effectiveH {
+				effectiveH = svc.latestCompletedHeight
+			}
+			if cbftHeight > effectiveH {
+				effectiveH = cbftHeight
+			}
+			if effectiveH > 0 {
+				LatestPublishedHeight.Set(float64(effectiveH))
+				CometBFTConsensusHeight.Set(float64(effectiveH))
+			}
 			// Invariant 1: When latest completed height >= latest published height, all published blocks are done.
 			if svc.latestCompletedHeight >= svc.latestPublishedHeight && svc.latestPublishedHeight > 0 {
 				if len(svc.inFlightBlocks) > 0 || svc.inFlightCount > 0 {
@@ -475,12 +502,17 @@ func (s *APIService) broadcastBlockReady(blockID string, height int, activeCols 
 	if height > s.latestCompletedHeight {
 		s.latestCompletedHeight = height
 	}
+	if s.latestCompletedHeight > s.latestPublishedHeight {
+		s.latestPublishedHeight = s.latestCompletedHeight
+	}
 	if s.latestCompletedHeight >= s.latestPublishedHeight && s.latestPublishedHeight > 0 {
 		if s.inFlightBlocks != nil {
 			s.inFlightBlocks = make(map[string]int)
 		}
 		s.inFlightCount = 0
 	}
+	LatestPublishedHeight.Set(float64(s.latestPublishedHeight))
+	CometBFTConsensusHeight.Set(float64(s.latestPublishedHeight))
 	LatestCompletedHeight.Set(float64(s.latestCompletedHeight))
 	InFlightBlocks.Set(float64(s.inFlightCount))
 
@@ -830,9 +862,29 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		reqHeight = p2pcommon.ParseHeightFromBlockID(req.BlockID)
 	}
 
-	// 0.4 Idempotency Check: if block already completed, return existing header without re-entering pipeline
+	// 0.4 Idempotency & Monotonic BlockID Protection:
+	// - For BFT consensus blocks (req.Header != nil), if block_id is already completed/cached, return cached header idempotently.
+	// - For direct/benchmark publish requests (req.Header == nil && s.sequencerPubKey == ""), if block_id or height collides
+	//   with an already published/in-flight block, auto-assign the next monotonic height and block-<height>.
 	s.colReadyMu.Lock()
-	if s.blockReadyEmitted[req.BlockID] || (reqHeight > 0 && reqHeight <= s.latestCompletedHeight) {
+	_, alreadyStarted := s.blockStartTime[req.BlockID]
+	_, alreadyInFlight := s.inFlightBlocks[req.BlockID]
+	alreadyCompleted := s.blockReadyEmitted[req.BlockID] || (reqHeight > 0 && reqHeight <= s.latestCompletedHeight)
+
+	if req.Header == nil && s.sequencerPubKey == "" {
+		if alreadyCompleted || alreadyStarted || alreadyInFlight || (reqHeight > 0 && reqHeight <= s.latestPublishedHeight) {
+			nextH := s.latestPublishedHeight + 1
+			if s.latestCompletedHeight+1 > nextH {
+				nextH = s.latestCompletedHeight + 1
+			}
+			oldBlockID := req.BlockID
+			reqHeight = nextH
+			req.Height = int64(reqHeight)
+			req.BlockID = fmt.Sprintf("block-%d", reqHeight)
+			log.Printf("[Height: %d] [Publisher] Remapped colliding direct publish %s -> %s (monotonic height %d)",
+				reqHeight, oldBlockID, req.BlockID, reqHeight)
+		}
+	} else if alreadyCompleted {
 		s.colReadyMu.Unlock()
 		log.Printf("[Height: %d] [Publisher] Block %s already completed (latest completed: %d). Returning cached header.", reqHeight, req.BlockID, s.latestCompletedHeight)
 		if s.db != nil {
@@ -852,9 +904,9 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-	} else {
-		s.colReadyMu.Unlock()
+		s.colReadyMu.Lock()
 	}
+	s.colReadyMu.Unlock()
 
 	queueTimeout := 300 * time.Second
 	if envTimeout := os.Getenv("PUBLISHER_QUEUE_TIMEOUT"); envTimeout != "" {
@@ -865,7 +917,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	maxInFlight := 32
+	maxInFlight := 2
 	if envMax := os.Getenv("PUBLISHER_MAX_IN_FLIGHT"); envMax != "" {
 		if m, err := strconv.Atoi(envMax); err == nil && m > 0 {
 			maxInFlight = m
@@ -891,6 +943,11 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("Block height %d timed out waiting in publisher queue (%d in-flight, max in-flight: %d after waiting %v)", reqHeight, currentInFlight, maxInFlight, queueTimeout), http.StatusUnprocessableEntity)
 			return
 		}
+	}
+	if reqHeight > s.latestPublishedHeight {
+		s.latestPublishedHeight = reqHeight
+		LatestPublishedHeight.Set(float64(s.latestPublishedHeight))
+		CometBFTConsensusHeight.Set(float64(s.latestPublishedHeight))
 	}
 	s.inFlightBlocks[req.BlockID] = reqHeight
 	s.inFlightCount = len(s.inFlightBlocks)
@@ -990,6 +1047,8 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 	s.colReadyMu.Lock()
 	if reqHeight > s.latestPublishedHeight {
 		s.latestPublishedHeight = reqHeight
+		LatestPublishedHeight.Set(float64(s.latestPublishedHeight))
+		CometBFTConsensusHeight.Set(float64(s.latestPublishedHeight))
 	}
 	s.blockK[header.BlockID] = kBlock
 	s.blockStartTime[header.BlockID] = start

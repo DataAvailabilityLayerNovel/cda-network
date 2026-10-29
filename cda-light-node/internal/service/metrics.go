@@ -49,9 +49,14 @@ var (
 	})
 )
 
+const dasWindowSize = 256
+
 var (
 	dasAttempts int64
 	dasSuccess  int64
+	dasWindow   [dasWindowSize]bool
+	dasWinIdx   int
+	dasWinCount int
 	dasMu       sync.Mutex
 
 	dialAttempts int64
@@ -78,7 +83,18 @@ func recordDASAttempt(success bool) {
 	if success {
 		dasSuccess++
 	}
-	rate := float64(dasSuccess) / float64(dasAttempts) * 100.0
+	dasWindow[dasWinIdx] = success
+	dasWinIdx = (dasWinIdx + 1) % dasWindowSize
+	if dasWinCount < dasWindowSize {
+		dasWinCount++
+	}
+	winSucc := 0
+	for i := 0; i < dasWinCount; i++ {
+		if dasWindow[i] {
+			winSucc++
+		}
+	}
+	rate := float64(winSucc) / float64(dasWinCount) * 100.0
 	dasMu.Unlock()
 
 	DASAttemptsTotal.Inc()
