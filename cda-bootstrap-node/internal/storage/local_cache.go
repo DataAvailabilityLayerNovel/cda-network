@@ -10,7 +10,8 @@ type CachedColumn struct {
 	ColIdx       int
 	ColumnData   [][]byte
 	PieceCommits [][]byte
-	Proofs       [][][]byte // row -> pieceIdx -> proof bytes
+	Proofs       [][][]byte     // row -> pieceIdx -> proof bytes
+	SeedBatches  map[int][]byte // netRow -> encoded BinaryBatchSeedRequest
 	CreatedAt    time.Time
 }
 
@@ -37,8 +38,36 @@ func (c *LocalCache) Store(blockID string, colIdx int, colData [][]byte, pieceCo
 		ColIdx:       colIdx,
 		ColumnData:   colData,
 		PieceCommits: pieceCommits,
+		SeedBatches:  make(map[int][]byte),
 		CreatedAt:    time.Now(),
 	}
+}
+
+func (c *LocalCache) SetSeedBatchForColRow(blockID string, colIdx int, netRow int, encodedBatch []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if cols, exists := c.cached[blockID]; exists {
+		if entry, ok := cols[colIdx]; ok {
+			if entry.SeedBatches == nil {
+				entry.SeedBatches = make(map[int][]byte)
+			}
+			entry.SeedBatches[netRow] = encodedBatch
+		}
+	}
+}
+
+func (c *LocalCache) GetSeedBatchForColRow(blockID string, colIdx int, netRow int) ([]byte, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if cols, exists := c.cached[blockID]; exists {
+		if entry, ok := cols[colIdx]; ok && entry.SeedBatches != nil {
+			b, found := entry.SeedBatches[netRow]
+			return b, found && len(b) > 0
+		}
+	}
+	return nil, false
 }
 
 func (c *LocalCache) SetProofs(blockID string, proofs [][][]byte) {

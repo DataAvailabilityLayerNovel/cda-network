@@ -94,6 +94,18 @@ func (s *SyncService) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	if colStr := r.URL.Query().Get("col"); colStr != "" {
 		if colIdx, err := strconv.Atoi(colStr); err == nil {
+			if netRowStr := r.URL.Query().Get("net_row"); netRowStr != "" {
+				if netRow, errNR := strconv.Atoi(netRowStr); errNR == nil {
+					if rawBatch, ok := s.cache.GetSeedBatchForColRow(blockID, colIdx, netRow); ok {
+						w.Header().Set("Content-Type", "application/octet-stream")
+						w.WriteHeader(http.StatusOK)
+						_, _ = w.Write(rawBatch)
+						return
+					}
+					http.Error(w, "Seed batch not found in cache", http.StatusNotFound)
+					return
+				}
+			}
 			col, exists := s.cache.GetCol(blockID, colIdx)
 			if !exists {
 				http.Error(w, "Column not found in cache", http.StatusNotFound)
