@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math/big"
@@ -31,32 +32,93 @@ func (v *DASVerifier) K() int {
 	return v.k
 }
 
-// IsLinearlyIndependent checks if the new coefficient vector is linearly independent of existing ones.
+// VerifySinglePiece verifies an individual coded piece against its column PieceCommits in O(1) pairing time.
+func (v *DASVerifier) VerifySinglePiece(piece cda.ReceivedPiece, pieceCommitsHex []string, domainSize int) bool {
+	if len(pieceCommitsHex) == 0 || len(piece.Data.Data) == 0 || len(piece.Proof) == 0 {
+		return false
+	}
+	if len(piece.Proof) == 80 && !cda.VerifyClaimedValue(piece.Data.Data, piece.Proof) {
+		return false
+	}
+	commits := make([]cda.PieceCommitment, len(pieceCommitsHex))
+	for i, cHex := range pieceCommitsHex {
+		b, err := hex.DecodeString(cHex)
+		if err != nil {
+			return false
+		}
+		commits[i] = cda.PieceCommitment(b)
+	}
+	combinedCommit, err := v.kzg.Combine(commits, piece.Data.Coeffs)
+	if err != nil {
+		return false
+	}
+	return v.kzg.VerifyForDomain(combinedCommit, piece.Row, piece.Data.Data, piece.Proof, domainSize)
+}
+
+func parseCoeffRowFr(coeff []byte, k int) ([]fr.Element, bool) {
+	if len(coeff) != k && len(coeff) != 2*k {
+		return nil, false
+	}
+	v := make([]fr.Element, k)
+	isTwoByte := len(coeff) == 2*k
+	for j := 0; j < k; j++ {
+		if isTwoByte {
+			cVal := binary.BigEndian.Uint16(coeff[j*2 : (j+1)*2])
+			v[j].SetUint64(uint64(cVal))
+		} else {
+			v[j].SetUint64(uint64(coeff[j]))
+		}
+	}
+	return v, true
+}
+
+// IsLinearlyIndependent checks if the new coefficient vector is linearly independent of existing ones over Fr.
 func IsLinearlyIndependent(existingCoeffs [][]byte, newCoeff []byte, k int) bool {
-	m := len(existingCoeffs)
-	if m >= k {
+	if len(existingCoeffs) >= k {
 		return false
 	}
 
-	A := make([][]byte, k)
-	for i := 0; i < m; i++ {
-		A[i] = append([]byte(nil), existingCoeffs[i]...)
+	basis := make([][]fr.Element, k)
+	addRow := func(coeff []byte) bool {
+		v, ok := parseCoeffRowFr(coeff, k)
+		if !ok {
+			return false
+		}
+		var term fr.Element
+		for col := 0; col < k; col++ {
+			if v[col].IsZero() {
+				continue
+			}
+			if basis[col] != nil {
+				factor := v[col]
+				bRow := basis[col]
+				v[col].SetZero()
+				for j := col + 1; j < k; j++ {
+					if !bRow[j].IsZero() {
+						term.Mul(&bRow[j], &factor)
+						v[j].Sub(&v[j], &term)
+					}
+				}
+			} else {
+				var inv fr.Element
+				inv.Inverse(&v[col])
+				v[col].SetOne()
+				for j := col + 1; j < k; j++ {
+					if !v[j].IsZero() {
+						v[j].Mul(&v[j], &inv)
+					}
+				}
+				basis[col] = v
+				return true
+			}
+		}
+		return false
 	}
-	A[m] = append([]byte(nil), newCoeff...)
 
-	for i := m + 1; i < k; i++ {
-		row := make([]byte, k)
-		row[i] = 1
-		A[i] = row
+	for _, c := range existingCoeffs {
+		addRow(c)
 	}
-
-	B := make([][]byte, k)
-	for i := 0; i < k; i++ {
-		B[i] = make([]byte, 32)
-	}
-
-	_, err := rlnc.SolveGaussian(A, B)
-	return err == nil
+	return addRow(newCoeff)
 }
 
 // InvertMatrixFr computes the inverse of a k x k matrix in Fr by solving k systems using rlnc.SolveGaussian.

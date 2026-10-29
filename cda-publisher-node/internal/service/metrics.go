@@ -21,6 +21,16 @@ var (
 		Help: "Instantaneous throughput of the latest publish in bytes/second.",
 	})
 
+	LatestPublishedHeight = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "cda_publisher_latest_published_height",
+		Help: "Block height of the latest published/consensus block admitted to the CDA publisher pipeline.",
+	})
+
+	CometBFTConsensusHeight = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "cometbft_consensus_height",
+		Help: "Latest consensus block height observed by the CDA publisher or CometBFT cluster.",
+	})
+
 	LatestCompletedHeight = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "cda_publisher_latest_completed_height",
 		Help: "Block height of the latest completed block on CDA network.",
@@ -53,6 +63,8 @@ func init() {
 		RSEncodeDuration,
 		ThroughputBytesTotal,
 		ThroughputBytesRate,
+		LatestPublishedHeight,
+		CometBFTConsensusHeight,
 		LatestCompletedHeight,
 		LatestK,
 		InFlightBlocks,
