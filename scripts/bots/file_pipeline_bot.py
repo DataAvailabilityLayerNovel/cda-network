@@ -3,15 +3,16 @@
 file_pipeline_bot.py - CDA Network File Ingestion, Chunking & Verification Bot.
 
 Handles:
-1. Ingestion: Reads a file from disk (--file) or generates synthetic data (--size).
-2. Chunking: Splits the file into ~500 KB chunks, each formatted into key-value
-   transaction slices for CometBFT and CDA Network.
+1. Namespace & Blob Ingestion: Splits files into ~500 KB chunks and ~500B slices
+   under URI key format: cda/<namespace>/<blob_id>/s/<chunk>_<slice>.
+2. On-Chain Head Manifest: Commits metadata manifest (cda/<namespace>/<blob_id>/meta)
+   in the first block, making data discovery 100% self-describing and stateless.
 3. Pipelined Submission: Submits chunks consecutively into CometBFT blocks while
    tracking CDA BlockReady and KZG commitments asynchronously.
-4. Manifest Recording: Generates a comprehensive JSON manifest with all metadata
-   (file hash, block heights, tx keys/hashes, KZG commits_root) needed for exact retrieval.
-5. Verification & Retrieval (--retrieve): Downloads chunks via CDA Publisher API,
-   reassembles the original file, and validates SHA-256 hash match.
+4. Stateless Retrieval: Reconstructs files from URI (cda://<namespace>/<blob_id>)
+   without requiring offline local JSON manifests.
+5. Catalog Discovery: Lists all registered blobs in a namespace via Publisher API
+   or CometBFT search.
 """
 
 import argparse
@@ -57,6 +58,19 @@ def parse_size_str(size_str):
     return int(s)
 
 
+def parse_cda_uri(uri_str):
+    """Parses URIs like 'cda://namespace/blob_id', 'cda/namespace/blob_id', or 'namespace/blob_id'."""
+    clean = uri_str.strip()
+    if clean.startswith("cda://"):
+        clean = clean[len("cda://"):]
+    elif clean.startswith("cda/"):
+        clean = clean[len("cda/"):]
+    parts = clean.split("/")
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    raise ValueError(f"Invalid CDA URI '{uri_str}'. Expected format: 'cda://<namespace>/<blob_id>'")
+
+
 def submit_tx_to_cometbft(cometbft_rpc, tx_bytes, timeout=30):
     if isinstance(tx_bytes, str):
         tx_bytes = tx_bytes.encode('utf-8')
@@ -83,8 +97,6 @@ def submit_tx_to_cometbft(cometbft_rpc, tx_bytes, timeout=30):
 
 
 def broadcast_tx_batch(cometbft_rpc, txs, max_workers=32, timeout=30):
-    last_tx_hash = None
-    first_tx_hash = None
     hashes = [None] * len(txs)
 
     def send_one(idx, tx):
@@ -118,66 +130,86 @@ def broadcast_tx_batch(cometbft_rpc, txs, max_workers=32, timeout=30):
 
 def wait_for_tx_commit(cometbft_rpc, tx_hash, timeout=60, poll_interval=0.1):
     url = f"{cometbft_rpc}/tx?hash=0x{tx_hash}&prove=false"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    start = time.time()
+    while time.time() - start < timeout:
         try:
-            with urllib.request.urlopen(url, timeout=3) as resp:
+            req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
                 res = data.get("result", {})
-                h = res.get("height")
-                if h:
-                    return int(h)
+                if res.get("height"):
+                    return int(res["height"])
+        except urllib.error.HTTPError:
+            pass
         except Exception:
             pass
         time.sleep(poll_interval)
-    raise TimeoutError(f"Tx {tx_hash} not committed within {timeout}s")
+    raise TimeoutError(f"Tx 0x{tx_hash} was not committed within {timeout}s")
 
 
-def fetch_publisher_block_info(publisher_url, block_id, max_retries=15, poll_interval=0.2):
+def fetch_publisher_block_info(publisher_url, block_id, max_retries=5):
     url = f"{publisher_url}/header/{block_id}"
-    for _ in range(max_retries):
+    for attempt in range(max_retries):
         try:
             data = http_get_json(url, timeout=3)
-            if data and "column_comm" in data:
-                n = len(data["column_comm"])
-                k = n // 2
+            if data and "commits_root" in data:
+                k_val = len(data.get("column_comm", [])) // 2
                 return {
-                    "k": k,
-                    "n": n,
                     "commits_root": data.get("commits_root", ""),
-                    "chain_id": data.get("chain_id", ""),
+                    "k": k_val if k_val > 0 else 32
                 }
         except Exception:
-            pass
-        time.sleep(poll_interval)
+            time.sleep(0.5)
     return None
 
 
-def wait_for_block_ready(bootstrap_url, expected_block_id, publisher_url=None, timeout=120, poll_interval=0.15):
-    latest_url = f"{bootstrap_url}/block-ready/latest"
+def wait_for_block_ready(bootstrap_url, expected_block_id, publisher_url=None, timeout=120, poll_interval=0.1):
     start = time.time()
-    deadline = start + timeout
-
-    while time.time() < deadline:
-        # 1. Exact match on Bootstrap /block-ready/latest
+    url = f"{bootstrap_url}/ready"
+    last_h = 0
+    exp_h = 0
+    if expected_block_id and expected_block_id.startswith("block-"):
         try:
-            with urllib.request.urlopen(latest_url, timeout=2) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode('utf-8'))
-                    if data.get("block_id") == expected_block_id:
+            exp_h = int(expected_block_id.split("-")[1])
+        except Exception:
+            exp_h = 0
+
+    while time.time() - start < timeout:
+        try:
+            req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                b_id = data.get("block_id")
+                h = data.get("height", 0)
+                if h > last_h:
+                    last_h = h
+
+                is_target_block = False
+                if expected_block_id and b_id == expected_block_id:
+                    is_target_block = True
+
+                if is_target_block:
+                    if publisher_url:
+                        try:
+                            b_url = f"{publisher_url}/block/{expected_block_id}"
+                            b_info = http_get_json(b_url, timeout=2)
+                            if b_info and b_info.get("status") == "success":
+                                if b_info.get("da_quorum_ready", False):
+                                    return True, time.time() - start, data.get("k", b_info.get("k", 0))
+                        except Exception:
+                            pass
+                    else:
                         return True, time.time() - start, data.get("k", 0)
         except Exception:
             pass
 
-        # 2. Cross-check with Publisher da_quorum_ready
         if publisher_url:
             try:
                 b_url = f"{publisher_url}/block/{expected_block_id}"
-                with urllib.request.urlopen(b_url, timeout=2) as resp:
-                    if resp.status == 200:
-                        binfo = json.loads(resp.read().decode('utf-8'))
-                        if binfo.get("da_quorum_ready") is True:
-                            return True, time.time() - start, binfo.get("k", 0)
+                binfo = http_get_json(b_url, timeout=2)
+                if binfo and binfo.get("status") == "success":
+                    if binfo.get("da_quorum_ready", False):
+                        return True, time.time() - start, binfo.get("k", 0)
             except Exception:
                 pass
 
@@ -186,7 +218,7 @@ def wait_for_block_ready(bootstrap_url, expected_block_id, publisher_url=None, t
 
 
 # ------------------------------------------------------------------------------
-# RETRIEVE MODULE
+# RETRIEVAL MODULE
 # ------------------------------------------------------------------------------
 
 def fetch_single_tx_by_key(publisher_url, key, timeout=10):
@@ -200,12 +232,301 @@ def fetch_single_tx_by_key(publisher_url, key, timeout=10):
     raise KeyError(f"Key {key} not found: {data.get('message')}")
 
 
-def retrieve_file_from_manifest(manifest_path, output_path, publisher_url, workers=32):
+def list_blobs_in_namespace(namespace, publisher_url, cometbft_rpc):
     print("=" * 80)
-    print("CDA NETWORK - FILE RETRIEVAL & INTEGRITY VERIFICATION")
-    print(f"Manifest Path : {manifest_path}")
-    print(f"Output Target : {output_path}")
-    print(f"Publisher API : {publisher_url}")
+    print(f"CDA NETWORK - NAMESPACE CATALOG: '{namespace}'")
+    print(f"Publisher API: {publisher_url}")
+    print("=" * 80)
+
+    blobs = []
+    # 1. Try Publisher API
+    try:
+        url = f"{publisher_url}/api/v1/namespaces/{namespace}/blobs"
+        resp = http_get_json(url, timeout=5)
+        if resp.get("status") == "success" and "blobs" in resp:
+            blobs = resp["blobs"]
+    except Exception:
+        pass
+
+    # 2. Fallback to CometBFT tx_search
+    if not blobs:
+        try:
+            query = urllib.parse.quote(f"app.key CONTAINS 'cda/{namespace}/' AND app.key CONTAINS '/meta'")
+            url = f"{cometbft_rpc}/tx_search?query=\"{query}\"&per_page=50"
+            resp = http_get_json(url, timeout=10)
+            txs = resp.get("result", {}).get("txs", [])
+            for t in txs:
+                raw_b64 = t.get("tx", "")
+                decoded = base64.b64decode(raw_b64).decode('utf-8', errors='ignore')
+                if "=" in decoded:
+                    k, v = decoded.split("=", 1)
+                    parts = k.split("/")
+                    b_id = parts[2] if len(parts) >= 3 else "unknown"
+                    try:
+                        try:
+                            raw_bytes = bytes.fromhex(v)
+                            m_obj = json.loads(raw_bytes.decode('utf-8'))
+                        except Exception:
+                            m_obj = json.loads(v)
+                        blobs.append({
+                            "blob_id": b_id,
+                            "filename": m_obj.get("filename", ""),
+                            "total_size": m_obj.get("total_size", 0),
+                            "sha256": m_obj.get("sha256", ""),
+                            "total_slices": m_obj.get("total_slices", 0),
+                            "status": "READY",
+                            "block_heights": [int(t.get("height", 0))]
+                        })
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Warning querying CometBFT: {e}")
+
+    if not blobs:
+        print(f"ℹ️ No blobs found in namespace '{namespace}'.")
+        return
+
+    print(f"{'BLOB ID':<20} | {'FILENAME':<24} | {'SIZE (KB)':<10} | {'STATUS':<10} | {'SHA256 (PREFIX)':<16}")
+    print("-" * 90)
+    for b in blobs:
+        b_id = b.get("blob_id", "")
+        fn = b.get("filename", "")[:24]
+        sz = f"{b.get('total_size', 0) / 1024:.1f}"
+        st = b.get("status", "READY")
+        sh = b.get("sha256", "")[:16]
+        print(f"{b_id:<20} | {fn:<24} | {sz:<10} | {st:<10} | {sh:<16}")
+    print("=" * 90)
+
+
+def retrieve_file_stateless(namespace, blob_id, output_path, publisher_url, cometbft_rpc, workers=32, retrieval_mode="auto"):
+    print("=" * 80)
+    print("CDA NETWORK - STATELESS BLOB RETRIEVAL & INTEGRITY VERIFICATION")
+    print(f"Target URI     : cda://{namespace}/{blob_id}")
+    print(f"Publisher API  : {publisher_url}")
+    print(f"Retrieval Mode : {retrieval_mode.upper()}")
+    print("=" * 80)
+
+    # 1. Fetch on-chain manifest
+    meta_key = f"cda/{namespace}/{blob_id}/meta"
+    print(f"🔍 Fetching On-Chain Manifest for 'cda://{namespace}/{blob_id}'...")
+
+    manifest = None
+    # Try publisher /api/v1/namespaces/{ns}/blobs/{id}
+    try:
+        url = f"{publisher_url}/api/v1/namespaces/{namespace}/blobs/{blob_id}"
+        resp = http_get_json(url, timeout=5)
+        if resp.get("status") == "success" and resp.get("blob"):
+            b = resp["blob"]
+            manifest = {
+                "file_id": blob_id,
+                "filename": b.get("filename", f"{blob_id}.bin"),
+                "file_size": b.get("total_size", 0),
+                "file_sha256": b.get("sha256", ""),
+                "total_chunks": b.get("total_chunks", 1),
+                "chunk_size": b.get("chunk_size", 512000),
+                "slice_size": b.get("slice_size", 500),
+                "total_slices": b.get("total_slices", 0),
+                "block_heights": b.get("block_heights", [])
+            }
+    except Exception:
+        pass
+
+    # Fallback to /tx?key=cda/<ns>/<blob_id>/meta
+    if not manifest or manifest.get("file_size", 0) == 0:
+        try:
+            raw_meta_str = fetch_single_tx_by_key(publisher_url, meta_key, timeout=10)
+            try:
+                raw_bytes = bytes.fromhex(raw_meta_str)
+                m_obj = json.loads(raw_bytes.decode('utf-8'))
+            except Exception:
+                m_obj = json.loads(raw_meta_str)
+            manifest = {
+                "file_id": blob_id,
+                "filename": m_obj.get("filename", f"{blob_id}.bin"),
+                "file_size": m_obj.get("total_size", 0),
+                "file_sha256": m_obj.get("sha256", ""),
+                "total_chunks": m_obj.get("total_chunks", 1),
+                "chunk_size": m_obj.get("chunk_size", 512000),
+                "slice_size": m_obj.get("slice_size", 500),
+                "total_slices": m_obj.get("total_slices", 0),
+                "block_heights": []
+            }
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch on-chain manifest for cda://{namespace}/{blob_id}: {e}")
+
+    filename = manifest.get("filename", f"{blob_id}.bin")
+    expected_size = manifest["file_size"]
+    expected_sha256 = manifest["file_sha256"]
+    total_chunks = max(1, manifest.get("total_chunks", 1))
+    slice_size = manifest.get("slice_size", 500)
+    chunk_size = manifest.get("chunk_size", 512000)
+    total_slices = manifest.get("total_slices", 0)
+    if total_slices == 0 and expected_size > 0:
+        total_slices = math.ceil(expected_size / slice_size)
+
+    if not output_path:
+        output_path = f"retrieved_{filename}"
+
+    print(f"\n📂 Namespace   : {namespace}")
+    print(f"📦 Blob ID     : {blob_id}")
+    print(f"📄 Filename    : {filename}")
+    print(f"📏 Size        : {expected_size} bytes ({expected_size / 1024 / 1024:.2f} MB)")
+    print(f"🧩 Chunks      : {total_chunks}")
+    print(f"🍰 Slices      : {total_slices}")
+    print(f"🔒 SHA-256     : {expected_sha256}")
+    print("-" * 80)
+
+    start_time = time.time()
+
+    # Direction 1.2: Direct Streaming Download
+    if retrieval_mode in ["auto", "direct"]:
+        try:
+            print("⚡ Attempting Direction 1.2: Direct Streaming Download...")
+            dl_url = f"{publisher_url}/api/v1/namespaces/{namespace}/blobs/{blob_id}/download"
+            req = urllib.request.Request(dl_url)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status == 200:
+                    full_file = resp.read()
+                    if len(full_file) == expected_size and (not expected_sha256 or hashlib.sha256(full_file).hexdigest() == expected_sha256):
+                        elapsed = time.time() - start_time
+                        rate_mb = (len(full_file) / 1024 / 1024) / max(0.001, elapsed)
+                        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+                        with open(output_path, "wb") as f:
+                            f.write(full_file)
+                        print(f"🎉 Direct Download Succeeded in {elapsed:.3f}s ({rate_mb:.2f} MB/s)!")
+                        print(f"💾 File saved successfully to: {output_path}")
+                        print("=" * 80)
+                        return
+        except Exception as e:
+            if retrieval_mode == "direct":
+                raise RuntimeError(f"Direct download failed in 'direct' mode: {e}")
+            print(f"⚠️ Direct download unavailable ({e}), trying next retrieval mode...")
+
+    # Collect deterministic slice keys
+    all_slice_keys = []
+    for c_idx in range(total_chunks):
+        offset = c_idx * chunk_size
+        actual_chunk_size = min(chunk_size, expected_size - offset)
+        num_slices = math.ceil(actual_chunk_size / slice_size)
+        for s_idx in range(num_slices):
+            key = f"cda/{namespace}/{blob_id}/s/{c_idx:03d}_{s_idx:04d}"
+            all_slice_keys.append(key)
+
+    # Direction 1.1: Batch Slice Query (POST /tx/batch)
+    if retrieval_mode in ["auto", "batch"]:
+        print(f"ℹ️ Retrieving via Direction 1.1: Batch Query API (POST /tx/batch) in 500-key batches ({len(all_slice_keys)} slices)...")
+        batch_size = 500
+        slice_data_map = {}
+        batch_failed = False
+        t_batch_start = time.time()
+
+        for i in range(0, len(all_slice_keys), batch_size):
+            chunk_keys = all_slice_keys[i:i + batch_size]
+            try:
+                req_data = json.dumps({"keys": chunk_keys}).encode('utf-8')
+                batch_req = urllib.request.Request(
+                    f"{publisher_url}/tx/batch",
+                    data=req_data,
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(batch_req, timeout=15) as b_resp:
+                    if b_resp.status == 200:
+                        b_data = json.loads(b_resp.read().decode('utf-8'))
+                        if b_data.get("status") == "success":
+                            res_map = b_data.get("results", {})
+                            for k, v in res_map.items():
+                                if "=" in v:
+                                    v = v.split("=", 1)[1]
+                                slice_data_map[k] = bytes.fromhex(v)
+                        else:
+                            batch_failed = True
+                            break
+                    else:
+                        batch_failed = True
+                        break
+            except Exception as e:
+                print(f"⚠️ Batch query error: {e}")
+                batch_failed = True
+                break
+
+        if not batch_failed and len(slice_data_map) == len(all_slice_keys):
+            assembled = bytearray()
+            for k in all_slice_keys:
+                assembled.extend(slice_data_map[k])
+            full_file = bytes(assembled[:expected_size])
+            calc_sha256 = hashlib.sha256(full_file).hexdigest()
+            elapsed = time.time() - start_time
+            print(f"\nReconstructed SHA-256 : {calc_sha256}")
+            print(f"Expected SHA-256      : {expected_sha256}")
+
+            if expected_sha256 and calc_sha256 != expected_sha256:
+                print("❌ INTEGRITY CHECK FAILED: SHA-256 mismatch!")
+                sys.exit(1)
+
+            print("🎉 INTEGRITY CHECK PASSED: 100% SHA-256 match!")
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            with open(output_path, "wb") as f:
+                f.write(full_file)
+            rate_mb = (len(full_file) / 1024 / 1024) / max(0.001, elapsed)
+            print(f"💾 File saved successfully to: {output_path}")
+            print(f"⏱️ Total Retrieval Time (Batch Query API): {elapsed:.3f}s ({rate_mb:.2f} MB/s)")
+            print("=" * 80)
+            return
+
+        if retrieval_mode == "batch":
+            raise RuntimeError(f"Batch query failed to retrieve all slices ({len(slice_data_map)} / {len(all_slice_keys)} retrieved)")
+
+    # Parallel single slice retrieval (Fallback / Baseline)
+    print(f"ℹ️ Reconstructing via parallel single-slice retrieval ({len(all_slice_keys)} slices, {workers} workers)...")
+    slices = [None] * len(all_slice_keys)
+
+    def fetch_slice(s_idx, s_key):
+        for retry in range(3):
+            try:
+                hex_val = fetch_single_tx_by_key(publisher_url, s_key, timeout=10)
+                return s_idx, bytes.fromhex(hex_val)
+            except Exception:
+                time.sleep(0.2)
+        raise RuntimeError(f"Failed to fetch slice key {s_key}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(fetch_slice, i, key): i for i, key in enumerate(all_slice_keys)}
+        for f in concurrent.futures.as_completed(futures):
+            i, b = f.result()
+            slices[i] = b
+
+    assembled = bytearray()
+    for s in slices:
+        if s:
+            assembled.extend(s)
+    full_file = bytes(assembled[:expected_size])
+
+    calc_sha256 = hashlib.sha256(full_file).hexdigest()
+    elapsed = time.time() - start_time
+    print(f"\nReconstructed SHA-256 : {calc_sha256}")
+    print(f"Expected SHA-256      : {expected_sha256}")
+
+    if expected_sha256 and calc_sha256 != expected_sha256:
+        print("❌ INTEGRITY CHECK FAILED: SHA-256 mismatch!")
+        sys.exit(1)
+
+    print("🎉 INTEGRITY CHECK PASSED: 100% SHA-256 match!")
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "wb") as f:
+        f.write(full_file)
+    rate_mb = (len(full_file) / 1024 / 1024) / max(0.001, elapsed)
+    print(f"💾 File saved successfully to: {output_path}")
+    print(f"⏱️ Total Retrieval Time (Parallel Baseline): {elapsed:.3f}s ({rate_mb:.2f} MB/s)")
+    print("=" * 80)
+
+
+def retrieve_file_from_manifest(manifest_path, output_path, publisher_url, workers=32, retrieval_mode="auto"):
+    print("=" * 80)
+    print("CDA NETWORK - FILE RETRIEVAL & INTEGRITY VERIFICATION (MANIFEST MODE)")
+    print(f"Manifest Path  : {manifest_path}")
+    print(f"Output Target  : {output_path}")
+    print(f"Publisher API  : {publisher_url}")
+    print(f"Retrieval Mode : {retrieval_mode.upper()}")
     print("=" * 80)
 
     if not os.path.isfile(manifest_path):
@@ -243,49 +564,53 @@ def retrieve_file_from_manifest(manifest_path, output_path, publisher_url, worke
 
         print(f"\n[Retrieving Chunk #{c_idx:03d} / {len(chunks_meta)}] Size: {c_size} bytes | Height: #{c_height}...")
 
-        # 1. First attempt: Retrieve via /block/:height/data (ODS Matrix Reconstruction)
         chunk_bytes = None
         t_start_chunk = time.time()
-        try:
-            block_data_url = f"{publisher_url}/block/{c_height}/data"
-            b_resp = http_get_json(block_data_url, timeout=20)
-            if b_resp.get("status") == "success" and b_resp.get("cells"):
-                raw_cell_blob = bytearray()
-                for c_hex in b_resp["cells"]:
-                    cb = bytes.fromhex(c_hex)
-                    raw_cell_blob.extend(cb)
 
-                # Search and extract slices from raw_cell_blob
-                found_slices = {}
-                for key in tx_keys:
-                    key_bytes = key.encode('utf-8') + b"="
-                    pos = raw_cell_blob.find(key_bytes)
-                    if pos != -1:
-                        val_start = pos + len(key_bytes)
-                        # Find end of slice hex data (either next slice or non-hex byte)
-                        # Slice size in hex is known from manifest
-                        exp_slice_hex_len = (c_meta.get("slice_size", 500)) * 2
-                        slice_hex = raw_cell_blob[val_start:val_start + exp_slice_hex_len].decode('ascii', errors='ignore')
-                        try:
-                            found_slices[key] = bytes.fromhex(slice_hex)
-                        except ValueError:
-                            pass
-
-                if len(found_slices) == len(tx_keys):
+        # Batch query attempt via POST /tx/batch
+        if chunk_bytes is None and retrieval_mode in ["auto", "batch"]:
+            try:
+                batch_size = 500
+                chunk_slice_data = {}
+                batch_err = False
+                for bi in range(0, len(tx_keys), batch_size):
+                    sub_keys = tx_keys[bi:bi + batch_size]
+                    req_data = json.dumps({"keys": sub_keys}).encode('utf-8')
+                    batch_req = urllib.request.Request(
+                        f"{publisher_url}/tx/batch",
+                        data=req_data,
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(batch_req, timeout=15) as b_resp:
+                        if b_resp.status == 200:
+                            b_data = json.loads(b_resp.read().decode('utf-8'))
+                            if b_data.get("status") == "success":
+                                res_map = b_data.get("results", {})
+                                for k, v in res_map.items():
+                                    if "=" in v:
+                                        v = v.split("=", 1)[1]
+                                    chunk_slice_data[k] = bytes.fromhex(v)
+                            else:
+                                batch_err = True
+                                break
+                        else:
+                            batch_err = True
+                            break
+                if not batch_err and len(chunk_slice_data) == len(tx_keys):
                     assembled = bytearray()
                     for k in tx_keys:
-                        assembled.extend(found_slices[k])
-                    assembled = assembled[:c_size]
-                    if hashlib.sha256(assembled).hexdigest() == c_sha256:
-                        chunk_bytes = bytes(assembled)
-                        print(f"  ✅ Reconstructed via CDA Block #{c_height} ODS Matrix in {time.time() - t_start_chunk:.3f}s")
-        except Exception as e:
-            # Fallback to key-value query
-            pass
+                        assembled.extend(chunk_slice_data[k])
+                    raw_full = bytes(assembled[:c_size])
+                    if not c_sha256 or hashlib.sha256(raw_full).hexdigest() == c_sha256:
+                        chunk_bytes = raw_full
+                        dur_c = time.time() - t_start_chunk
+                        rate_c = (len(chunk_bytes) / 1024 / 1024) / max(0.001, dur_c)
+                        print(f"  🎉 Chunk #{c_idx:03d} retrieved via Batch Query API in {dur_c:.3f}s ({rate_c:.2f} MB/s)")
+            except Exception:
+                pass
 
-        # 2. Fallback attempt: Retrieve via Two-Tier /tx?key=... in parallel
+        # Fallback / parallel query
         if chunk_bytes is None:
-            print(f"  ℹ️ Falling back to parallel /tx?key=... query for {len(tx_keys)} slices...")
             slices = [None] * len(tx_keys)
 
             def fetch_slice(s_idx, s_key):
@@ -308,7 +633,8 @@ def retrieve_file_from_manifest(manifest_path, output_path, publisher_url, worke
 
             assembled = bytearray()
             for s in slices:
-                assembled.extend(s)
+                if s:
+                    assembled.extend(s)
             assembled = assembled[:c_size]
 
             calc_chunk_sha256 = hashlib.sha256(assembled).hexdigest()
@@ -316,11 +642,12 @@ def retrieve_file_from_manifest(manifest_path, output_path, publisher_url, worke
                 raise ValueError(f"Chunk #{c_idx} SHA-256 mismatch! Expected {c_sha256}, got {calc_chunk_sha256}")
 
             chunk_bytes = bytes(assembled)
-            print(f"  ✅ Reconstructed via Two-Tier /tx?key= query in {time.time() - t_start_chunk:.3f}s")
+            dur_c = time.time() - t_start_chunk
+            rate_c = (len(chunk_bytes) / 1024 / 1024) / max(0.001, dur_c)
+            print(f"  ✅ Reconstructed via Two-Tier /tx?key= query in {dur_c:.3f}s ({rate_c:.2f} MB/s)")
 
         reconstructed_chunks[c_idx] = chunk_bytes
 
-    # Assemble entire file
     full_file = bytearray()
     for c in reconstructed_chunks:
         full_file.extend(c)
@@ -341,19 +668,18 @@ def retrieve_file_from_manifest(manifest_path, output_path, publisher_url, worke
 
     print("🎉 INTEGRITY CHECK PASSED: 100% SHA-256 exact match!")
 
-    # Write output file
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "wb") as f:
         f.write(full_file)
 
     rate_mb = (final_size / 1024 / 1024) / max(0.001, elapsed)
     print(f"💾 File saved successfully to: {output_path}")
-    print(f"⏱️ Total Retrieval Time      : {elapsed:.2f}s ({rate_mb:.2f} MB/s)")
+    print(f"⏱️ Total Retrieval Time      : {elapsed:.3f}s ({rate_mb:.2f} MB/s)")
     print("=" * 80)
 
 
 # ------------------------------------------------------------------------------
-# UPLOAD / SUBMIT MODULE
+# UPLOAD / SUBMISSION MODULE
 # ------------------------------------------------------------------------------
 
 def main():
@@ -362,32 +688,51 @@ def main():
     parser.add_argument("--size", type=str, default="2MB", help="Synthetic file size if no --file is given (e.g. '2MB', '1.5M', '500KB')")
     parser.add_argument("--chunk-size", type=str, default="500KB", help="Target chunk size per block (default: 500KB, ~K=32)")
     parser.add_argument("--slice-size", type=int, default=500, help="Payload bytes per transaction slice (default: 500 bytes)")
+    parser.add_argument("--namespace", type=str, default="cda-default", help="Target namespace (default: 'cda-default')")
+    parser.add_argument("--blob-id", type=str, default="", help="Optional unique blob ID (defaults to auto-generated)")
+    parser.add_argument("--uri", type=str, default="", help="CDA URI for retrieval (e.g. 'cda://namespace/blob_id')")
+    parser.add_argument("--list-blobs", action="store_true", default=False, help="List all registered blobs in namespace")
     parser.add_argument("--manifest", type=str, default="", help="Path to save or read manifest JSON file")
-    parser.add_argument("--retrieve", action="store_true", default=False, help="Run in retrieval mode: reconstruct file from manifest")
+    parser.add_argument("--retrieve", action="store_true", default=False, help="Run in retrieval mode: reconstruct file from URI or manifest")
+    parser.add_argument("--retrieval-mode", type=str, default="auto", choices=["auto", "direct", "batch", "parallel"], help="Retrieval mode: 'auto' (direct->batch->parallel), 'direct' (streaming API), 'batch' (POST /tx/batch), 'parallel' (single slice queries)")
     parser.add_argument("--output", type=str, default="", help="Target output file path for --retrieve mode")
     parser.add_argument("--cometbft", type=str, default="http://localhost:26657", help="CometBFT RPC endpoint")
     parser.add_argument("--publisher", type=str, default="http://localhost:8080", help="CDA Publisher API endpoint")
     parser.add_argument("--bootstrap", type=str, default="http://localhost:9200", help="CDA Bootstrap API endpoint")
     parser.add_argument("--workers", type=int, default=32, help="Concurrency workers for broadcasting (default: 32)")
+    parser.add_argument("--native-blob", action=argparse.BooleanOptionalAction, default=True, help="Enable Native Blob Transaction mode (default: true)")
     parser.add_argument("--wait-cda", action=argparse.BooleanOptionalAction, default=True, help="Wait for CDA BlockReady in the background (default: true)")
     parser.add_argument("--max-in-flight", type=int, default=4, help="Maximum in-flight blocks in CDA pipeline (default: 4)")
     args = parser.parse_args()
 
-    # Dispatch to retrieve mode if requested
-    if args.retrieve:
-        manifest_path = args.manifest
-        if not manifest_path:
-            print("❌ Error: --retrieve requires --manifest <path_to_manifest.json>")
-            sys.exit(1)
-        out_path = args.output
-        if not out_path:
-            out_path = "retrieved_" + os.path.basename(manifest_path).replace(".manifest.json", "")
-        retrieve_file_from_manifest(manifest_path, out_path, args.publisher, workers=args.workers)
+    # 1. Dispatch: List blobs in namespace
+    if args.list_blobs:
+        list_blobs_in_namespace(args.namespace, args.publisher, args.cometbft)
         return
 
-    # Ingestion mode
+    # 2. Dispatch: Retrieval mode
+    if args.retrieve:
+        if args.uri:
+            ns, b_id = parse_cda_uri(args.uri)
+            retrieve_file_stateless(ns, b_id, args.output, args.publisher, args.cometbft, workers=args.workers, retrieval_mode=args.retrieval_mode)
+            return
+        elif args.namespace and args.blob_id:
+            retrieve_file_stateless(args.namespace, args.blob_id, args.output, args.publisher, args.cometbft, workers=args.workers, retrieval_mode=args.retrieval_mode)
+            return
+        elif args.manifest:
+            out_path = args.output
+            if not out_path:
+                out_path = "retrieved_" + os.path.basename(args.manifest).replace(".manifest.json", "")
+            retrieve_file_from_manifest(args.manifest, out_path, args.publisher, workers=args.workers, retrieval_mode=args.retrieval_mode)
+            return
+        else:
+            print("❌ Error: --retrieve requires either --uri cda://<ns>/<id>, --namespace & --blob-id, or --manifest <file.json>")
+            sys.exit(1)
+
+    # 3. Ingestion mode
     chunk_size_bytes = parse_size_str(args.chunk_size)
     slice_size_bytes = args.slice_size
+    namespace = args.namespace.strip()
 
     if args.file:
         if not os.path.isfile(args.file):
@@ -403,28 +748,32 @@ def main():
         print(f"🎲 Generating synthetic pseudo-random data file of {total_size} bytes ({total_size / 1024 / 1024:.2f} MB)...")
         file_bytes = os.urandom(total_size)
 
-    file_id = f"f_{uuid.uuid4().hex[:8]}"
+    blob_id = args.blob_id.strip() if args.blob_id else f"b_{uuid.uuid4().hex[:8]}"
     file_sha256 = hashlib.sha256(file_bytes).hexdigest()
     total_file_size = len(file_bytes)
     total_chunks = math.ceil(total_file_size / chunk_size_bytes)
+    total_slices = math.ceil(total_file_size / slice_size_bytes)
 
     manifest_output_path = args.manifest
     if not manifest_output_path:
         manifest_output_path = f"{file_name}.manifest.json"
 
     print("=" * 80)
-    print("CDA NETWORK - FILE PIPELINE & INGESTION BOT")
-    print(f"File ID         : {file_id}")
+    print("CDA NETWORK - FILE PIPELINE & NAMESPACE INGESTION BOT")
+    print(f"Namespace       : {namespace}")
+    print(f"Blob ID         : {blob_id}")
+    print(f"Target URI      : cda://{namespace}/{blob_id}")
     print(f"File Name       : {file_name}")
     print(f"Total Size      : {total_file_size} bytes ({total_file_size / 1024 / 1024:.2f} MB)")
     print(f"SHA-256         : {file_sha256}")
     print(f"Chunk Size      : {chunk_size_bytes} bytes (~{chunk_size_bytes / 1024:.1f} KB / block)")
     print(f"Total Chunks    : {total_chunks}")
+    print(f"Total Slices    : {total_slices}")
     print(f"Slice Size      : {slice_size_bytes} bytes / tx")
     print(f"CometBFT RPC    : {args.cometbft}")
     print(f"CDA Publisher   : {args.publisher}")
     print(f"CDA Bootstrap   : {args.bootstrap}")
-    print(f"Manifest File   : {manifest_output_path}")
+    print(f"Backup Manifest : {manifest_output_path}")
     print("=" * 80)
 
     # Health check
@@ -451,7 +800,6 @@ def main():
                 break
             b_id, t_start, exp_k, c_idx, h = item
             ready, dur_cda, ready_k = wait_for_block_ready(args.bootstrap, b_id, publisher_url=args.publisher, timeout=120)
-            tot_dur = time.time() - t_start
             info = fetch_publisher_block_info(args.publisher, b_id, max_retries=5)
             k_fin = ready_k if ready_k > 0 else (info['k'] if info else exp_k)
             commits_root = info['commits_root'] if info else ""
@@ -485,67 +833,150 @@ def main():
     manifest_chunks = []
     start_time = time.time()
 
-    try:
-        for chunk_idx in range(total_chunks):
-            offset = chunk_idx * chunk_size_bytes
-            chunk_data = file_bytes[offset:offset + chunk_size_bytes]
-            actual_chunk_size = len(chunk_data)
-            chunk_sha256 = hashlib.sha256(chunk_data).hexdigest()
+    # Build Head Manifest
+    on_chain_manifest = {
+        "version": 1,
+        "namespace": namespace,
+        "blob_id": blob_id,
+        "filename": file_name,
+        "total_size": total_file_size,
+        "sha256": file_sha256,
+        "total_chunks": total_chunks,
+        "chunk_size": chunk_size_bytes,
+        "slice_size": slice_size_bytes,
+        "total_slices": total_slices,
+        "created_at": int(time.time()),
+    }
+    manifest_raw = json.dumps(on_chain_manifest, separators=(',', ':')).encode('utf-8')
+    manifest_tx_str = f"cda/{namespace}/{blob_id}/meta={manifest_raw.hex()}"
 
-            # Split chunk into slices
-            num_slices = math.ceil(actual_chunk_size / slice_size_bytes)
+    try:
+        if args.native_blob:
+            print(f"\n🚀 [Native Blob Mode] Uploading {total_file_size / 1024:.1f} KB as Native Blob Transaction(s)...")
             txs = []
             tx_keys = []
-            for s_idx in range(num_slices):
-                s_offset = s_idx * slice_size_bytes
-                slice_bytes = chunk_data[s_offset:s_offset + slice_size_bytes]
-                key = f"{file_id}_{chunk_idx:03d}_{s_idx:04d}"
-                val = slice_bytes.hex()
-                tx_str = f"{key}={val}"
+            # 1. Manifest
+            txs.append(manifest_tx_str.encode('utf-8'))
+            tx_keys.append(f"cda/{namespace}/{blob_id}/meta")
+
+            # 2. Blobs / Parts
+            if total_chunks <= 1:
+                blob_key = f"cda/{namespace}/{blob_id}/blob"
+                blob_val = file_bytes.hex()
+                tx_str = f"{blob_key}={blob_val}"
                 txs.append(tx_str.encode('utf-8'))
-                tx_keys.append(key)
+                tx_keys.append(blob_key)
+                print(f"  -> Generated 1 Single BlobTx: {blob_key} ({len(file_bytes) / 1024:.1f} KB)")
+            else:
+                for chunk_idx in range(total_chunks):
+                    offset = chunk_idx * chunk_size_bytes
+                    chunk_data = file_bytes[offset:offset + chunk_size_bytes]
+                    part_key = f"cda/{namespace}/{blob_id}/part/{chunk_idx:03d}"
+                    part_val = chunk_data.hex()
+                    tx_str = f"{part_key}={part_val}"
+                    txs.append(tx_str.encode('utf-8'))
+                    tx_keys.append(part_key)
+                print(f"  -> Generated {total_chunks} Part BlobTx(s): {chunk_size_bytes / 1024:.1f} KB each")
 
-            print(f"[Chunk #{chunk_idx:03d} / {total_chunks:03d}] Offset {offset:8d}..{offset + actual_chunk_size:8d} ({actual_chunk_size / 1024:.1f} KB) | {num_slices} tx slices...")
-
-            t_chunk_start = time.time()
+            t_blob_start = time.time()
             first_hash, last_hash, all_hashes = broadcast_tx_batch(args.cometbft, txs, max_workers=args.workers, timeout=30)
-
-            # Wait for commit into CometBFT
-            height = wait_for_tx_commit(args.cometbft, first_hash, timeout=60)
+            height = wait_for_tx_commit(args.cometbft, last_hash, timeout=60)
+            dur_commit = time.time() - t_blob_start
             block_id = f"block-{height}"
-            dur_commit = time.time() - t_chunk_start
-            print(f"  ✅ Committed into CometBFT Height #{height} ({block_id}) | Latency: {dur_commit:.3f}s")
+            print(f"  ✅ [Native Blob Committed] Height #{height} ({block_id}) | {len(txs)} txs | Latency: {dur_commit:.3f}s")
 
-            # Queue for background CDA tracking
             if args.wait_cda:
                 with in_flight_cond:
-                    if args.max_in_flight > 0:
-                        while in_flight_count >= args.max_in_flight:
-                            in_flight_cond.wait(timeout=0.2)
                     in_flight_count += 1
-                cda_queue.put((block_id, t_chunk_start, 32, chunk_idx, height))
+                cda_queue.put((block_id, t_blob_start, 32, 0, height))
 
-            key_prefix = f"{file_id}_{chunk_idx:03d}"
             manifest_chunks.append({
-                "chunk_idx": chunk_idx,
-                "offset": offset,
-                "size": actual_chunk_size,
-                "sha256": chunk_sha256,
+                "chunk_idx": 0,
+                "offset": 0,
+                "size": total_file_size,
+                "sha256": file_sha256,
                 "height": height,
                 "block_id": block_id,
                 "tx_count": len(txs),
-                "slice_count": num_slices,
-                "slice_size": slice_size_bytes,
-                "key_prefix": key_prefix,
-                "key_pattern": f"{key_prefix}_{{seq:04d}}",
-                "first_key": tx_keys[0] if tx_keys else "",
-                "last_key": tx_keys[-1] if tx_keys else "",
+                "slice_count": len(txs),
+                "slice_size": total_file_size,
+                "key_prefix": f"cda/{namespace}/{blob_id}",
+                "tx_keys": tx_keys,
+                "first_key": tx_keys[0],
+                "last_key": tx_keys[-1],
                 "first_tx_hash": first_hash,
                 "last_tx_hash": last_hash,
                 "cda_commits_root": "",
                 "cda_k": 32,
                 "cda_ready": False
             })
+        else:
+            for chunk_idx in range(total_chunks):
+                offset = chunk_idx * chunk_size_bytes
+                chunk_data = file_bytes[offset:offset + chunk_size_bytes]
+                actual_chunk_size = len(chunk_data)
+                chunk_sha256 = hashlib.sha256(chunk_data).hexdigest()
+
+                # Split chunk into slices
+                num_slices = math.ceil(actual_chunk_size / slice_size_bytes)
+                txs = []
+                tx_keys = []
+
+                # Prepend Head Manifest to Chunk 0
+                if chunk_idx == 0:
+                    txs.append(manifest_tx_str.encode('utf-8'))
+                    tx_keys.append(f"cda/{namespace}/{blob_id}/meta")
+
+                for s_idx in range(num_slices):
+                    s_offset = s_idx * slice_size_bytes
+                    slice_bytes = chunk_data[s_offset:s_offset + slice_size_bytes]
+                    key = f"cda/{namespace}/{blob_id}/s/{chunk_idx:03d}_{s_idx:04d}"
+                    val = slice_bytes.hex()
+                    tx_str = f"{key}={val}"
+                    txs.append(tx_str.encode('utf-8'))
+                    tx_keys.append(key)
+
+                print(f"[Chunk #{chunk_idx:03d} / {total_chunks:03d}] Offset {offset:8d}..{offset + actual_chunk_size:8d} ({actual_chunk_size / 1024:.1f} KB) | {len(txs)} txs...")
+
+                t_chunk_start = time.time()
+                first_hash, last_hash, all_hashes = broadcast_tx_batch(args.cometbft, txs, max_workers=args.workers, timeout=30)
+
+                # Wait for commit into CometBFT
+                height = wait_for_tx_commit(args.cometbft, first_hash, timeout=60)
+                block_id = f"block-{height}"
+                dur_commit = time.time() - t_chunk_start
+                print(f"  ✅ Committed into CometBFT Height #{height} ({block_id}) | Latency: {dur_commit:.3f}s")
+
+                # Queue for background CDA tracking
+                if args.wait_cda:
+                    with in_flight_cond:
+                        if args.max_in_flight > 0:
+                            while in_flight_count >= args.max_in_flight:
+                                in_flight_cond.wait(timeout=0.2)
+                        in_flight_count += 1
+                    cda_queue.put((block_id, t_chunk_start, 32, chunk_idx, height))
+
+                key_prefix = f"cda/{namespace}/{blob_id}/s/{chunk_idx:03d}"
+                manifest_chunks.append({
+                    "chunk_idx": chunk_idx,
+                    "offset": offset,
+                    "size": actual_chunk_size,
+                    "sha256": chunk_sha256,
+                    "height": height,
+                    "block_id": block_id,
+                    "tx_count": len(txs),
+                    "slice_count": num_slices,
+                    "slice_size": slice_size_bytes,
+                    "key_prefix": key_prefix,
+                    "tx_keys": tx_keys,
+                    "first_key": tx_keys[0] if tx_keys else "",
+                    "last_key": tx_keys[-1] if tx_keys else "",
+                    "first_tx_hash": first_hash,
+                    "last_tx_hash": last_hash,
+                    "cda_commits_root": "",
+                    "cda_k": 32,
+                    "cda_ready": False
+                })
 
     except KeyboardInterrupt:
         print("\nUpload interrupted by user.")
@@ -554,7 +985,7 @@ def main():
         print(f"\n[Upload Complete] Waiting for remaining in-flight CDA verification...")
         cda_queue.join()
 
-    # Merge background CDA verification results into manifest chunks
+    # Merge background CDA verification results
     for m_chunk in manifest_chunks:
         c_idx = m_chunk["chunk_idx"]
         if c_idx in cda_completed_records:
@@ -563,21 +994,23 @@ def main():
             m_chunk["cda_commits_root"] = rec.get("commits_root", "")
             m_chunk["cda_k"] = rec.get("k", 32)
         else:
-            # Query publisher header directly if not caught
             info = fetch_publisher_block_info(args.publisher, m_chunk["block_id"], max_retries=3)
             if info:
                 m_chunk["cda_commits_root"] = info.get("commits_root", "")
                 m_chunk["cda_k"] = info.get("k", 32)
 
-    # Build and write final manifest
+    # Build and write final backup manifest
     manifest_data = {
-        "file_id": file_id,
+        "file_id": blob_id,
+        "namespace": namespace,
+        "uri": f"cda://{namespace}/{blob_id}",
         "filename": file_name,
         "file_size": total_file_size,
         "file_sha256": file_sha256,
         "chunk_size": chunk_size_bytes,
         "slice_size": slice_size_bytes,
         "total_chunks": len(manifest_chunks),
+        "total_slices": total_slices,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "cometbft_rpc": args.cometbft,
         "publisher_url": args.publisher,
@@ -597,9 +1030,12 @@ def main():
     print(f"Total Data Stored : {total_file_size} bytes ({total_file_size / 1024 / 1024:.2f} MB)")
     print(f"Original SHA-256  : {file_sha256}")
     print(f"Effective Speed   : {throughput_mb:.2f} MB/s (Total time: {total_time:.2f}s)")
-    print(f"📁 Manifest Saved : {manifest_output_path}")
-    print("\n💡 To retrieve and verify this file at any time, run:")
-    print(f"   python3 scripts/bots/file_pipeline_bot.py --retrieve --manifest {manifest_output_path} --output restored_{file_name}")
+    print(f"🎉 Registered URI : cda://{namespace}/{blob_id}")
+    print(f"📁 Backup Manifest: {manifest_output_path}")
+    print("\n💡 To retrieve this file statelessly from anywhere (no JSON needed):")
+    print(f"   python3 scripts/bots/file_pipeline_bot.py --retrieve --uri cda://{namespace}/{blob_id} --output restored_{file_name}")
+    print("\n💡 To list all files in this namespace:")
+    print(f"   python3 scripts/bots/file_pipeline_bot.py --list-blobs --namespace {namespace}")
     print("=" * 80)
 
 
