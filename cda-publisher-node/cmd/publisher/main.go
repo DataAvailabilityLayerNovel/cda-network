@@ -233,10 +233,22 @@ func main() {
 	apiService.RegisterHandlers(mux)
 	mux.Handle("/metrics", promhttp.Handler())
 
+	// CORS wrapper to allow web-based frontend dashboards to interact with the API
+	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+
 	// 6. Start HTTP server for external triggers
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.APIPort),
-		Handler: mux,
+		Handler: corsHandler,
 	}
 
 	go func() {

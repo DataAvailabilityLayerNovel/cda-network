@@ -689,7 +689,23 @@ func (s *APIService) RegisterHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/header/", s.handleGetHeader)
 	mux.HandleFunc("/tx", s.handleGetTx)
 	mux.HandleFunc("/tx/", s.handleGetTx)
+	mux.HandleFunc("/tx/batch", s.handleBatchGetTx)
+	mux.HandleFunc("/tx/batch/", s.handleBatchGetTx)
 	mux.HandleFunc("/block/", s.handleGetBlockData)
+	mux.HandleFunc("/api/v1/toc/", func(w http.ResponseWriter, r *http.Request) {
+		target := strings.TrimPrefix(r.URL.Path, "/api/v1/toc/")
+		target = strings.Trim(target, "/")
+		s.handleGetBlockTOC(w, r, target)
+	})
+	mux.HandleFunc("/api/v1/namespaces", s.handleNamespaces)
+	mux.HandleFunc("/api/v1/namespaces/", s.handleNamespaces)
+
+	// Serve static web dashboard
+	fs := http.FileServer(http.Dir("web"))
+	mux.Handle("/dashboard/", http.StripPrefix("/dashboard/", fs))
+	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/dashboard/", http.StatusMovedPermanently)
+	})
 }
 
 func (s *APIService) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -1075,15 +1091,26 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 			// Index transactions from req.Txs
 			for _, tx := range req.Txs {
 				txBytes, _ := json.Marshal(tx)
+				payload := extractPayloadFromCells(decodedData, tx.Offset, tx.Cells, tx.Size)
 				if tx.Hash != "" {
 					upperHash := strings.ToUpper(strings.TrimPrefix(tx.Hash, "0x"))
 					_ = txn.Set([]byte("idx_tx_"+upperHash), []byte(strconv.FormatInt(height, 10)))
 					_ = txn.Set([]byte(fmt.Sprintf("meta_tx_%s_%s", header.BlockID, upperHash)), txBytes)
+					if len(payload) > 0 {
+						_ = txn.Set([]byte("data_tx_"+upperHash), payload)
+					}
 				}
 				if tx.Key != "" {
 					_ = txn.Set([]byte("idx_key_"+tx.Key), []byte(strconv.FormatInt(height, 10)))
 					_ = txn.Set([]byte(fmt.Sprintf("meta_key_%s_%s", header.BlockID, tx.Key)), []byte(strings.ToUpper(strings.TrimPrefix(tx.Hash, "0x"))))
+					if len(payload) > 0 {
+						_ = txn.Set([]byte("data_key_"+tx.Key), payload)
+					}
 				}
+			}
+
+			if len(req.Txs) > 0 {
+				s.indexBlockTOCAndNamespaces(txn, header.BlockID, height, req.Txs, decodedData)
 			}
 
 			// Fallback: If req.Txs is empty, parse raw cells
@@ -1092,6 +1119,10 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 			}
 			return nil
 		})
+	}
+
+	if s.reconstructor != nil {
+		s.reconstructor.PutCachedODS(header.BlockID, height, decodedData)
 	}
 
 	log.Printf("[Height: %d] Successfully generated Block Header for BlockID: %s", height, header.BlockID)
@@ -1212,11 +1243,15 @@ func (s *APIService) handleGetHeader(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *APIService) indexTransactionsFromRawCells(txn *badger.Txn, blockID string, height int64, data []string) {
+	rawSummaries := make([]TxSummary, 0, len(data))
+	rawCells := make([][]byte, 0, len(data))
+
 	for i, cellHex := range data {
 		cellBytes, err := hex.DecodeString(cellHex)
 		if err != nil || len(cellBytes) == 0 {
 			continue
 		}
+		rawCells = append(rawCells, cellBytes)
 		trimmed := bytes.TrimRight(cellBytes, "\x00")
 		if len(trimmed) == 0 {
 			continue
@@ -1235,10 +1270,17 @@ func (s *APIService) indexTransactionsFromRawCells(txn *badger.Txn, blockID stri
 			txMeta.Key = str[:eqIdx]
 			_ = txn.Set([]byte("idx_key_"+txMeta.Key), []byte(strconv.FormatInt(height, 10)))
 			_ = txn.Set([]byte(fmt.Sprintf("meta_key_%s_%s", blockID, txMeta.Key)), []byte(txHash))
+			_ = txn.Set([]byte("data_key_"+txMeta.Key), trimmed)
 		}
 		metaBytes, _ := json.Marshal(txMeta)
 		_ = txn.Set([]byte("idx_tx_"+txHash), []byte(strconv.FormatInt(height, 10)))
 		_ = txn.Set([]byte(fmt.Sprintf("meta_tx_%s_%s", blockID, txHash)), metaBytes)
+		_ = txn.Set([]byte("data_tx_"+txHash), trimmed)
+		rawSummaries = append(rawSummaries, txMeta)
+	}
+
+	if len(rawSummaries) > 0 {
+		s.indexBlockTOCAndNamespaces(txn, blockID, height, rawSummaries, rawCells)
 	}
 }
 
@@ -1317,6 +1359,62 @@ func (s *APIService) handleGetTx(w http.ResponseWriter, r *http.Request) {
 
 	if txHash != "" {
 		txHash = strings.ToUpper(strings.TrimPrefix(txHash, "0x"))
+	}
+
+	// 0. Fast Path: Check local BadgerDB data cache first unless force_cda is requested
+	if !forceCDA && s.db != nil {
+		var cachedPayload []byte
+		var foundHeight int64
+		_ = s.db.View(func(txn *badger.Txn) error {
+			keyToLookup := ""
+			if txKey != "" {
+				keyToLookup = "data_key_" + txKey
+				if hItem, err := txn.Get([]byte("idx_key_" + txKey)); err == nil {
+					_ = hItem.Value(func(hVal []byte) error {
+						foundHeight, _ = strconv.ParseInt(string(hVal), 10, 64)
+						return nil
+					})
+				}
+			} else if txHash != "" {
+				keyToLookup = "data_tx_" + txHash
+				if hItem, err := txn.Get([]byte("idx_tx_" + txHash)); err == nil {
+					_ = hItem.Value(func(hVal []byte) error {
+						foundHeight, _ = strconv.ParseInt(string(hVal), 10, 64)
+						return nil
+					})
+				}
+			}
+			if keyToLookup != "" {
+				if item, err := txn.Get([]byte(keyToLookup)); err == nil {
+					_ = item.Value(func(val []byte) error {
+						cachedPayload = append([]byte(nil), val...)
+						return nil
+					})
+				}
+			}
+			return nil
+		})
+
+		if len(cachedPayload) > 0 {
+			payloadStr := string(cachedPayload)
+			extractedKey := txKey
+			if extractedKey == "" {
+				if eqIdx := strings.IndexByte(payloadStr, '='); eqIdx > 0 {
+					extractedKey = payloadStr[:eqIdx]
+				}
+			}
+			resp := TxResponse{
+				Status:   "success",
+				Source:   "cda_cache",
+				Height:   foundHeight,
+				TxHash:   txHash,
+				Key:      extractedKey,
+				Payload:  payloadStr,
+				Verified: true,
+			}
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
 	}
 
 	// 1. Hot Path: Try CometBFT unless force_cda is requested
@@ -1758,6 +1856,117 @@ func scanODSForTx(ods [][]byte, targetHash, targetKey string) ([]byte, string, s
 	return nil, targetHash, targetKey
 }
 
+type BatchTxRequest struct {
+	Keys   []string `json:"keys,omitempty"`
+	Hashes []string `json:"hashes,omitempty"`
+}
+
+type BatchTxResponse struct {
+	Status  string            `json:"status"`
+	Count   int               `json:"count"`
+	Missing int               `json:"missing"`
+	Results map[string]string `json:"results"`
+}
+
+func (s *APIService) handleBatchGetTx(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	var req BatchTxRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"status":"error","message":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+
+	results := make(map[string]string, len(req.Keys)+len(req.Hashes))
+
+	if s.db != nil {
+		_ = s.db.View(func(txn *badger.Txn) error {
+			for _, k := range req.Keys {
+				if item, err := txn.Get([]byte("data_key_" + k)); err == nil {
+					_ = item.Value(func(val []byte) error {
+						results[k] = string(val)
+						return nil
+					})
+				}
+			}
+			for _, h := range req.Hashes {
+				upper := strings.ToUpper(strings.TrimPrefix(h, "0x"))
+				if item, err := txn.Get([]byte("data_tx_" + upper)); err == nil {
+					_ = item.Value(func(val []byte) error {
+						results[h] = string(val)
+						return nil
+					})
+				}
+			}
+			return nil
+		})
+	}
+
+	// For missing keys, attempt CometBFT fallback in parallel (bounded workers)
+	var missingKeys []string
+	for _, k := range req.Keys {
+		if _, exists := results[k]; !exists {
+			missingKeys = append(missingKeys, k)
+		}
+	}
+	if len(missingKeys) > 0 {
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 16)
+		for _, mk := range missingKeys {
+			wg.Add(1)
+			go func(key string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				endpoint := fmt.Sprintf("tx_search?query=\"app.key='%s'\"&prove=false", key)
+				if body, status, err := s.queryCometBFT(endpoint); err == nil && status == http.StatusOK {
+					var rpcResp struct {
+						Result struct {
+							Txs []struct {
+								Tx string `json:"tx"`
+							} `json:"txs"`
+						} `json:"result"`
+					}
+					if err := json.Unmarshal(body, &rpcResp); err == nil && len(rpcResp.Result.Txs) > 0 {
+						if decoded, errDec := base64.StdEncoding.DecodeString(rpcResp.Result.Txs[0].Tx); errDec == nil {
+							mu.Lock()
+							results[key] = string(decoded)
+							mu.Unlock()
+						}
+					}
+				}
+			}(mk)
+		}
+		wg.Wait()
+	}
+
+	missingCount := 0
+	for _, k := range req.Keys {
+		if _, exists := results[k]; !exists {
+			missingCount++
+		}
+	}
+	for _, h := range req.Hashes {
+		if _, exists := results[h]; !exists {
+			missingCount++
+		}
+	}
+
+	resp := BatchTxResponse{
+		Status:  "success",
+		Count:   len(results),
+		Missing: missingCount,
+		Results: results,
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
 func (s *APIService) handleGetBlockData(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1775,6 +1984,11 @@ func (s *APIService) handleGetBlockData(w http.ResponseWriter, r *http.Request) 
 	// Extract primary block identifier segment (handles /1843, /1843/data, /1843/dat)
 	parts := strings.Split(path, "/")
 	target := parts[0]
+
+	if len(parts) >= 2 && (parts[1] == "index" || parts[1] == "toc") {
+		s.handleGetBlockTOC(w, r, target)
+		return
+	}
 
 	var height int64
 	var blockID string
