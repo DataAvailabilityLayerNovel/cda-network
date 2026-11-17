@@ -7,6 +7,6 @@
   "net_cols": 8,
   "net_rows": 4,
   "bootstrap_peers": {
-    "0": "/dns4/bootstrap-0/tcp/19200"
+    "0": "/dns4/bootstrap-0/udp/19200/quic-v1"
   }
 }

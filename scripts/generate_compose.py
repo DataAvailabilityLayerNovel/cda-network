@@ -96,7 +96,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
             boot_svc['environment'] = boot_env
         compose['services'][bootstrap_name] = boot_svc
 
-        bootstrap_addresses.append(f"{c}:/dns4/{bootstrap_name}/tcp/{bootstrap_p2p_port}")
+        bootstrap_addresses.append(f"{c}:/dns4/{bootstrap_name}/udp/{bootstrap_p2p_port}/quic-v1")
 
         # Store Nodes for this column (NetRows x NodesPerCell)
         for s in range(1, stores_per_col + 1):
@@ -131,7 +131,7 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                         "-row", str(s - 1),
                         "-col", str(col_id),
                         "-publisher", "http://publisher:8080",
-                        "-bootstrap", f"/dns4/{bootstrap_name}/tcp/{bootstrap_p2p_port}",
+                        "-bootstrap", f"/dns4/{bootstrap_name}/udp/{bootstrap_p2p_port}/quic-v1",
                         "-k", str(k),
                         "-k-piece", str(k_piece),
                         "-num-cols", str(cols),
@@ -839,7 +839,7 @@ def generate_publisher_config(k, k_piece, cols, cols_per_net_col, active_cols=No
     peers = {}
     for c in range(active_cols):
         bootstrap_p2p_port = 9200 + c + 10000
-        peers[str(c)] = f"/dns4/bootstrap-{c}/tcp/{bootstrap_p2p_port}"
+        peers[str(c)] = f"/dns4/bootstrap-{c}/udp/{bootstrap_p2p_port}/quic-v1"
     
     pub_config = {
         "api_port": 8080,

@@ -16,6 +16,21 @@
       aspect-ratio: 1;
       border-radius: 1px;
     }
+    /* Sleek custom dark scrollbar */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #090d16;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #475569;
+    }
   </style>
 </head>
 <body class="bg-slate-900 text-slate-100 min-h-screen font-sans antialiased">
@@ -142,7 +157,10 @@
           <div class="min-w-0 w-full flex-1 flex flex-col">
             <div class="flex items-center justify-between mb-2">
               <h3 class="text-sm font-bold text-white">Transaction Log</h3>
-              <button onclick="clearTxLogs()" class="text-[11px] text-slate-500 hover:text-slate-300 transition px-2 py-0.5 rounded border border-slate-800 hover:border-slate-700 bg-slate-900/60 font-mono">Clear</button>
+              <div class="flex items-center space-x-2">
+                <button onclick="checkTxPrompt()" class="text-[11px] text-indigo-400 hover:text-indigo-300 transition px-2 py-0.5 rounded border border-indigo-900 hover:border-indigo-700 bg-indigo-950/40 font-mono cursor-pointer">Check Hash</button>
+                <button onclick="clearTxLogs()" class="text-[11px] text-slate-500 hover:text-slate-300 transition px-2 py-0.5 rounded border border-slate-800 hover:border-slate-700 bg-slate-900/60 font-mono cursor-pointer">Clear</button>
+              </div>
             </div>
             <div id="tx-log" class="text-xs font-mono text-slate-400 space-y-2.5 h-72 overflow-y-auto overflow-x-hidden break-all bg-slate-900/90 p-3 rounded-lg border border-slate-800/80 min-w-0 w-full">
               <p class="text-slate-500 italic break-all">No transactions submitted yet.</p>
@@ -156,52 +174,109 @@
     </section>
 
     <!-- TAB 2: NAMESPACE & BLOBS -->
-    <section id="panel-namespace" class="tab-panel hidden space-y-6">
+    <section id="panel-namespace" class="tab-panel hidden space-y-5">
+      <!-- Top Frame: Search Namespace & Active Namespaces -->
+      <div class="bg-slate-950 border border-slate-800 rounded-xl p-5 shadow-sm space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-3 pb-2 border-b border-slate-800/80">
+          <div>
+            <h2 class="text-sm font-bold text-white uppercase tracking-wider">Namespace Explorer</h2>
+            <p class="text-xs text-slate-400">Search or select an active namespace across the CDA Network.</p>
+          </div>
+          <div class="flex items-center gap-2 flex-1 max-w-md ml-auto">
+            <div class="relative flex-1">
+              <input id="ns-search-input" 
+                     type="text" 
+                     placeholder="Enter namespace (e.g. bot-1, bot-2)..." 
+                     oninput="onNamespaceSearchInput(this.value)"
+                     onkeydown="if(event.key === 'Enter') handleNamespaceSearch()"
+                     class="w-full bg-slate-900 border border-slate-700 px-3 py-1.5 rounded-lg text-white font-mono text-xs focus:outline-none focus:border-indigo-500 transition pr-7">
+              <button type="button" 
+                      onclick="clearNamespaceSearch()" 
+                      id="clear-ns-search-btn"
+                      title="Clear namespace input"
+                      class="hidden absolute right-2 top-1.5 text-slate-500 hover:text-slate-300 text-xs px-1">
+                ✕
+              </button>
+            </div>
+            <button onclick="handleNamespaceSearch()" 
+                    class="bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white text-xs font-medium px-3.5 py-1.5 rounded-lg transition border border-indigo-500 shadow-sm whitespace-nowrap cursor-pointer">
+              Search
+            </button>
+          </div>
+        </div>
+
+        <!-- Active Namespaces List -->
+        <div class="flex flex-wrap items-center gap-2 text-xs pt-1">
+          <span class="text-slate-400 font-medium">Active Namespaces:</span>
+          <div id="active-namespaces-list" class="flex flex-wrap gap-1.5 items-center">
+            <span class="text-slate-500 italic">Scanning...</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Main Frame: Namespace Blobs Table with Header & Search by Blob ID -->
       <div class="bg-slate-950 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
-        <div class="flex flex-wrap items-center justify-between gap-4 pb-2 border-b border-slate-800">
+        <!-- Blobs Header Row: Title & Info on Left, Search by Blob ID + Limit + Refresh on Right -->
+        <div class="flex flex-wrap items-center justify-between gap-4 pb-3 border-b border-slate-800/80">
           <div>
             <h2 class="text-base font-bold text-white flex items-center gap-2">
               <span>Namespace Blobs:</span>
               <span id="current-ns-display" class="font-mono text-indigo-400"></span>
               <span id="ns-blobs-count" class="text-xs font-mono bg-indigo-950 text-indigo-300 border border-indigo-800/60 px-2 py-0.5 rounded-full"></span>
             </h2>
-            <p class="text-xs text-slate-400">Indexed by Publisher Node and verified via CDA 2D Reed-Solomon / CometBFT Consensus.</p>
+            <p class="text-xs text-slate-400 mt-0.5">Indexed by Publisher Node and verified via CDA 2D Reed-Solomon / CometBFT Consensus.</p>
           </div>
-          <div class="flex items-center gap-3">
+
+          <!-- Controls: Search by Blob ID, Show limit, Refresh -->
+          <div class="flex flex-wrap items-center gap-2.5 ml-auto">
+            <!-- Search by Blob ID -->
+            <div class="relative w-56 sm:w-64">
+              <input id="blob-search-input" 
+                     type="text" 
+                     placeholder="Search Blob ID..." 
+                     oninput="onBlobSearchInput(this.value)"
+                     class="w-full bg-slate-900 border border-slate-700 px-3 py-1.5 rounded-lg text-white font-mono text-xs focus:outline-none focus:border-indigo-500 transition pr-7">
+              <button type="button" 
+                      onclick="clearBlobSearch()" 
+                      id="clear-blob-search-btn"
+                      title="Clear search"
+                      class="hidden absolute right-2 top-1.5 text-slate-500 hover:text-slate-300 text-xs px-1">
+                ✕
+              </button>
+            </div>
+
+            <!-- Matched count badge (if searching) -->
+            <span id="blob-filter-count" class="text-[11px] font-mono text-indigo-400"></span>
+
+            <!-- Limit selector -->
             <div class="flex items-center gap-1.5 text-xs text-slate-400">
               <span>Show:</span>
-              <select id="ns-blobs-limit-select" onchange="loadNamespaceBlobs()" class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white font-mono text-xs">
+              <select id="ns-blobs-limit-select" onchange="renderBlobsTable()" class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white font-mono text-xs focus:outline-none focus:border-indigo-500">
                 <option value="50">Latest 50</option>
                 <option value="100" selected>Latest 100</option>
                 <option value="250">Latest 250</option>
                 <option value="all">All Blobs</option>
               </select>
             </div>
-            <button onclick="loadNamespaceBlobs()" class="bg-slate-800 hover:bg-slate-700 text-white text-xs px-3 py-1.5 rounded-lg transition font-medium border border-slate-700/60 flex items-center gap-1">
-              <span>↻ Refresh</span>
+
+            <!-- Refresh button -->
+            <button onclick="loadNamespaceBlobs()" class="bg-slate-800 hover:bg-slate-700 text-white text-xs px-3 py-1.5 rounded-lg transition font-medium border border-slate-700/60 cursor-pointer">
+              Refresh
             </button>
           </div>
         </div>
 
-        <!-- Discovered Namespaces Selector -->
-        <div class="flex flex-wrap items-center gap-2 text-xs py-1">
-          <span class="text-slate-400">Active Namespaces:</span>
-          <div id="active-namespaces-list" class="flex flex-wrap gap-1.5 items-center">
-            <span class="text-slate-500 italic">Scanning...</span>
-          </div>
-        </div>
-
-        <!-- Blobs Table -->
-        <div class="overflow-x-auto">
+        <!-- Scrollable Blobs Table Container with Bounded Height -->
+        <div class="overflow-x-auto overflow-y-auto max-h-[500px] border border-slate-800/80 rounded-lg shadow-inner">
           <table class="w-full text-left text-xs">
-            <thead class="bg-slate-900 text-slate-400 font-semibold uppercase border-b border-slate-800">
+            <thead class="bg-slate-900 text-slate-400 font-semibold uppercase border-b border-slate-800 sticky top-0 z-10 shadow-sm">
               <tr>
-                <th class="px-4 py-3">Blob ID</th>
-                <th class="px-4 py-3">Size</th>
-                <th class="px-4 py-3">SHA-256</th>
-                <th class="px-4 py-3">Block Height</th>
-                <th class="px-4 py-3">Status</th>
-                <th class="px-4 py-3 text-right">Action</th>
+                <th class="px-4 py-3 bg-slate-900">Blob ID</th>
+                <th class="px-4 py-3 bg-slate-900">Size</th>
+                <th class="px-4 py-3 bg-slate-900">SHA-256</th>
+                <th class="px-4 py-3 bg-slate-900">Block Height</th>
+                <th class="px-4 py-3 bg-slate-900">Status</th>
+                <th class="px-4 py-3 bg-slate-900 text-right">Action</th>
               </tr>
             </thead>
             <tbody id="blobs-table-body" class="divide-y divide-slate-800 font-mono">
@@ -223,10 +298,22 @@
           <p id="stat-height" class="text-2xl font-bold font-mono text-indigo-400 mt-1">-</p>
           <span class="text-[10px] text-slate-500 font-mono">Consensus tip</span>
         </div>
-        <div class="bg-slate-950 border border-slate-800 p-4 rounded-xl" title="End-to-end block processing latency: CometBFT Consensus + CDA Publisher 2D-RS & KZG DA Quorum">
-          <span class="text-xs text-slate-400">Avg Pipeline Latency</span>
-          <p id="stat-pipeline-time" class="text-2xl font-bold font-mono text-emerald-400 mt-1">-</p>
-          <span id="stat-pipeline-sub" class="text-[10px] text-slate-500 font-mono">Consensus: - | CDA DA: -</span>
+        <div class="bg-slate-950 border border-slate-800 p-4 rounded-xl flex flex-col justify-between" title="End-to-end average block processing latency: CometBFT Consensus Layer + CDA DA Layer">
+          <div class="flex items-center justify-between">
+            <span class="text-xs text-slate-400 font-medium">Avg Pipeline Latency</span>
+            <span id="stat-pipeline-time" class="text-xs font-mono font-bold text-slate-300 bg-slate-900 border border-slate-800 px-2 py-0.5 rounded" title="Total Average Pipeline Latency">-</span>
+          </div>
+          <div class="grid grid-cols-2 gap-2 mt-2 pt-1.5 border-t border-slate-800/80">
+            <div>
+              <span class="text-[11px] text-slate-400 font-sans block" title="CometBFT Consensus Layer Average Processing Time">Consensus Time</span>
+              <span id="stat-avg-consensus" class="text-lg font-bold font-mono text-indigo-400 block mt-0.5">-</span>
+            </div>
+            <div>
+              <span class="text-[11px] text-slate-400 font-sans block" title="CDA DA Layer Average Processing Time (t_store_complete - t_block_commit)">DA Time</span>
+              <span id="stat-avg-da" class="text-lg font-bold font-mono text-emerald-400 block mt-0.5">-</span>
+            </div>
+          </div>
+          <span id="stat-pipeline-sub" class="hidden"></span>
         </div>
         <div class="bg-slate-950 border border-slate-800 p-4 rounded-xl">
           <span class="text-xs text-slate-400">Consensus Validators</span>
@@ -270,12 +357,11 @@
                 <th class="px-4 py-2.5 bg-slate-900">Txs</th>
                 <th class="px-4 py-2.5 bg-slate-900">Size</th>
                 <th class="px-4 py-2.5 bg-slate-900">Time / Age</th>
-                <th class="px-4 py-2.5 bg-slate-900 text-right">Action</th>
               </tr>
             </thead>
             <tbody id="recent-blocks-table-body" class="divide-y divide-slate-800/80 font-mono">
               <tr>
-                <td colspan="6" class="px-4 py-8 text-center text-slate-500 italic">Loading recent blocks...</td>
+                <td colspan="5" class="px-4 py-8 text-center text-slate-500 italic">Loading recent blocks...</td>
               </tr>
             </tbody>
           </table>
@@ -392,7 +478,14 @@
       pubURL: savedPub || defaultPub,
       account: null,
       currentNamespace: '',
-      selectedFile: null
+      selectedFile: null,
+      activeNamespaces: [],
+      currentBlobs: [],
+      nsSearchQuery: '',
+      blobSearchQuery: '',
+      networkReferenceTime: null,
+      networkReferenceClientTick: null,
+      selectedBlockHeight: null
     };
 
     // Cryptographic Helpers (Supports Insecure HTTP Contexts)
@@ -535,6 +628,9 @@
       document.getElementById('tx-namespace').value = state.account.address;
       document.getElementById('current-ns-display').textContent = state.account.address;
 
+      const nsInput = document.getElementById('ns-search-input');
+      if (nsInput) nsInput.value = state.account.address;
+
       document.getElementById('account-address').textContent = state.account.address;
       document.getElementById('account-pubkey').textContent = state.account.pubKey;
       document.getElementById('account-privkey').value = state.account.privKey;
@@ -544,11 +640,7 @@
     function switchNamespace() {
       const val = document.getElementById('custom-ns-input').value.trim();
       if (!val) return;
-      state.currentNamespace = val;
-      document.getElementById('user-namespace-badge').textContent = val;
-      document.getElementById('tx-namespace').value = val;
-      document.getElementById('current-ns-display').textContent = val;
-      loadNamespaceBlobs();
+      selectNamespace(val);
       logTx(`Switched namespace: ${val}`);
     }
 
@@ -663,51 +755,20 @@
           throw new Error(`CheckTx Rejected (Code ${result.code}): ${result.log}`);
         }
 
-        txLogger.log(`Transaction accepted in Mempool.`);
-        txLogger.log(`Tx Hash: ${result.hash}`);
+        const cleanHash = result.hash.replace(/^0x/i, '');
+        txLogger.setHash(cleanHash);
+        txLogger.log(`Transaction accepted into Mempool.`);
+        txLogger.log(`Tx Hash: <span class="text-indigo-300 font-bold select-all">${cleanHash}</span>`);
         txLogger.log(`Key: ${txKey}`);
-        txLogger.log(`Waiting for block commit...`);
+        txLogger.log(`Tracking commit in background (polling CometBFT)...`);
 
         // Reset form inputs early
         state.selectedFile = null;
         document.getElementById('file-info').textContent = 'No file selected';
         document.getElementById('raw-text-input').value = '';
 
-        // Poll CometBFT for committed block height
-        const cleanHash = result.hash.replace(/^0x/i, '');
-        let committedHeight = null;
-        for (let attempt = 0; attempt < 12; attempt++) {
-          await new Promise(r => setTimeout(r, 600));
-          try {
-            const checkRes = await fetch(`${state.cometURL.replace(/\/+$/, '')}/tx?hash=0x${cleanHash}`);
-            if (checkRes.ok) {
-              const checkData = await checkRes.json();
-              if (checkData.result && checkData.result.height) {
-                committedHeight = checkData.result.height;
-                break;
-              }
-            }
-          } catch (e) {
-            // keep polling until committed
-          }
-        }
-
-        if (committedHeight) {
-          txLogger.success(committedHeight);
-          txLogger.log(`Committed in Block Height: #${committedHeight}`);
-          document.getElementById('toc-height-input').value = committedHeight;
-        } else {
-          txLogger.log(`Transaction confirmed in mempool; waiting for next block.`);
-        }
-
-        // Trigger updates
-        setTimeout(async () => {
-          await loadNamespaceBlobs();
-          await fetchChainStats();
-          if (committedHeight) {
-            fetchBlockTOC();
-          }
-        }, 800);
+        // Start non-blocking background tracker
+        trackTxCommit(cleanHash, txLogger, namespace, blobId);
 
       } catch (err) {
         txLogger.fail(err.message);
@@ -801,99 +862,143 @@
         const res = await fetch(`${state.pubURL}/api/v1/namespaces/${state.currentNamespace}/blobs`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-
-        const countBadge = document.getElementById('ns-blobs-count');
-        const totalCount = data.blobs ? data.blobs.length : 0;
-        if (countBadge) {
-          countBadge.textContent = `${totalCount.toLocaleString()} blobs`;
-        }
-
-        if (!data.blobs || data.blobs.length === 0) {
-          tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-8 text-center text-slate-500">No blobs found in namespace "${state.currentNamespace}". Submit your first transaction!</td></tr>`;
-          return;
-        }
-
-        // Sort descending by highest block height (newest transactions first)
-        const sortedBlobs = [...data.blobs].sort((a, b) => {
-          const hA = (a.block_heights && a.block_heights.length > 0) ? Math.max(...a.block_heights) : 0;
-          const hB = (b.block_heights && b.block_heights.length > 0) ? Math.max(...b.block_heights) : 0;
-          return hB - hA;
-        });
-
-        // Determine view slice based on selector
-        const limitSelect = document.getElementById('ns-blobs-limit-select');
-        const limitVal = limitSelect ? limitSelect.value : "100";
-        const displayBlobs = limitVal === "all" ? sortedBlobs : sortedBlobs.slice(0, parseInt(limitVal, 10) || 100);
-
-        tbody.innerHTML = '';
-        const missingHeights = new Set();
-
-        displayBlobs.forEach((blob, idx) => {
-          const cacheKey = `${blob.namespace}/${blob.blob_id}`;
-          const cachedMeta = window._cdaBlobMeta.get(cacheKey);
-          const cachedSz = localStorage.getItem(`cda_sz_${blob.namespace}_${blob.blob_id}`);
-          const cachedSha = localStorage.getItem(`cda_sha_${blob.namespace}_${blob.blob_id}`);
-
-          let resolvedSize = null;
-          let resolvedSha = blob.sha256 || cachedSha || '';
-
-          if (blob.total_size > 0) {
-            resolvedSize = blob.total_size;
-          } else if (cachedMeta && cachedMeta.payloadSize > 0) {
-            resolvedSize = cachedMeta.payloadSize;
-            if (!resolvedSha && cachedMeta.sha) resolvedSha = cachedMeta.sha;
-          } else if (cachedSz) {
-            resolvedSize = parseInt(cachedSz, 10);
-          } else if (blob.total_slices > 0) {
-            // Immediate nominal preview while TOC fetches
-            resolvedSize = blob.total_slices * 512;
-          }
-
-          const heights = blob.block_heights || [];
-          const heightsStr = heights.join(', ') || '-';
-          const primaryHeight = heights.length > 0 ? heights[0] : 0;
-
-          // Collect heights needing TOC lookup
-          if ((!cachedMeta || !resolvedSha || blob.total_size === 0) && primaryHeight > 0) {
-            if (!_cdaTocCache.has(primaryHeight)) {
-              missingHeights.add(primaryHeight);
-            }
-          }
-
-          const sizeDisplay = resolvedSize !== null 
-            ? formatBytes(resolvedSize) 
-            : `<span class="text-indigo-400/80 animate-pulse text-[11px]">Scanning TOC...</span>`;
-          const shaDisplay = resolvedSha ? `${resolvedSha.substring(0, 10)}...` : '-';
-          const rowId = `blob-row-${idx}`;
-
-          const tr = document.createElement('tr');
-          tr.id = rowId;
-          tr.dataset.blobKey = cacheKey;
-          tr.className = 'hover:bg-slate-900/60 transition';
-          tr.innerHTML = `
-            <td class="px-4 py-3 font-semibold text-white">${blob.blob_id}</td>
-            <td class="px-4 py-3 text-indigo-300 font-mono text-xs blob-size-cell">${sizeDisplay}</td>
-            <td class="px-4 py-3 text-slate-400 font-mono text-xs blob-sha-cell" title="${resolvedSha}">${shaDisplay}</td>
-            <td class="px-4 py-3 text-emerald-400">#${heightsStr}</td>
-            <td class="px-4 py-3"><span class="bg-emerald-950 text-emerald-400 border border-emerald-800 px-2 py-0.5 rounded text-[10px] font-sans font-bold">${blob.status || 'READY'}</span></td>
-            <td class="px-4 py-3 text-right">
-              <button id="dl-btn-${blob.namespace}-${blob.blob_id}"
-                      onclick="downloadBlobContent('${blob.namespace}', '${blob.blob_id}', '${resolvedSha}', ${primaryHeight})" 
-                      class="inline-block bg-indigo-600/80 hover:bg-indigo-600 active:bg-indigo-700 text-white px-2.5 py-1 rounded text-[11px] font-sans font-medium transition cursor-pointer">
-                Download
-              </button>
-            </td>
-          `;
-          tbody.appendChild(tr);
-        });
-
-        // Resolve missing heights in background without blocking rendering
-        if (missingHeights.size > 0) {
-          fetchTOCBatch(Array.from(missingHeights), state.currentNamespace);
-        }
-
+        state.currentBlobs = data.blobs || [];
+        renderBlobsTable();
       } catch (err) {
         tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-6 text-center text-amber-500">Unable to connect to Publisher API (${err.message})</td></tr>`;
+      }
+    }
+
+    function renderBlobsTable() {
+      const tbody = document.getElementById('blobs-table-body');
+      if (!tbody) return;
+
+      const countBadge = document.getElementById('ns-blobs-count');
+      const totalCount = state.currentBlobs ? state.currentBlobs.length : 0;
+      if (countBadge) {
+        countBadge.textContent = `${totalCount.toLocaleString()} blobs`;
+      }
+
+      if (!state.currentBlobs || state.currentBlobs.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-8 text-center text-slate-500">No blobs found in namespace "${state.currentNamespace}". Submit your first transaction!</td></tr>`;
+        return;
+      }
+
+      // Sort descending by highest block height (newest transactions first)
+      const sortedBlobs = [...state.currentBlobs].sort((a, b) => {
+        const hA = (a.block_heights && a.block_heights.length > 0) ? Math.max(...a.block_heights) : 0;
+        const hB = (b.block_heights && b.block_heights.length > 0) ? Math.max(...b.block_heights) : 0;
+        return hB - hA;
+      });
+
+      // Filter by Blob ID if search query is present
+      const query = (state.blobSearchQuery || '').trim().toLowerCase();
+      let displayBlobs = sortedBlobs;
+      const filterCountEl = document.getElementById('blob-filter-count');
+
+      if (query) {
+        displayBlobs = sortedBlobs.filter(blob => {
+          const idMatch = blob.blob_id && blob.blob_id.toLowerCase().includes(query);
+          const shaMatch = blob.sha256 && blob.sha256.toLowerCase().includes(query);
+          const meta = window._cdaBlobMeta?.get(`${blob.namespace}/${blob.blob_id}`);
+          const metaShaMatch = meta && meta.sha && meta.sha.toLowerCase().includes(query);
+          const heightsStr = (blob.block_heights || []).join(',');
+          const heightMatch = heightsStr.includes(query);
+          return idMatch || shaMatch || metaShaMatch || heightMatch;
+        });
+
+        if (filterCountEl) {
+          filterCountEl.textContent = `Matched ${displayBlobs.length} of ${sortedBlobs.length} blobs`;
+        }
+      } else {
+        if (filterCountEl) {
+          filterCountEl.textContent = '';
+        }
+        // Apply limit selector when not searching
+        const limitSelect = document.getElementById('ns-blobs-limit-select');
+        const limitVal = limitSelect ? limitSelect.value : "100";
+        if (limitVal !== "all") {
+          displayBlobs = sortedBlobs.slice(0, parseInt(limitVal, 10) || 100);
+        }
+      }
+
+      if (displayBlobs.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-8 text-center text-slate-400">No blobs match "<strong>${state.blobSearchQuery}</strong>" in namespace "${state.currentNamespace}".</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = '';
+      const missingHeights = new Set();
+
+      displayBlobs.forEach((blob, idx) => {
+        const cacheKey = `${blob.namespace}/${blob.blob_id}`;
+        const cachedMeta = window._cdaBlobMeta.get(cacheKey);
+        const cachedSz = localStorage.getItem(`cda_sz_${blob.namespace}_${blob.blob_id}`);
+        const cachedSha = localStorage.getItem(`cda_sha_${blob.namespace}_${blob.blob_id}`);
+
+        let resolvedSize = null;
+        let resolvedSha = blob.sha256 || cachedSha || '';
+
+        if (blob.total_size > 0) {
+          resolvedSize = blob.total_size;
+        } else if (cachedMeta && cachedMeta.payloadSize > 0) {
+          resolvedSize = cachedMeta.payloadSize;
+          if (!resolvedSha && cachedMeta.sha) resolvedSha = cachedMeta.sha;
+        } else if (cachedSz) {
+          resolvedSize = parseInt(cachedSz, 10);
+        } else if (blob.total_slices > 0) {
+          // Immediate nominal preview while TOC fetches
+          resolvedSize = blob.total_slices * 512;
+        }
+
+        const heights = blob.block_heights || [];
+        const heightsStr = heights.join(', ') || '-';
+        const primaryHeight = heights.length > 0 ? heights[0] : 0;
+
+        // Collect heights needing TOC lookup
+        if ((!cachedMeta || !resolvedSha || blob.total_size === 0) && primaryHeight > 0) {
+          if (!_cdaTocCache.has(primaryHeight)) {
+            missingHeights.add(primaryHeight);
+          }
+        }
+
+        const sizeDisplay = resolvedSize !== null 
+          ? formatBytes(resolvedSize) 
+          : `<span class="text-indigo-400/80 animate-pulse text-[11px]">Scanning TOC...</span>`;
+        const shaDisplay = resolvedSha ? `${resolvedSha.substring(0, 10)}...` : '-';
+        const rowId = `blob-row-${idx}`;
+
+        // Highlight matched part in blob_id if searching
+        let highlightedId = blob.blob_id;
+        if (query && blob.blob_id.toLowerCase().includes(query)) {
+          const re = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+          highlightedId = blob.blob_id.replace(re, '<span class="bg-indigo-600/50 text-indigo-200 px-0.5 rounded font-bold">$1</span>');
+        }
+
+        const tr = document.createElement('tr');
+        tr.id = rowId;
+        tr.dataset.blobKey = cacheKey;
+        tr.className = 'hover:bg-slate-900/60 transition';
+        tr.innerHTML = `
+          <td class="px-4 py-3 font-semibold text-white">${highlightedId}</td>
+          <td class="px-4 py-3 text-indigo-300 font-mono text-xs blob-size-cell">${sizeDisplay}</td>
+          <td class="px-4 py-3 text-slate-400 font-mono text-xs blob-sha-cell" title="${resolvedSha}">${shaDisplay}</td>
+          <td class="px-4 py-3 text-emerald-400">#${heightsStr}</td>
+          <td class="px-4 py-3"><span class="bg-emerald-950 text-emerald-400 border border-emerald-800 px-2 py-0.5 rounded text-[10px] font-sans font-bold">${blob.status || 'READY'}</span></td>
+          <td class="px-4 py-3 text-right">
+            <button id="dl-btn-${blob.namespace}-${blob.blob_id}"
+                    onclick="downloadBlobContent('${blob.namespace}', '${blob.blob_id}', '${resolvedSha}', ${primaryHeight})" 
+                    class="inline-block bg-indigo-600/80 hover:bg-indigo-600 active:bg-indigo-700 text-white px-2.5 py-1 rounded text-[11px] font-sans font-medium transition cursor-pointer">
+              Download
+            </button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      });
+
+      // Resolve missing heights in background without blocking rendering
+      if (missingHeights.size > 0) {
+        fetchTOCBatch(Array.from(missingHeights), state.currentNamespace);
       }
     }
 
@@ -1001,19 +1106,33 @@
 
     // 6. Chain Explorer & Block TOC
     function renderNamespaceBadges(namespaces) {
+      if (namespaces && Array.isArray(namespaces)) {
+        state.activeNamespaces = namespaces;
+      }
       const container = document.getElementById('active-namespaces-list');
       if (!container) return;
-      if (!namespaces || namespaces.length === 0) {
+      
+      const allList = state.activeNamespaces || [];
+      if (allList.length === 0) {
         container.innerHTML = '<span class="text-slate-500 text-xs italic">No namespaces found yet.</span>';
         return;
       }
-      container.innerHTML = namespaces.map(ns => {
+
+      const q = (state.nsSearchQuery || '').trim().toLowerCase();
+      const filtered = q ? allList.filter(ns => ns.toLowerCase().includes(q)) : allList;
+
+      if (filtered.length === 0) {
+        container.innerHTML = `<span class="text-slate-500 text-xs italic">No active namespace matches "${state.nsSearchQuery}". Press Enter in search box to open anyway.</span>`;
+        return;
+      }
+
+      container.innerHTML = filtered.map(ns => {
         const isSelected = ns === state.currentNamespace;
         return `
           <button onclick="selectNamespace('${ns}')" 
-                  class="px-2.5 py-1 rounded text-xs font-mono border transition ${
+                  class="px-2.5 py-1 rounded text-xs font-mono border transition cursor-pointer ${
                     isSelected 
-                      ? 'bg-indigo-600/30 text-indigo-300 border-indigo-500 font-bold' 
+                      ? 'bg-indigo-600/30 text-indigo-300 border-indigo-500 font-bold shadow-sm' 
                       : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700 hover:text-white'
                   }">
             ${ns}
@@ -1023,26 +1142,128 @@
     }
 
     function selectNamespace(ns) {
+      if (!ns) return;
       state.currentNamespace = ns;
       document.getElementById('user-namespace-badge').textContent = ns;
       document.getElementById('tx-namespace').value = ns;
       document.getElementById('current-ns-display').textContent = ns;
-      document.getElementById('custom-ns-input').value = ns;
+
+      const customNsInput = document.getElementById('custom-ns-input');
+      if (customNsInput) customNsInput.value = ns;
+
+      const nsSearchInput = document.getElementById('ns-search-input');
+      if (nsSearchInput) {
+        nsSearchInput.value = ns;
+        const clearBtn = document.getElementById('clear-ns-search-btn');
+        if (clearBtn) clearBtn.classList.remove('hidden');
+      }
+
+      // Reset blob search query when changing namespace
+      const blobSearchInput = document.getElementById('blob-search-input');
+      if (blobSearchInput) {
+        blobSearchInput.value = '';
+        state.blobSearchQuery = '';
+        const clearBlobBtn = document.getElementById('clear-blob-search-btn');
+        if (clearBlobBtn) clearBlobBtn.classList.add('hidden');
+      }
+
+      renderNamespaceBadges();
       loadNamespaceBlobs();
       fetchChainStats();
     }
 
-    function timeAgo(dateString) {
-      if (!dateString) return '-';
-      const diffMs = Date.now() - new Date(dateString).getTime();
+    function onNamespaceSearchInput(val) {
+      state.nsSearchQuery = (val || '').trim();
+      const clearBtn = document.getElementById('clear-ns-search-btn');
+      if (clearBtn) {
+        if (val && val.trim()) clearBtn.classList.remove('hidden');
+        else clearBtn.classList.add('hidden');
+      }
+      renderNamespaceBadges();
+    }
+
+    function handleNamespaceSearch() {
+      const input = document.getElementById('ns-search-input');
+      const val = input ? input.value.trim() : '';
+      if (!val) return;
+      selectNamespace(val);
+      logTx(`Switched namespace to: ${val}`);
+    }
+
+    function clearNamespaceSearch() {
+      const input = document.getElementById('ns-search-input');
+      if (input) input.value = '';
+      state.nsSearchQuery = '';
+      const clearBtn = document.getElementById('clear-ns-search-btn');
+      if (clearBtn) clearBtn.classList.add('hidden');
+      renderNamespaceBadges();
+    }
+
+    function onBlobSearchInput(val) {
+      state.blobSearchQuery = (val || '').trim().toLowerCase();
+      const clearBtn = document.getElementById('clear-blob-search-btn');
+      if (clearBtn) {
+        if (val && val.trim()) clearBtn.classList.remove('hidden');
+        else clearBtn.classList.add('hidden');
+      }
+      renderBlobsTable();
+    }
+
+    function clearBlobSearch() {
+      const input = document.getElementById('blob-search-input');
+      if (input) input.value = '';
+      state.blobSearchQuery = '';
+      const clearBtn = document.getElementById('clear-blob-search-btn');
+      if (clearBtn) clearBtn.classList.add('hidden');
+      renderBlobsTable();
+    }
+
+    function parseBlockDate(dateString) {
+      if (!dateString) return null;
+      if (typeof dateString === 'number') {
+        return new Date(dateString < 1e11 ? dateString * 1000 : dateString);
+      }
+      if (typeof dateString === 'string') {
+        let cleaned = dateString.trim();
+        // Standardize "2026-11-06 04:05:10 UTC" -> "2026-11-06T04:05:10Z"
+        cleaned = cleaned.replace(/\s+UTC$/i, 'Z').replace(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})/, '$1T$2');
+        // Truncate sub-millisecond nanoseconds (e.g. .486591787Z -> .486Z) for reliable cross-browser parsing
+        cleaned = cleaned.replace(/(\.\d{3})\d+(Z?)$/i, '$1$2');
+        if (!cleaned.endsWith('Z') && cleaned.includes('T')) {
+          cleaned += 'Z';
+        }
+        const d = new Date(cleaned);
+        if (!isNaN(d.getTime())) return d;
+        const fallback = new Date(dateString);
+        return isNaN(fallback.getTime()) ? null : fallback;
+      }
+      return null;
+    }
+
+    function getNetworkTime() {
+      if (state.networkReferenceTime && state.networkReferenceClientTick) {
+        const elapsed = Date.now() - state.networkReferenceClientTick;
+        return state.networkReferenceTime + elapsed;
+      }
+      return Date.now();
+    }
+
+    function timeAgo(dateString, overrideNow) {
+      const d = parseBlockDate(dateString);
+      if (!d) return '-';
+      const now = (typeof overrideNow === 'number') ? overrideNow : getNetworkTime();
+      const diffMs = now - d.getTime();
       if (isNaN(diffMs)) return '-';
-      if (diffMs < 1000) return 'just now';
+      // If block timestamp is in the future or within 10 seconds of now (eliminates negative clock skew)
+      if (diffMs <= 10000) return 'just now';
       const sec = Math.floor(diffMs / 1000);
       if (sec < 60) return `${sec}s ago`;
       const min = Math.floor(sec / 60);
       if (min < 60) return `${min}m ago`;
       const hr = Math.floor(min / 60);
-      return `${hr}h ago`;
+      if (hr < 24) return `${hr}h ago`;
+      const day = Math.floor(hr / 24);
+      return `${day}d ago`;
     }
 
     async function fetchRecentBlocks() {
@@ -1053,10 +1274,91 @@
       const targetLimit = limitSelect ? parseInt(limitSelect.value, 10) : 50;
 
       try {
+        let blocks = null;
+        let latestHeight = 0;
+        let apiData = null;
+
+        // 1. Fast-path: query unified backend API on dashboard host (server-calculated clock skew & age, 0 CORS)
+        try {
+          const apiRes = await fetch(`/api/recent-blocks?limit=${targetLimit}`).catch(() => null);
+          if (apiRes && apiRes.ok) {
+            apiData = await apiRes.json().catch(() => null);
+            if (apiData && apiData.status === 'success' && Array.isArray(apiData.blocks)) {
+              blocks = apiData.blocks;
+              latestHeight = apiData.latest_height || (blocks[0]?.height || 0);
+            }
+          }
+        } catch (_) {}
+
+        window._cdaBlockSizes = window._cdaBlockSizes || new Map();
+
+        if (blocks && blocks.length > 0) {
+          tbody.innerHTML = '';
+          blocks.forEach(b => {
+            const h = b.height;
+            const hInt = parseInt(h, 10);
+            const hash = b.hash;
+            const hashShort = hash ? `${hash.substring(0, 8)}...${hash.substring(hash.length - 6)}` : '-';
+            const numTxs = parseInt(b.num_txs || '0', 10);
+            const blockSize = parseInt(b.block_size || '0', 10);
+            window._cdaBlockSizes.set(hInt, blockSize);
+
+            const isSelected = state.selectedBlockHeight === hInt;
+            const tr = document.createElement('tr');
+            tr.className = isSelected 
+              ? 'bg-indigo-950/60 border-l-2 border-indigo-500 hover:bg-indigo-900/50 cursor-pointer transition' 
+              : 'hover:bg-slate-900/60 cursor-pointer transition';
+            tr.onclick = () => inspectBlock(h);
+
+            const numTxsDisplay = numTxs > 0 
+              ? `<span class="text-emerald-400 font-bold font-mono">${numTxs}</span>` 
+              : `<span class="text-slate-500 font-mono text-[11px]">0 (Empty)</span>`;
+
+            const sizeDisplay = numTxs > 0
+              ? `<span class="text-slate-200 font-mono text-xs font-semibold" title="CometBFT wire size: ${formatBytes(blockSize)} (${blockSize.toLocaleString()} bytes)">${formatBytes(blockSize)}</span>`
+              : `<span class="text-slate-500 font-mono text-[11px]" title="CometBFT heartbeat wire size: ${formatBytes(blockSize)}">0 B <span class="text-slate-600">(${formatBytes(blockSize)})</span></span>`;
+
+            tr.innerHTML = `
+              <td class="px-4 py-2.5 font-bold ${isSelected ? 'text-indigo-300 font-extrabold' : 'text-indigo-400'}">#${h}</td>
+              <td class="px-4 py-2.5 text-slate-400 font-mono text-[11px]" title="${hash}">${hashShort}</td>
+              <td class="px-4 py-2.5">${numTxsDisplay}</td>
+              <td class="px-4 py-2.5">${sizeDisplay}</td>
+              <td class="px-4 py-2.5 text-slate-300 font-mono text-xs" title="Committed at ${b.raw_time}">
+                <span class="text-slate-200">${b.time_str}</span> <span class="text-slate-500 font-sans text-[11px]">(${b.age_str})</span>
+              </td>
+            `;
+            tbody.appendChild(tr);
+          });
+
+          // Update Pipeline Latency stats card from backend API metrics
+          const elPipeline = document.getElementById('stat-pipeline-time');
+          const elConsensus = document.getElementById('stat-avg-consensus');
+          const elDA = document.getElementById('stat-avg-da');
+          const elSub = document.getElementById('stat-pipeline-sub');
+          if (elPipeline) {
+            const cSec = typeof apiData.avg_consensus_sec === 'number' ? apiData.avg_consensus_sec : 0;
+            const daSec = typeof apiData.avg_da_sec === 'number' ? apiData.avg_da_sec : 0;
+            const totalSec = typeof apiData.total_pipeline_sec === 'number' ? apiData.total_pipeline_sec : (cSec + daSec);
+            if (totalSec > 0 || cSec > 0 || daSec > 0) {
+              elPipeline.textContent = `Total: ${totalSec.toFixed(1)}s`;
+              if (elConsensus) elConsensus.textContent = cSec > 0 ? `${cSec.toFixed(1)}s` : '-';
+              if (elDA) elDA.textContent = daSec > 0 ? `${daSec.toFixed(1)}s` : '-';
+              if (elSub) elSub.textContent = `Consensus: ${cSec.toFixed(1)}s | DA: ${daSec.toFixed(1)}s`;
+            } else {
+              elPipeline.textContent = '-';
+              if (elConsensus) elConsensus.textContent = '-';
+              if (elDA) elDA.textContent = '-';
+            }
+          }
+
+          return;
+        }
+
+        // 2. Fallback: Query CometBFT cluster directly if backend API was unreachable
         const cRes = await fetch(`${state.cometURL}/status`);
         if (!cRes.ok) throw new Error('CometBFT offline');
         const cData = await cRes.json();
-        const latestHeight = parseInt(cData.result?.sync_info?.latest_block_height || '0', 10);
+        latestHeight = parseInt(cData.result?.sync_info?.latest_block_height || '0', 10);
         if (latestHeight <= 0) return;
 
         // Fetch up to targetLimit blocks in parallel chunks of 20
@@ -1075,8 +1377,21 @@
         const metas = chunkArrays.flat();
 
         if (metas.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-6 text-center text-slate-500 italic">No blocks recorded yet.</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-6 text-center text-slate-500 italic">No blocks recorded yet.</td></tr>';
           return;
+        }
+
+        // Strictly sort descending by height
+        metas.sort((a, b) => parseInt(b.header.height, 10) - parseInt(a.header.height, 10));
+
+        // Calibrate network reference clock against current tip
+        const topTimeStr = cData.result?.sync_info?.latest_block_time || metas[0]?.header?.time;
+        if (topTimeStr) {
+          const topDate = parseBlockDate(topTimeStr);
+          if (topDate) {
+            state.networkReferenceTime = topDate.getTime();
+            state.networkReferenceClientTick = Date.now();
+          }
         }
 
         // Calculate average active consensus block time (filtering out idle gaps > 6.0s when no txs were submitted)
@@ -1119,57 +1434,82 @@
         }
 
         const elPipeline = document.getElementById('stat-pipeline-time');
+        const elConsensus = document.getElementById('stat-avg-consensus');
+        const elDA = document.getElementById('stat-avg-da');
         const elSub = document.getElementById('stat-pipeline-sub');
         if (elPipeline) {
           if (avgConsensusSec > 0 || avgCdaSec > 0) {
             const totalSec = avgConsensusSec + avgCdaSec;
-            elPipeline.textContent = `${totalSec.toFixed(1)}s`;
+            elPipeline.textContent = `Total: ${totalSec.toFixed(1)}s`;
+            if (elConsensus) {
+              elConsensus.textContent = avgConsensusSec > 0 ? `${avgConsensusSec.toFixed(1)}s` : '-';
+            }
+            if (elDA) {
+              elDA.textContent = avgCdaSec > 0 ? `${avgCdaSec.toFixed(1)}s` : '-';
+            }
             if (elSub) {
-              elSub.textContent = `Consensus: ${avgConsensusSec.toFixed(1)}s | CDA DA: ${avgCdaSec.toFixed(1)}s`;
+              elSub.textContent = `Consensus: ${avgConsensusSec.toFixed(1)}s | DA: ${avgCdaSec.toFixed(1)}s`;
             }
           } else {
             elPipeline.textContent = '-';
+            if (elConsensus) elConsensus.textContent = '-';
+            if (elDA) elDA.textContent = '-';
           }
         }
 
         tbody.innerHTML = '';
         metas.forEach(m => {
           const h = m.header.height;
+          const hInt = parseInt(h, 10);
           const hash = m.block_id.hash;
           const hashShort = hash ? `${hash.substring(0, 8)}...${hash.substring(hash.length - 6)}` : '-';
           const numTxs = parseInt(m.num_txs || '0', 10);
           const blockSize = parseInt(m.block_size || '0', 10);
-          const timeStr = timeAgo(m.header.time);
+          window._cdaBlockSizes.set(hInt, blockSize);
 
+          const d = parseBlockDate(m.header.time);
+          const timeHms = d ? `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}:${String(d.getUTCSeconds()).padStart(2, '0')} UTC` : '-';
+          const timeAgoStr = timeAgo(m.header.time);
+
+          const isSelected = state.selectedBlockHeight === hInt;
           const tr = document.createElement('tr');
-          tr.className = 'hover:bg-slate-900/60 cursor-pointer transition';
-          tr.onclick = (e) => {
-            if (e.target.tagName !== 'BUTTON') inspectBlock(h);
-          };
+          tr.className = isSelected 
+            ? 'bg-indigo-950/60 border-l-2 border-indigo-500 hover:bg-indigo-900/50 cursor-pointer transition' 
+            : 'hover:bg-slate-900/60 cursor-pointer transition';
+          tr.onclick = () => inspectBlock(h);
+
+          const numTxsDisplay = numTxs > 0 
+            ? `<span class="text-emerald-400 font-bold font-mono">${numTxs}</span>` 
+            : `<span class="text-slate-500 font-mono text-[11px]">0 (Empty)</span>`;
+
+          const sizeDisplay = numTxs > 0
+            ? `<span class="text-slate-200 font-mono text-xs font-semibold" title="CometBFT wire size: ${formatBytes(blockSize)} (${blockSize.toLocaleString()} bytes)">${formatBytes(blockSize)}</span>`
+            : `<span class="text-slate-500 font-mono text-[11px]" title="CometBFT heartbeat wire size: ${formatBytes(blockSize)}">0 B <span class="text-slate-600">(${formatBytes(blockSize)})</span></span>`;
 
           tr.innerHTML = `
-            <td class="px-4 py-2 font-bold text-indigo-400">#${h}</td>
-            <td class="px-4 py-2 text-slate-400 font-mono text-[11px]" title="${hash}">${hashShort}</td>
-            <td class="px-4 py-2 ${numTxs > 0 ? 'text-emerald-400 font-bold' : 'text-slate-500'}">${numTxs}</td>
-            <td class="px-4 py-2 text-slate-300 font-mono text-xs">${formatBytes(blockSize)}</td>
-            <td class="px-4 py-2 text-slate-400 text-xs">${timeStr}</td>
-            <td class="px-4 py-2 text-right">
-              <button onclick="inspectBlock(${h})" class="bg-indigo-600/80 hover:bg-indigo-600 text-white px-2.5 py-1 rounded text-[11px] font-sans font-medium transition">
-                Inspect
-              </button>
+            <td class="px-4 py-2.5 font-bold ${isSelected ? 'text-indigo-300 font-extrabold' : 'text-indigo-400'}">#${h}</td>
+            <td class="px-4 py-2.5 text-slate-400 font-mono text-[11px]" title="${hash}">${hashShort}</td>
+            <td class="px-4 py-2.5">${numTxsDisplay}</td>
+            <td class="px-4 py-2.5">${sizeDisplay}</td>
+            <td class="px-4 py-2.5 text-slate-300 font-mono text-xs" title="Committed at ${m.header.time}">
+              <span class="text-slate-200">${timeHms}</span> <span class="text-slate-500 font-sans text-[11px]">(${timeAgoStr})</span>
             </td>
           `;
           tbody.appendChild(tr);
         });
 
       } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-6 text-center text-amber-500">Unable to load recent blocks (${err.message})</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="5" class="px-4 py-6 text-center text-amber-500">Unable to load recent blocks (${err.message})</td></tr>`;
       }
     }
 
     function inspectBlock(height) {
+      const hInt = parseInt(height, 10);
+      state.selectedBlockHeight = hInt;
       document.getElementById('toc-height-input').value = height;
       fetchBlockTOC();
+      // Re-render table selection highlight
+      fetchRecentBlocks();
       const card = document.getElementById('block-toc-card');
       if (card) {
         card.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1184,6 +1524,16 @@
         if (cRes.ok) {
           const cData = await cRes.json();
           latestHeight = parseInt(cData.result?.sync_info?.latest_block_height || '0', 10);
+
+          // Calibrate network clock against latest block time to eliminate client clock skew
+          const sTimeStr = cData.result?.sync_info?.latest_block_time;
+          if (sTimeStr) {
+            const sDate = parseBlockDate(sTimeStr);
+            if (sDate) {
+              state.networkReferenceTime = sDate.getTime();
+              state.networkReferenceClientTick = Date.now();
+            }
+          }
           document.getElementById('comet-height').textContent = `#${latestHeight}`;
           document.getElementById('comet-dot').className = 'w-2 h-2 rounded-full bg-emerald-500';
           document.getElementById('stat-height').textContent = `#${latestHeight}`;
@@ -1248,6 +1598,9 @@
 
       // 5. Fetch Recent Processed Blocks
       await fetchRecentBlocks();
+
+      // 6. Reconcile Any Pending Transactions
+      await reconcilePendingTxs();
     }
 
     async function fetchBlockTOC() {
@@ -1260,31 +1613,79 @@
       container.innerHTML = `<p class="text-xs text-slate-400 italic">Loading Block #${height} Header and TOC...</p>`;
 
       try {
-        const [tocRes, blockRes, pubHeaderRes, prevBlockRes, metricsRes] = await Promise.all([
-          fetch(`${state.pubURL}/api/v1/toc/${height}`).catch(() => null),
-          fetch(`${state.cometURL}/block?height=${height}`).catch(() => null),
-          fetch(`${state.pubURL}/header/${reqBlockId}`).catch(() => null),
-          prevHeight ? fetch(`${state.cometURL}/block?height=${prevHeight}`).catch(() => null) : null,
-          fetch(`${state.pubURL}/metrics`).catch(() => null)
-        ]);
-
         let toc = null;
-        if (tocRes && tocRes.ok) {
-          const json = await tocRes.json();
-          if (json.status !== 'not_found') {
-            toc = json.toc || json;
-          }
-        }
-
         let cbBlock = null;
-        if (blockRes && blockRes.ok) {
-          const json = await blockRes.json();
-          cbBlock = json.result;
-        }
-
         let pubHeader = null;
-        if (pubHeaderRes && pubHeaderRes.ok) {
-          pubHeader = await pubHeaderRes.json();
+        let blockId = null;
+        let consensusDurationSec = null;
+        let daDurationSec = null;
+        let tCommitIso = null;
+        let tStoreCompleteIso = null;
+        let backendBlockSize = null;
+        let backendWireSize = null;
+        let backendPayloadSize = null;
+
+        // 1. Fast-path: query unified backend API on dashboard host (same-origin, 0-CORS overhead)
+        try {
+          const inspRes = await fetch(`/api/block-inspect/${height}`).catch(() => null);
+          if (inspRes && inspRes.ok) {
+            const inspData = await inspRes.json().catch(() => null);
+            if (inspData && inspData.status === 'success') {
+              if (inspData.toc) toc = inspData.toc.toc || inspData.toc;
+              if (inspData.pub_header) pubHeader = inspData.pub_header;
+              if (inspData.cb_header) {
+                cbBlock = { block: { header: inspData.cb_header }, block_id: { hash: inspData.block_hash } };
+              }
+              if (inspData.block_hash) blockId = inspData.block_hash;
+              if (inspData.block_size) backendBlockSize = inspData.block_size;
+              if (inspData.wire_size) backendWireSize = inspData.wire_size;
+              if (inspData.payload_size) backendPayloadSize = inspData.payload_size;
+              if (inspData.timings) {
+                if (typeof inspData.timings.consensus_sec === 'number') consensusDurationSec = inspData.timings.consensus_sec;
+                if (typeof inspData.timings.da_sec === 'number') daDurationSec = inspData.timings.da_sec;
+                tCommitIso = inspData.timings.t_block_commit_iso || null;
+                tStoreCompleteIso = inspData.timings.t_store_complete_iso || null;
+              }
+            }
+          }
+        } catch (_) {}
+
+        // 2. Fallback: if fast-path did not yield both toc and cbBlock, query cluster nodes directly
+        if (!toc || !cbBlock) {
+          const [tocRes, headerRes, pubHeaderRes, timingsRes] = await Promise.all([
+            !toc ? fetch(`${state.pubURL}/api/v1/toc/${height}`).catch(() => null) : null,
+            !cbBlock ? fetch(`${state.cometURL}/header?height=${height}`).catch(() => null) : null,
+            !pubHeader ? fetch(`${state.pubURL}/header/${reqBlockId}`).catch(() => null) : null,
+            consensusDurationSec === null ? fetch(`/api/block-timings/${height}`).catch(() => null) : null
+          ]);
+
+          if (tocRes && tocRes.ok) {
+            const json = await tocRes.json().catch(() => null);
+            if (json && json.status !== 'not_found') {
+              toc = json.toc || json;
+            }
+          }
+
+          if (headerRes && headerRes.ok) {
+            const json = await headerRes.json().catch(() => null);
+            if (json && json.result && json.result.header) {
+              cbBlock = { block: { header: json.result.header } };
+            }
+          }
+
+          if (pubHeaderRes && pubHeaderRes.ok) {
+            pubHeader = await pubHeaderRes.json().catch(() => null);
+          }
+
+          if (timingsRes && timingsRes.ok) {
+            const tJson = await timingsRes.json().catch(() => null);
+            if (tJson && tJson.status === 'success') {
+              if (typeof tJson.consensus_sec === 'number') consensusDurationSec = tJson.consensus_sec;
+              if (typeof tJson.da_sec === 'number') daDurationSec = tJson.da_sec;
+              tCommitIso = tJson.t_block_commit_iso || null;
+              tStoreCompleteIso = tJson.t_store_complete_iso || null;
+            }
+          }
         }
 
         if (!toc && !cbBlock) {
@@ -1293,26 +1694,37 @@
 
         // Extract key header values
         const bHeader = cbBlock?.block?.header || {};
-        const blockId = cbBlock?.block_id?.hash || toc?.block_id || reqBlockId;
+        if (!blockId) {
+          blockId = cbBlock?.block_id?.hash || toc?.block_id || reqBlockId;
+        }
         const chainId = bHeader.chain_id || 'cda-network';
-        const blockTime = bHeader.time ? new Date(bHeader.time).toUTCString() : '-';
+        const parsedBTime = parseBlockDate(bHeader.time);
+        const blockTime = parsedBTime ? parsedBTime.toUTCString() : '-';
         const age = bHeader.time ? timeAgo(bHeader.time) : '';
         const proposer = bHeader.proposer_address || '-';
         const dataHash = bHeader.data_hash || '-';
+        
+        const txs = toc?.txs || [];
+        const totalTxs = toc?.total_txs !== undefined ? toc.total_txs : (cbBlock?.block?.data?.txs?.length || txs.length);
+        const isEmptyBlock = totalTxs === 0;
+
         let fiatShamirCoeffs = pubHeader?.coeffs || bHeader.coeffs || '';
         if (Array.isArray(fiatShamirCoeffs)) {
           let binary = '';
           for (let i = 0; i < fiatShamirCoeffs.length; i++) binary += String.fromCharCode(fiatShamirCoeffs[i]);
           fiatShamirCoeffs = btoa(binary);
         }
-        if (!fiatShamirCoeffs) fiatShamirCoeffs = '-';
+        if (!fiatShamirCoeffs) {
+          fiatShamirCoeffs = isEmptyBlock ? 'N/A (Empty Block)' : '-';
+        }
 
         const parentHash = bHeader.last_block_id?.hash || '-';
         const commitsRoot = pubHeader?.commits_root || bHeader.commits_root || '';
 
-        const txs = toc?.txs || [];
-        const totalTxs = toc?.total_txs !== undefined ? toc.total_txs : (cbBlock?.block?.data?.txs?.length || txs.length);
-        const namespacesList = (toc?.namespaces || []).join(', ') || '-';
+        const namespacesList = (toc?.namespaces && toc.namespaces.length > 0)
+          ? toc.namespaces.join(', ')
+          : (isEmptyBlock ? 'None (Empty Block)' : '-');
+
         const totalCells = txs.reduce((sum, t) => sum + (t.num_cells || t.cell_count || 0), 0);
 
         // Determine K and ODS Dimension (e.g. 16x16, 32x32, 64x64)
@@ -1328,47 +1740,64 @@
           }
           k = candidate;
         }
-        const odsDimStr = k > 0 ? `${k}x${k}` : '-';
+        const odsDimStr = isEmptyBlock ? '0x0 (Empty)' : (k > 0 ? `${k}x${k}` : '-');
 
-        // Calculate Block Processing Duration (Consensus latency and Total Pipeline)
-        let consensusDurationSec = null;
-        if (cbBlock?.block?.header?.time && prevBlockRes && prevBlockRes.ok) {
+        // Fallback consensus duration calculation if not already provided by backend
+        if (consensusDurationSec === null && cbBlock?.block?.header?.time) {
           try {
-            const prevJson = await prevBlockRes.json();
-            const prevTime = prevJson?.result?.block?.header?.time;
-            if (prevTime) {
-              const tCurr = new Date(cbBlock.block.header.time).getTime();
-              const tPrev = new Date(prevTime).getTime();
-              const diff = (tCurr - tPrev) / 1000;
-              if (diff >= 0) {
-                consensusDurationSec = diff;
+            const prevRes = await fetch(`${state.cometURL}/header?height=${hNum - 1}`).catch(() => null);
+            if (prevRes && prevRes.ok) {
+              const prevJson = await prevRes.json().catch(() => null);
+              const prevTime = prevJson?.result?.header?.time;
+              if (prevTime) {
+                const tCurr = parseBlockDate(cbBlock.block.header.time)?.getTime();
+                const tPrev = parseBlockDate(prevTime)?.getTime();
+                if (tCurr && tPrev) {
+                  const diff = (tCurr - tPrev) / 1000;
+                  if (diff >= 0 && diff <= 120) {
+                    consensusDurationSec = diff;
+                  }
+                }
               }
             }
-          } catch (e) {}
+          } catch (_) {}
         }
 
-        let avgCdaSec = 0;
-        if (metricsRes && metricsRes.ok) {
-          try {
-            const mText = await metricsRes.text();
-            const sumMatch = mText.match(/cda_publisher_block_duration_seconds_sum\s+([0-9.]+)/);
-            const countMatch = mText.match(/cda_publisher_block_duration_seconds_count\s+([0-9.]+)/);
-            if (sumMatch && countMatch) {
-              const sum = parseFloat(sumMatch[1]);
-              const count = parseFloat(countMatch[1]);
-              if (count > 0) avgCdaSec = sum / count;
-            }
-          } catch (e) {}
-        }
-
-        let procDisplayHtml = '<span class="text-slate-500 font-mono">-</span>';
+        let consensusDisplay = '<span class="text-slate-500 font-mono">-</span>';
         if (consensusDurationSec !== null) {
-          const totalPipeline = avgCdaSec > 0 ? (consensusDurationSec + avgCdaSec) : consensusDurationSec;
-          const tooltip = avgCdaSec > 0
-            ? `Total Pipeline Latency: Consensus (${consensusDurationSec.toFixed(2)}s) + CDA DA (${avgCdaSec.toFixed(2)}s) = ${totalPipeline.toFixed(2)}s`
-            : `Consensus Latency: ${consensusDurationSec.toFixed(2)}s`;
-          procDisplayHtml = `<span class="text-emerald-400 font-bold font-mono" title="${tooltip}">${totalPipeline.toFixed(1)}s</span>`;
+          consensusDisplay = `<span class="text-indigo-400 font-bold font-mono" title="CometBFT consensus duration for Block #${hNum}: ${consensusDurationSec.toFixed(2)}s">${consensusDurationSec.toFixed(1)}s</span>`;
         }
+
+        let daDisplay = '<span class="text-slate-500 font-mono">-</span>';
+        if (isEmptyBlock) {
+          daDisplay = '<span class="text-slate-400 font-mono text-[11px]" title="CometBFT produced an empty block to maintain consensus heartbeats. CDA DA pipeline skipped.">Idle (0 txs)</span>';
+        } else if (daDurationSec !== null && daDurationSec > 0) {
+          const detailTip = (tStoreCompleteIso && tCommitIso)
+            ? `Block #${hNum} DA Time (t_store_complete - t_block_commit): ${tStoreCompleteIso} - ${tCommitIso} = ${daDurationSec.toFixed(1)}s`
+            : `Block #${hNum} DA Time (t_store_complete - t_block_commit): ${daDurationSec.toFixed(1)}s`;
+          daDisplay = `<span class="text-emerald-400 font-bold font-mono" title="${detailTip}">${daDurationSec.toFixed(1)}s</span>`;
+        }
+
+        // Resolve accurate Block Size (prioritize exact CometBFT wire size and TOC payload bytes over stale caches)
+        const totalPayloadBytes = txs.reduce((sum, t) => sum + (t.size || 0), 0);
+        let displayedBlockSize = 0;
+        if (backendWireSize && backendWireSize > 0) {
+          displayedBlockSize = backendWireSize;
+        } else if (backendBlockSize && backendBlockSize > 0) {
+          displayedBlockSize = backendBlockSize;
+        } else if (totalPayloadBytes > 0) {
+          displayedBlockSize = totalPayloadBytes;
+        } else if (window._cdaBlockSizes?.has(hNum)) {
+          displayedBlockSize = window._cdaBlockSizes.get(hNum);
+        } else if (cbBlock?.block?.data?.txs && cbBlock.block.data.txs.length > 0) {
+          displayedBlockSize = cbBlock.block.data.txs.reduce((sum, t) => sum + Math.floor((t.length * 3) / 4), 0);
+        } else {
+          displayedBlockSize = isEmptyBlock ? 892 : (totalCells > 0 ? totalCells * 512 : 892);
+        }
+
+        const sizeTooltip = (totalPayloadBytes > 0)
+          ? `Wire size: ${formatBytes(displayedBlockSize)} | Payload: ${formatBytes(totalPayloadBytes)} (${totalPayloadBytes.toLocaleString()} bytes across ${txs.length} txs)`
+          : `Block size: ${formatBytes(displayedBlockSize)}`;
 
         let html = `
           <!-- Block Header Summary Card -->
@@ -1377,6 +1806,7 @@
               <div class="flex items-center space-x-2">
                 <span class="text-sm font-bold text-white">Block #${height}</span>
                 <span class="bg-indigo-950 text-indigo-300 border border-indigo-700/60 px-2 py-0.5 rounded text-[11px] font-semibold">${chainId}</span>
+                ${isEmptyBlock ? '<span class="bg-slate-800 text-slate-400 border border-slate-700/80 px-2 py-0.5 rounded text-[10px] font-mono">Empty Consensus Block</span>' : ''}
               </div>
               <div class="text-slate-400 text-xs font-sans">
                 <span>${blockTime}</span> <span class="text-slate-500 font-mono">(${age})</span>
@@ -1419,9 +1849,11 @@
             <div class="pt-2 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs">
               <div class="flex flex-wrap items-center gap-3">
                 <div><span class="text-slate-400 font-sans">Total Txs:</span> <span class="text-indigo-400 font-bold">${totalTxs}</span></div>
+                <div><span class="text-slate-400 font-sans">Block Size:</span> <span class="text-white font-bold font-mono" title="${sizeTooltip}">${formatBytes(displayedBlockSize)}</span></div>
                 <div><span class="text-slate-400 font-sans">ODS Size:</span> <span class="text-cyan-400 font-bold font-mono" title="Original Data Square Dimension (${odsDimStr}, K=${k})">${odsDimStr}</span></div>
                 <div><span class="text-slate-400 font-sans">ODS Cells:</span> <span class="text-amber-400 font-bold">${totalCells} cells</span></div>
-                <div><span class="text-slate-400 font-sans">Pipeline Time:</span> ${procDisplayHtml}</div>
+                <div><span class="text-slate-400 font-sans" title="Consensus Layer Processing Time for Block #${hNum}">Consensus Time:</span> ${consensusDisplay}</div>
+                <div><span class="text-slate-400 font-sans" title="DA Layer Processing Time (t_store_complete - t_block_commit) for Block #${hNum}">DA Time:</span> ${daDisplay}</div>
               </div>
               <div><span class="text-slate-400 font-sans">Active Namespaces:</span> <span class="text-emerald-400 font-bold">${namespacesList}</span></div>
             </div>
@@ -1430,23 +1862,34 @@
           <!-- ODS Table of Contents -->
           <div class="space-y-2 pt-1">
             <h4 class="text-xs font-bold text-white uppercase tracking-wider">ODS Matrix Layout (Table of Contents)</h4>
-            <div class="overflow-x-auto border border-slate-800/80 rounded-lg">
+        `;
+
+        if (isEmptyBlock) {
+          html += `
+            <div class="bg-slate-900/60 border border-slate-800 rounded-lg p-5 text-center space-y-1.5">
+              <p class="text-xs font-bold text-slate-300">Empty Consensus Block (0 Transactions)</p>
+              <p class="text-[11px] text-slate-400 max-w-lg mx-auto leading-relaxed">
+                CometBFT consensus committed this block to maintain network heartbeats while the mempool had no queued transactions.
+                CDA 2D Reed-Solomon erasure coding, Original Data Square (ODS) layout, and BLS12-381 KZG polynomial commitments are only generated for blocks containing blob payload transactions.
+              </p>
+            </div>
+          </div>`;
+        } else {
+          html += `
+            <div class="overflow-x-auto overflow-y-auto max-h-80 border border-slate-800/80 rounded-lg shadow-inner">
               <table class="w-full text-left text-xs font-mono">
-                <thead class="bg-slate-900 text-slate-400 border-b border-slate-800">
+                <thead class="bg-slate-900 text-slate-400 border-b border-slate-800 sticky top-0 z-10 shadow-sm">
                   <tr>
-                    <th class="px-3 py-2">Cell Offset</th>
-                    <th class="px-3 py-2">Cells</th>
-                    <th class="px-3 py-2">Size</th>
-                    <th class="px-3 py-2">Namespace</th>
-                    <th class="px-3 py-2">Transaction Key</th>
+                    <th class="px-3 py-2 bg-slate-900">Cell Offset</th>
+                    <th class="px-3 py-2 bg-slate-900">Cells</th>
+                    <th class="px-3 py-2 bg-slate-900">Size</th>
+                    <th class="px-3 py-2 bg-slate-900">Namespace</th>
+                    <th class="px-3 py-2 bg-slate-900">Transaction Key</th>
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-800/80">
-        `;
+          `;
 
-        if (txs.length === 0) {
-          html += `<tr><td colspan="5" class="px-3 py-4 text-center text-slate-500 italic">No transactions recorded in this block ODS matrix.</td></tr>`;
-        } else {
           txs.forEach(t => {
             html += `
               <tr class="hover:bg-slate-900/50">
@@ -1458,14 +1901,13 @@
               </tr>
             `;
           });
-        }
 
-        html += `
+          html += `
                 </tbody>
               </table>
             </div>
-          </div>
-        `;
+          </div>`;
+        }
 
         container.innerHTML = html;
 
@@ -1477,6 +1919,8 @@
     // Utilities & Structured Transaction Logging
     let txCounter = 0;
     let currentTxLogger = null;
+    window._cdaLoggerRegistry = window._cdaLoggerRegistry || new Map();
+    window._activeTxTrackers = window._activeTxTrackers || new Map();
 
     function startTxLog(namespace, blobId) {
       const container = document.getElementById('tx-log');
@@ -1494,7 +1938,7 @@
             <span class="bg-indigo-950 text-indigo-300 border border-indigo-700/60 px-1.5 py-0.5 rounded font-bold font-mono text-[10px]">TX #${txId}</span>
             <span class="text-white font-semibold font-mono truncate" title="${blobId}">${blobId}</span>
           </div>
-          <span id="tx-badge-${txId}" class="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-amber-950 text-amber-300 border border-amber-800 shrink-0">PENDING</span>
+          <span id="tx-badge-${txId}" class="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-amber-950 text-amber-300 border border-amber-800 shrink-0 cursor-pointer" title="Pending block commit. Click to recheck status.">PENDING</span>
         </div>
         <div id="tx-entries-${txId}" class="space-y-1 text-slate-400 text-xs font-mono pt-0.5"></div>
       `;
@@ -1507,6 +1951,19 @@
 
       const logger = {
         id: txId,
+        hash: null,
+        namespace: namespace,
+        blobId: blobId,
+        setHash(cleanHash) {
+          this.hash = cleanHash;
+          groupDiv.dataset.txHash = cleanHash;
+          groupDiv.dataset.txNamespace = namespace;
+          groupDiv.dataset.txBlobId = blobId;
+          groupDiv.dataset.txPending = "true";
+          window._cdaLoggerRegistry.set(cleanHash.toLowerCase(), this);
+          badge.title = `Transaction Hash: 0x${cleanHash}. Click to recheck status.`;
+          badge.onclick = () => window.checkTxCommit(cleanHash, this);
+        },
         log(msg) {
           const p = document.createElement('p');
           p.className = 'break-all leading-relaxed text-[11px]';
@@ -1516,23 +1973,159 @@
           container.scrollTop = container.scrollHeight;
         },
         success(height) {
-          badge.className = 'text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-emerald-950 text-emerald-400 border border-emerald-800 shrink-0';
+          delete groupDiv.dataset.txPending;
+          badge.className = 'text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-emerald-950 text-emerald-400 border border-emerald-800 shrink-0 cursor-pointer';
           badge.textContent = height ? `COMMITTED #${height}` : 'CONFIRMED';
+          badge.title = `Committed in block #${height}. Click to inspect block.`;
+          badge.onclick = () => {
+            if (height) inspectBlock(height);
+          };
           groupDiv.classList.remove('border-slate-800');
           groupDiv.classList.add('border-emerald-800/50');
         },
         fail(err) {
+          delete groupDiv.dataset.txPending;
           badge.className = 'text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-rose-950 text-rose-400 border border-rose-800 shrink-0';
           badge.textContent = 'FAILED';
+          badge.onclick = null;
           groupDiv.classList.remove('border-slate-800');
           groupDiv.classList.add('border-rose-800/60');
           this.log(`<span class="text-rose-400 font-semibold">Error: ${err}</span>`);
+        },
+        timeout() {
+          badge.className = 'text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-amber-900/50 text-amber-300 border border-amber-700 shrink-0 cursor-pointer hover:bg-amber-800';
+          badge.textContent = 'IN MEMPOOL (RECHECK)';
+          badge.title = 'Block commit is taking longer than usual. Click to poll CometBFT again.';
         }
       };
 
       currentTxLogger = logger;
       return logger;
     }
+
+    async function trackTxCommit(cleanHash, txLogger, namespace, blobId) {
+      if (!cleanHash) return;
+      const key = cleanHash.toLowerCase();
+      if (window._activeTxTrackers.has(key)) return;
+      window._activeTxTrackers.set(key, true);
+
+      const maxAttempts = 60; // 60 attempts x 1500ms = 90s
+      let committedHeight = null;
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        await new Promise(r => setTimeout(r, 1500));
+        try {
+          const checkRes = await fetch(`${state.cometURL.replace(/\/+$/, '')}/tx?hash=0x${cleanHash}`);
+          if (checkRes.ok) {
+            const checkData = await checkRes.json();
+            if (checkData.result && checkData.result.height) {
+              committedHeight = parseInt(checkData.result.height, 10);
+              break;
+            }
+          }
+        } catch (e) {
+          // ignore transient network hiccups
+        }
+      }
+
+      window._activeTxTrackers.delete(key);
+
+      if (committedHeight) {
+        if (txLogger) {
+          txLogger.success(committedHeight);
+          txLogger.log(`Committed in Block Height: #${committedHeight}`);
+        }
+        const tocInput = document.getElementById('toc-height-input');
+        if (tocInput) tocInput.value = committedHeight;
+        await loadNamespaceBlobs();
+        await fetchChainStats();
+      } else {
+        if (txLogger) {
+          txLogger.timeout();
+          txLogger.log(`Transaction remains in mempool. Click badge above to recheck.`);
+        }
+      }
+    }
+
+    window.checkTxCommit = async function(rawHash, txLogger) {
+      if (!rawHash) return null;
+      const cleanHash = rawHash.replace(/^0x/i, '').trim();
+      const logger = txLogger || window._cdaLoggerRegistry.get(cleanHash.toLowerCase());
+
+      if (logger) logger.log(`Querying CometBFT RPC for 0x${cleanHash.substring(0, 12)}...`);
+      try {
+        const res = await fetch(`${state.cometURL.replace(/\/+$/, '')}/tx?hash=0x${cleanHash}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.error) throw new Error(data.error.data || data.error.message);
+        
+        if (data.result && data.result.height) {
+          const height = parseInt(data.result.height, 10);
+          const index = data.result.index;
+          const code = data.result.tx_result?.code || 0;
+          if (logger) {
+            logger.success(height);
+            logger.log(`Found on-chain! Block Height: #${height}, Index: ${index}, Code: ${code}`);
+          } else {
+            logTx(`Tx 0x${cleanHash.substring(0, 10)}... COMMITTED in Block #${height} (index ${index})`);
+          }
+          const tocInput = document.getElementById('toc-height-input');
+          if (tocInput) tocInput.value = height;
+          loadNamespaceBlobs();
+          fetchChainStats();
+          return { height, index, code };
+        } else {
+          if (logger) logger.log(`Transaction is still pending in Mempool.`);
+          else logTx(`Tx 0x${cleanHash.substring(0, 10)}... is still pending in Mempool.`);
+        }
+      } catch (err) {
+        if (logger) logger.log(`Tx check result: ${err.message}`);
+        else logTx(`Tx check failed: ${err.message}`);
+      }
+      return null;
+    };
+
+    async function reconcilePendingTxs() {
+      const pendingElements = document.querySelectorAll('[data-tx-pending="true"]');
+      if (!pendingElements || pendingElements.length === 0) return;
+
+      for (const el of pendingElements) {
+        const hash = el.dataset.txHash;
+        if (!hash) continue;
+        const logger = window._cdaLoggerRegistry.get(hash.toLowerCase());
+        try {
+          const res = await fetch(`${state.cometURL.replace(/\/+$/, '')}/tx?hash=0x${hash}`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.result && data.result.height) {
+              const h = parseInt(data.result.height, 10);
+              if (logger) {
+                logger.success(h);
+                logger.log(`Auto-reconciled: Committed in Block #${h}`);
+              } else {
+                delete el.dataset.txPending;
+                const badge = el.querySelector('[id^="tx-badge-"]');
+                if (badge) {
+                  badge.className = 'text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-emerald-950 text-emerald-400 border border-emerald-800 shrink-0 cursor-pointer';
+                  badge.textContent = `COMMITTED #${h}`;
+                }
+              }
+              loadNamespaceBlobs();
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
+    window.checkTxPrompt = async function() {
+      const input = prompt('Enter CometBFT Transaction Hash (Hex):', '');
+      if (!input || !input.trim()) return;
+      const cleanHash = input.replace(/^0x/i, '').trim();
+      const logger = startTxLog('lookup', cleanHash.substring(0, 12));
+      logger.setHash(cleanHash);
+      logger.log(`Checking status for hash: ${cleanHash}`);
+      await window.checkTxCommit(cleanHash, logger);
+    };
 
     function clearTxLogs() {
       const el = document.getElementById('tx-log');
