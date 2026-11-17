@@ -4,11 +4,13 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"math/bits"
 
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/rlnc"
 	bls12381 "github.com/consensys/gnark-crypto/ecc/bls12-381"
 	"github.com/consensys/gnark-crypto/ecc/bls12-381/fr"
+	"github.com/consensys/gnark-crypto/ecc/bls12-381/fr/fft"
 )
 
 type RLNCEncoder struct {
@@ -89,6 +91,97 @@ func EvaluatePieceColumnWithPowers(columnData [][]byte, pieceIdx, rowIdx, k, frS
 	return result
 }
 
+func bitReverseFr(a []fr.Element) {
+	n := uint64(len(a))
+	nn := uint64(64 - bits.TrailingZeros64(n))
+	for i := uint64(0); i < n; i++ {
+		irev := bits.Reverse64(i) >> nn
+		if irev > i {
+			a[i], a[irev] = a[irev], a[i]
+		}
+	}
+}
+
+// PrecomputeColumnFragments evaluates all k piece-columns across all N rows simultaneously in O(k * numChunks * N log N)
+// using Radix-2 FFT over the roots-of-unity domain instead of O(N^2) per-row polynomial evaluation.
+// Returns a 3D slice indexed by [row][pieceIdx][]byte.
+func (e *RLNCEncoder) PrecomputeColumnFragments(columnData [][]byte) [][][]byte {
+	n := len(columnData)
+	if n == 0 || e.k <= 0 {
+		return nil
+	}
+	frSize := len(columnData[0]) / e.k
+	numChunks := (frSize + 31) / 32
+	if numChunks <= 0 {
+		numChunks = 1
+	}
+
+	allFragments := make([][][]byte, n)
+	var domainN *fft.Domain
+	if gnarkKZG, isGnark := e.kzg.(*cda.GnarkKZG); isGnark {
+		domainN = gnarkKZG.GetDomain(n)
+	}
+
+	// Fast-path: O(N log N) FFT evaluation across all rows when domainN is available
+	if domainN != nil {
+		// Pre-allocate contiguous byte arena for all N * k * (numChunks*32) fragment bytes
+		fragByteLen := numChunks * 32
+		arena := make([]byte, n*e.k*fragByteLen)
+		for r := 0; r < n; r++ {
+			allFragments[r] = make([][]byte, e.k)
+			rowBase := r * e.k * fragByteLen
+			for j := 0; j < e.k; j++ {
+				start := rowBase + j*fragByteLen
+				allFragments[r][j] = arena[start : start+fragByteLen]
+			}
+		}
+
+		poly := make([]fr.Element, n)
+		for j := 0; j < e.k; j++ {
+			for m := 0; m < numChunks; m++ {
+				chunkStart := j*frSize + m*32
+				chunkEnd := chunkStart + 32
+				if chunkEnd > (j+1)*frSize {
+					chunkEnd = (j + 1) * frSize
+				}
+
+				for r := 0; r < n; r++ {
+					if chunkStart < len(columnData[r]) {
+						end := chunkEnd
+						if end > len(columnData[r]) {
+							end = len(columnData[r])
+						}
+						poly[r].SetBytes(columnData[r][chunkStart:end])
+					} else {
+						poly[r].SetZero()
+					}
+				}
+
+				domainN.FFT(poly, fft.DIF)
+				bitReverseFr(poly)
+
+				chunkOffset := m * 32
+				for row := 0; row < n; row++ {
+					bVal := poly[row].Bytes()
+					copy(allFragments[row][j][chunkOffset:chunkOffset+32], bVal[:])
+				}
+			}
+		}
+		return allFragments
+	}
+
+	// Fallback path: non-power-of-2 or non-Gnark KZG provider
+	for row := 0; row < n; row++ {
+		z := e.kzg.GetEvaluationPoint(row)
+		zPowers := ComputeZPowersFromPoint(z, n)
+		allFragments[row] = make([][]byte, e.k)
+		for j := 0; j < e.k; j++ {
+			allFragments[row][j] = EvaluatePieceColumnWithPowers(columnData, j, row, e.k, frSize, zPowers)
+		}
+	}
+	return allFragments
+}
+
 // EncodeRowNSeeds performs RLNC encoding on the cell of a specific row and column
 // to generate `count` distinct random seed pieces (d_i, g_i, P_i) using random coefficients g_i.
 func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pieceProofs [][]byte, count int) ([]*cda.ReceivedPiece, error) {
@@ -114,6 +207,23 @@ func (e *RLNCEncoder) EncodeRowNSeeds(row int, col int, columnData [][]byte, pie
 	for j := 0; j < e.k; j++ {
 		fragments[j] = EvaluatePieceColumnWithPowers(columnData, j, row, e.k, frSize, zPowers)
 	}
+
+	return e.EncodeRowNSeedsWithFragments(row, col, fragments, pieceProofs, count)
+}
+
+// EncodeRowNSeedsWithFragments generates `count` random RLNC seed pieces for (row, col) using pre-evaluated row fragments.
+func (e *RLNCEncoder) EncodeRowNSeedsWithFragments(row int, col int, fragments [][]byte, pieceProofs [][]byte, count int) ([]*cda.ReceivedPiece, error) {
+	if len(pieceProofs) != e.k {
+		return nil, fmt.Errorf("invalid piece proofs count: got %d, expected %d", len(pieceProofs), e.k)
+	}
+	if len(fragments) != e.k {
+		return nil, fmt.Errorf("invalid fragments count: got %d, expected %d", len(fragments), e.k)
+	}
+	if count <= 0 {
+		count = e.k
+	}
+
+	gnarkKZG, isGnark := e.kzg.(*cda.GnarkKZG)
 
 	openingProofs := make([]cda.OpeningProof, e.k)
 	for i := 0; i < e.k; i++ {

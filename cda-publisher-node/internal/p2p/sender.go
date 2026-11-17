@@ -2,8 +2,6 @@ package p2p
 
 import (
 	"context"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/url"
@@ -15,6 +13,7 @@ import (
 
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 )
@@ -39,7 +38,7 @@ func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, p
 		return fmt.Errorf("resolve bootstrap address for column %d (n %d): %w", colIdx, n, err)
 	}
 
-	// Support HTTP address conversion to multiaddr
+	// Support HTTP address conversion to QUIC multiaddr
 	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
 		u, err := url.Parse(addr)
 		if err == nil {
@@ -48,9 +47,9 @@ func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, p
 			if portVal, err := strconv.Atoi(portStr); err == nil {
 				p2pPort := portVal + 10000
 				if hostStr == "localhost" || hostStr == "127.0.0.1" {
-					addr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p2pPort)
+					addr = fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", p2pPort)
 				} else {
-					addr = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, p2pPort)
+					addr = fmt.Sprintf("/dns4/%s/udp/%d/quic-v1", hostStr, p2pPort)
 				}
 			}
 		}
@@ -82,8 +81,10 @@ func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, p
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	if err := s.host.Connect(ctx, *info); err != nil {
-		return fmt.Errorf("failed to connect to bootstrap node %s: %w", info.ID, err)
+	if s.host.Network().Connectedness(info.ID) != network.Connected {
+		if err := s.host.Connect(ctx, *info); err != nil {
+			return fmt.Errorf("failed to connect to bootstrap node %s: %w", info.ID, err)
+		}
 	}
 
 	log.Printf("[P2P] [Height: %d] Dialing stream %s to %s", height, p2pcommon.ProtoPublisherPush, info.ID)
@@ -93,16 +94,6 @@ func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, p
 	}
 	defer stream.Close()
 
-	hexColData := make([]string, len(colData))
-	for i, d := range colData {
-		hexColData[i] = hex.EncodeToString(d)
-	}
-
-	hexPieceCommits := make([]string, len(pieceCommits))
-	for i, c := range pieceCommits {
-		hexPieceCommits[i] = hex.EncodeToString(c)
-	}
-
 	serializedProofs := make([]p2pcommon.SerializedMerkleProof, len(merkleProofs))
 	for i, p := range merkleProofs {
 		serializedProofs[i] = p2pcommon.SerializedMerkleProof{
@@ -111,25 +102,22 @@ func (s *Sender) SendColumnChunk(blockID string, colIdx int, colData [][]byte, p
 		}
 	}
 
-	payload := p2pcommon.PublisherPushRequest{
+	payload := &p2pcommon.BinaryPublisherPushRequest{
 		BlockID:      blockID,
-		ColIdx:       colIdx,
-		ColumnData:   hexColData,
-		PieceCommits: hexPieceCommits,
+		ColIdx:       uint16(colIdx),
+		ColumnData:   colData,
+		PieceCommits: pieceCommits,
 		MerkleProofs: serializedProofs,
 	}
 
-	if err := json.NewEncoder(stream).Encode(payload); err != nil {
-		return fmt.Errorf("failed to encode payload to stream: %w", err)
+	if err := p2pcommon.WriteBinaryPublisherPush(stream, payload); err != nil {
+		return fmt.Errorf("failed to encode binary payload to stream: %w", err)
 	}
 
-	// Read acknowledgement response
-	var response struct {
-		Success bool   `json:"success"`
-		Error   string `json:"error,omitempty"`
-	}
-	if err := json.NewDecoder(stream).Decode(&response); err != nil {
-		return fmt.Errorf("failed to read response from remote peer: %w", err)
+	// Read binary acknowledgement response
+	response, err := p2pcommon.ReadBinaryBatchResponse(stream)
+	if err != nil {
+		return fmt.Errorf("failed to read binary response from remote peer: %w", err)
 	}
 
 	if !response.Success {

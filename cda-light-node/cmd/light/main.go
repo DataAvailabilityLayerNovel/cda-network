@@ -102,9 +102,9 @@ func main() {
 					if portVal, err := strconv.Atoi(portStr); err == nil {
 						p2pPort := portVal + 10000
 						if hostStr == "localhost" || hostStr == "127.0.0.1" {
-							bootAddr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p2pPort)
+							bootAddr = fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", p2pPort)
 						} else {
-							bootAddr = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, p2pPort)
+							bootAddr = fmt.Sprintf("/dns4/%s/udp/%d/quic-v1", hostStr, p2pPort)
 						}
 					}
 				}

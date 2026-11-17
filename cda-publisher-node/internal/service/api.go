@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -48,6 +49,7 @@ type APIService struct {
 	latestPublishedHeight int
 	latestCompletedHeight int
 	inFlightCount         int
+	pendingPublishCount   int
 	inFlightBlocks        map[string]int                     // BlockID -> Height
 	storeReadyMap         map[string]map[int]map[int]bool    // BlockID -> NetColIdx -> set of covered NetRowIdx
 	storeReadyPeers       map[string]map[int]map[string]bool // BlockID -> NetColIdx -> set of ready PeerID
@@ -717,29 +719,15 @@ func (s *APIService) handleStatus(w http.ResponseWriter, r *http.Request) {
 			InFlightBlocks.Set(0)
 		}
 	}
-	inFlight := s.inFlightCount
+	inFlight := s.inFlightCount + s.pendingPublishCount
 	completedH := s.latestCompletedHeight
 	pubH := s.latestPublishedHeight
 	s.colReadyMu.Unlock()
 
-	if completedH == 0 {
-		client := &http.Client{Timeout: 500 * time.Millisecond}
-		if resp, err := client.Get("http://localhost:8080/status"); err == nil {
-			if resp.StatusCode == http.StatusOK {
-				var st struct {
-					LatestCompletedHeight int `json:"latest_completed_height"`
-					LatestPublishedHeight int `json:"latest_published_height"`
-				}
-				if err := json.NewDecoder(resp.Body).Decode(&st); err == nil {
-					if st.LatestCompletedHeight > completedH {
-						completedH = st.LatestCompletedHeight
-					}
-					if st.LatestPublishedHeight > pubH {
-						pubH = st.LatestPublishedHeight
-					}
-				}
-			}
-			resp.Body.Close()
+	maxInFlight := 2
+	if envMax := os.Getenv("PUBLISHER_MAX_IN_FLIGHT"); envMax != "" {
+		if m, err := strconv.Atoi(envMax); err == nil && m > 0 {
+			maxInFlight = m
 		}
 	}
 
@@ -752,6 +740,7 @@ func (s *APIService) handleStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":                  "healthy",
 		"in_flight_count":         inFlight,
+		"max_in_flight":           maxInFlight,
 		"latest_published_height": pubH,
 		"latest_completed_height": completedH,
 		"latest_rejected_height":  latestRejH,
@@ -836,21 +825,69 @@ func VerifyCDAHeader(computedHeader *engine.BlockHeader, bftHeader *HeaderPayloa
 }
 
 func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	var req PublishRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if len(req.Data) == 0 {
+	var req PublishRequest
+	var preDecodedCells [][]byte
+
+	if len(bodyBytes) >= 4 && binary.BigEndian.Uint32(bodyBytes[:4]) == p2pcommon.BinaryPublishBlockMagic {
+		binReq, err := p2pcommon.DecodeBinaryPublishBlock(bodyBytes)
+		if err != nil {
+			http.Error(w, "Invalid binary request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.BlockID = binReq.BlockID
+		req.Height = binReq.Height
+		preDecodedCells = binReq.Cells
+		if len(binReq.Signature) > 0 {
+			req.Signature = hex.EncodeToString(binReq.Signature)
+		}
+		if binReq.Header != nil {
+			colHex := make([]string, len(binReq.Header.ColumnComm))
+			for i, cc := range binReq.Header.ColumnComm {
+				colHex[i] = hex.EncodeToString(cc)
+			}
+			req.Header = &HeaderPayload{
+				ChainID:         binReq.Header.ChainID,
+				Height:          binReq.Header.Height,
+				Time:            time.Unix(0, binReq.Header.TimeUnixNano).UTC(),
+				DataHash:        hex.EncodeToString(binReq.Header.DataHash),
+				AppHash:         hex.EncodeToString(binReq.Header.AppHash),
+				ProposerAddress: binReq.Header.ProposerAddress,
+				CommitsRoot:     hex.EncodeToString(binReq.Header.CommitsRoot),
+				ColumnComm:      colHex,
+				Coeffs:          hex.EncodeToString(binReq.Header.Coeffs),
+			}
+		}
+		if len(binReq.Txs) > 0 {
+			req.Txs = make([]TxSummary, len(binReq.Txs))
+			for i, t := range binReq.Txs {
+				req.Txs[i] = TxSummary{
+					Hash:   t.Hash,
+					Key:    t.Key,
+					Offset: t.Offset,
+					Cells:  t.Cells,
+					Size:   t.Size,
+				}
+			}
+		}
+	} else {
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	if len(preDecodedCells) == 0 && len(req.Data) == 0 {
 		http.Error(w, "Data cannot be empty", http.StatusBadRequest)
 		return
 	}
@@ -861,6 +898,12 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Missing signature in request", http.StatusUnauthorized)
 			return
 		}
+		if len(req.Data) == 0 && len(preDecodedCells) > 0 {
+			req.Data = make([]string, len(preDecodedCells))
+			for i, c := range preDecodedCells {
+				req.Data[i] = hex.EncodeToString(c)
+			}
+		}
 		if err := VerifySignature(req.BlockID, req.Data, req.Signature, s.sequencerPubKey); err != nil {
 			log.Printf("[Publisher] Signature verification failed for block %s: %v", req.BlockID, err)
 			s.markBlockRejected(req.BlockID, req.Height, "Signature verification failed: "+err.Error())
@@ -869,10 +912,6 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 0.5. Sequential Completion Gate (Multi-Block Pipeline Queue Control)
-	// Allows publisher to proactively admit and send the NEXT block (H) to bootstrap nodes
-	// for pre-computation even while block (H-1) is still reaching StoreReady.
-	// Max in-flight is 2 (1 active storage round, 1 pre-computed buffer round).
 	reqHeight := int(req.Height)
 	if reqHeight <= 0 {
 		reqHeight = p2pcommon.ParseHeightFromBlockID(req.BlockID)
@@ -900,6 +939,9 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[Height: %d] [Publisher] Remapped colliding direct publish %s -> %s (monotonic height %d)",
 				reqHeight, oldBlockID, req.BlockID, reqHeight)
 		}
+		if reqHeight > s.latestPublishedHeight {
+			s.latestPublishedHeight = reqHeight
+		}
 	} else if alreadyCompleted {
 		s.colReadyMu.Unlock()
 		log.Printf("[Height: %d] [Publisher] Block %s already completed (latest completed: %d). Returning cached header.", reqHeight, req.BlockID, s.latestCompletedHeight)
@@ -922,80 +964,49 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 		s.colReadyMu.Lock()
 	}
-	s.colReadyMu.Unlock()
-
-	queueTimeout := 300 * time.Second
-	if envTimeout := os.Getenv("PUBLISHER_QUEUE_TIMEOUT"); envTimeout != "" {
-		if d, err := time.ParseDuration(envTimeout); err == nil && d > 0 {
-			queueTimeout = d
-		} else if sec, err := strconv.Atoi(envTimeout); err == nil && sec > 0 {
-			queueTimeout = time.Duration(sec) * time.Second
-		}
-	}
-
-	maxInFlight := 2
-	if envMax := os.Getenv("PUBLISHER_MAX_IN_FLIGHT"); envMax != "" {
-		if m, err := strconv.Atoi(envMax); err == nil && m > 0 {
-			maxInFlight = m
-		}
-	}
-
-	s.colReadyMu.Lock()
-	if s.inFlightBlocks == nil {
-		s.inFlightBlocks = make(map[string]int)
-	}
-	if maxInFlight > 0 {
-		deadline := time.Now().Add(queueTimeout)
-		for len(s.inFlightBlocks) >= maxInFlight && time.Now().Before(deadline) {
-			log.Printf("[Height: %d] [Publisher Queue] In-flight pipeline full (%d in-flight, max: %d). Waiting before accepting block-%d...",
-				reqHeight, len(s.inFlightBlocks), maxInFlight, reqHeight)
-			s.colReadyMu.Unlock()
-			time.Sleep(200 * time.Millisecond)
-			s.colReadyMu.Lock()
-		}
-		if len(s.inFlightBlocks) >= maxInFlight {
-			currentInFlight := len(s.inFlightBlocks)
-			s.colReadyMu.Unlock()
-			http.Error(w, fmt.Sprintf("Block height %d timed out waiting in publisher queue (%d in-flight, max in-flight: %d after waiting %v)", reqHeight, currentInFlight, maxInFlight, queueTimeout), http.StatusUnprocessableEntity)
-			return
-		}
-	}
+	s.pendingPublishCount++
 	if reqHeight > s.latestPublishedHeight {
 		s.latestPublishedHeight = reqHeight
 		LatestPublishedHeight.Set(float64(s.latestPublishedHeight))
 		CometBFTConsensusHeight.Set(float64(s.latestPublishedHeight))
 	}
-	s.inFlightBlocks[req.BlockID] = reqHeight
-	s.inFlightCount = len(s.inFlightBlocks)
-	InFlightBlocks.Set(float64(s.inFlightCount))
+	InFlightBlocks.Set(float64(s.inFlightCount + s.pendingPublishCount))
 	s.colReadyMu.Unlock()
 
-	accepted := false
-	defer func() {
-		if !accepted {
+	pendingActive := true
+	releasePending := func() {
+		if pendingActive {
+			pendingActive = false
 			s.colReadyMu.Lock()
-			if s.inFlightBlocks != nil {
-				delete(s.inFlightBlocks, req.BlockID)
-				s.inFlightCount = len(s.inFlightBlocks)
-			} else if s.inFlightCount > 0 {
-				s.inFlightCount--
+			if s.pendingPublishCount > 0 {
+				s.pendingPublishCount--
 			}
-			InFlightBlocks.Set(float64(s.inFlightCount))
+			InFlightBlocks.Set(float64(s.inFlightCount + s.pendingPublishCount))
 			s.colReadyMu.Unlock()
 		}
-	}()
+	}
+	defer releasePending()
 
-	// 1. Decode hex data cells (ODS) concurrently
-	decodedData := make([][]byte, len(req.Data))
+	// 1. Extract data cells (ODS): zero-hex fast path for binary wire format, or hex decode for JSON
+	var decodedData [][]byte
 	totalBytes := 0
-	for i, h := range req.Data {
-		b, err := hex.DecodeString(h)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Invalid hex string at index %d: %v", i, err), http.StatusBadRequest)
-			return
+	if len(preDecodedCells) > 0 {
+		decodedData = make([][]byte, len(preDecodedCells))
+		for i, b := range preDecodedCells {
+			decodedData[i] = b
+			totalBytes += len(b)
 		}
-		decodedData[i] = b
-		totalBytes += len(b)
+	} else {
+		decodedData = make([][]byte, len(req.Data))
+		for i, h := range req.Data {
+			b, err := hex.DecodeString(h)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Invalid hex string at index %d: %v", i, err), http.StatusBadRequest)
+				return
+			}
+			decodedData[i] = b
+			totalBytes += len(b)
+		}
 	}
 
 	// Dynamic ODS sizing: find smallest power-of-2 K (>= 8) such that K*K >= len(decodedData)
@@ -1014,7 +1025,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		decodedData = append(decodedData, padCell)
 	}
 
-	// 2. Run engine pipeline concurrently: ODS -> EDS -> Commitments -> Header
+	// 2. Run engine pipeline immediately: ODS -> EDS -> Commitments -> Header
 	start := time.Now()
 	header, pubData, proofs, eds, err := s.pipeline.ProcessODS(decodedData, req.BlockID)
 	duration := time.Since(start).Seconds()
@@ -1056,76 +1067,147 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Height: %d] [Publisher] SUCCESS: Header verification passed for BlockID %s against BFT consensus!", height, req.BlockID)
 	}
 
-	// 2.6. Sequential dispatch phase: acquire publishMu to serialize DB, GossipSub and P2P column distribution
+	// 3. Immediate ODS Cache & Async WriteBatch Indexing Phase (decoupled from publishMu and P2P in-flight queue)
 	s.publishMu.Lock()
-	defer s.publishMu.Unlock()
-
-	s.colReadyMu.Lock()
-	if reqHeight > s.latestPublishedHeight {
-		s.latestPublishedHeight = reqHeight
-		LatestPublishedHeight.Set(float64(s.latestPublishedHeight))
-		CometBFTConsensusHeight.Set(float64(s.latestPublishedHeight))
-	}
-	s.blockK[header.BlockID] = kBlock
-	s.blockStartTime[header.BlockID] = start
-	s.colReadyMu.Unlock()
-
-	// Record metrics
 	RSEncodeDuration.Observe(duration)
 	ThroughputBytesTotal.Add(float64(totalBytes))
 	if duration > 0 {
 		ThroughputBytesRate.Set(float64(totalBytes) / duration)
 	}
-
-	// 3. Save Header and Broadcast via GossipSub
-	if s.db != nil {
-		headerBytes, _ := json.Marshal(header)
-		_ = s.db.Update(func(txn *badger.Txn) error {
-			if err := txn.Set([]byte("header_"+header.BlockID), headerBytes); err != nil {
-				return err
-			}
-			if height > 0 {
-				_ = txn.Set([]byte(fmt.Sprintf("block_height_%d", height)), []byte(header.BlockID))
-			}
-
-			// Index transactions from req.Txs
-			for _, tx := range req.Txs {
-				txBytes, _ := json.Marshal(tx)
-				payload := extractPayloadFromCells(decodedData, tx.Offset, tx.Cells, tx.Size)
-				if tx.Hash != "" {
-					upperHash := strings.ToUpper(strings.TrimPrefix(tx.Hash, "0x"))
-					_ = txn.Set([]byte("idx_tx_"+upperHash), []byte(strconv.FormatInt(height, 10)))
-					_ = txn.Set([]byte(fmt.Sprintf("meta_tx_%s_%s", header.BlockID, upperHash)), txBytes)
-					if len(payload) > 0 {
-						_ = txn.Set([]byte("data_tx_"+upperHash), payload)
-					}
-				}
-				if tx.Key != "" {
-					_ = txn.Set([]byte("idx_key_"+tx.Key), []byte(strconv.FormatInt(height, 10)))
-					_ = txn.Set([]byte(fmt.Sprintf("meta_key_%s_%s", header.BlockID, tx.Key)), []byte(strings.ToUpper(strings.TrimPrefix(tx.Hash, "0x"))))
-					if len(payload) > 0 {
-						_ = txn.Set([]byte("data_key_"+tx.Key), payload)
-					}
-				}
-			}
-
-			if len(req.Txs) > 0 {
-				s.indexBlockTOCAndNamespaces(txn, header.BlockID, height, req.Txs, decodedData)
-			}
-
-			// Fallback: If req.Txs is empty, parse raw cells
-			if len(req.Txs) == 0 && len(req.Data) > 0 {
-				s.indexTransactionsFromRawCells(txn, header.BlockID, height, req.Data)
-			}
-			return nil
-		})
-	}
-
 	if s.reconstructor != nil {
 		s.reconstructor.PutCachedODS(header.BlockID, height, decodedData)
 	}
+	s.publishMu.Unlock()
 
-	log.Printf("[Height: %d] Successfully generated Block Header for BlockID: %s", height, header.BlockID)
+	if s.db != nil {
+		headerCopy := *header
+		txsCopy := append([]TxSummary(nil), req.Txs...)
+		dataCopy := append([]string(nil), req.Data...)
+		cellsCopy := append([][]byte(nil), decodedData...)
+
+		// Synchronous header write + WriteBatch for transaction indices outside publishMu
+		headerBytes, _ := json.Marshal(&headerCopy)
+		wb := s.db.NewWriteBatch()
+		_ = wb.Set([]byte("header_"+headerCopy.BlockID), headerBytes)
+		if height > 0 {
+			_ = wb.Set([]byte(fmt.Sprintf("block_height_%d", height)), []byte(headerCopy.BlockID))
+		}
+		heightBytes := []byte(strconv.FormatInt(height, 10))
+		for _, tx := range txsCopy {
+			txBytes, _ := json.Marshal(tx)
+			payload := extractPayloadFromCells(cellsCopy, tx.Offset, tx.Cells, tx.Size)
+			upperHash := strings.ToUpper(strings.TrimPrefix(tx.Hash, "0x"))
+			if upperHash == "" && len(payload) > 0 {
+				sum := sha256.Sum256(payload)
+				upperHash = strings.ToUpper(hex.EncodeToString(sum[:]))
+			}
+			if upperHash != "" {
+				_ = wb.Set([]byte("idx_tx_"+upperHash), heightBytes)
+				_ = wb.Set([]byte(fmt.Sprintf("meta_tx_%s_%s", headerCopy.BlockID, upperHash)), txBytes)
+				if len(payload) > 0 {
+					_ = wb.Set([]byte("data_tx_"+upperHash), payload)
+				}
+			}
+			if tx.Key != "" {
+				_ = wb.Set([]byte("idx_key_"+tx.Key), heightBytes)
+				if upperHash != "" {
+					hashBytes := []byte(upperHash)
+					_ = wb.Set([]byte(fmt.Sprintf("meta_key_%s_%s", headerCopy.BlockID, tx.Key)), hashBytes)
+					_ = wb.Set([]byte("key_ref_"+tx.Key), hashBytes)
+				} else if len(payload) > 0 {
+					_ = wb.Set([]byte("data_key_"+tx.Key), payload)
+				}
+			}
+		}
+		_ = wb.Flush()
+
+		// Async TOC & Namespace catalog indexing outside the hot publish path
+		go func(bID string, h int64, txs []TxSummary, rawData []string, cells [][]byte) {
+			_ = s.db.Update(func(txn *badger.Txn) error {
+				if len(txs) > 0 {
+					s.indexBlockTOCAndNamespaces(txn, bID, h, txs, cells)
+				} else if len(rawData) > 0 {
+					s.indexTransactionsFromRawCells(txn, bID, h, rawData)
+				}
+				return nil
+			})
+		}(headerCopy.BlockID, height, txsCopy, dataCopy, cellsCopy)
+	}
+
+	log.Printf("[Height: %d] Successfully generated and indexed Block Header for BlockID: %s (encode=%.3fs)", height, header.BlockID, duration)
+
+	// 4. P2P Pipeline Queue Control & Column Distribution Phase
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	queueTimeout := 300 * time.Second
+	if envTimeout := os.Getenv("PUBLISHER_QUEUE_TIMEOUT"); envTimeout != "" {
+		if d, err := time.ParseDuration(envTimeout); err == nil && d > 0 {
+			queueTimeout = d
+		} else if sec, err := strconv.Atoi(envTimeout); err == nil && sec > 0 {
+			queueTimeout = time.Duration(sec) * time.Second
+		}
+	}
+
+	maxInFlight := 2
+	if envMax := os.Getenv("PUBLISHER_MAX_IN_FLIGHT"); envMax != "" {
+		if m, err := strconv.Atoi(envMax); err == nil && m > 0 {
+			maxInFlight = m
+		}
+	}
+
+	s.colReadyMu.Lock()
+	if s.inFlightBlocks == nil {
+		s.inFlightBlocks = make(map[string]int)
+	}
+	if maxInFlight > 0 {
+		deadline := time.Now().Add(queueTimeout)
+		for len(s.inFlightBlocks) >= maxInFlight && time.Now().Before(deadline) {
+			log.Printf("[Height: %d] [Publisher Queue] In-flight pipeline full (%d in-flight, max: %d). Waiting before dispatching P2P columns for block-%d...",
+				reqHeight, len(s.inFlightBlocks), maxInFlight, reqHeight)
+			s.colReadyMu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+			s.colReadyMu.Lock()
+		}
+		if len(s.inFlightBlocks) >= maxInFlight {
+			currentInFlight := len(s.inFlightBlocks)
+			s.colReadyMu.Unlock()
+			http.Error(w, fmt.Sprintf("Block height %d timed out waiting in publisher queue (%d in-flight, max in-flight: %d after waiting %v)", reqHeight, currentInFlight, maxInFlight, queueTimeout), http.StatusUnprocessableEntity)
+			return
+		}
+	}
+	if reqHeight > s.latestPublishedHeight {
+		s.latestPublishedHeight = reqHeight
+		LatestPublishedHeight.Set(float64(s.latestPublishedHeight))
+		CometBFTConsensusHeight.Set(float64(s.latestPublishedHeight))
+	}
+	if pendingActive {
+		pendingActive = false
+		if s.pendingPublishCount > 0 {
+			s.pendingPublishCount--
+		}
+	}
+	s.blockK[header.BlockID] = kBlock
+	s.blockStartTime[header.BlockID] = start
+	s.inFlightBlocks[header.BlockID] = reqHeight
+	s.inFlightCount = len(s.inFlightBlocks)
+	InFlightBlocks.Set(float64(s.inFlightCount + s.pendingPublishCount))
+	s.colReadyMu.Unlock()
+
+	accepted := false
+	defer func() {
+		if !accepted {
+			s.colReadyMu.Lock()
+			if s.inFlightBlocks != nil {
+				delete(s.inFlightBlocks, header.BlockID)
+				s.inFlightCount = len(s.inFlightBlocks)
+			} else if s.inFlightCount > 0 {
+				s.inFlightCount--
+			}
+			InFlightBlocks.Set(float64(s.inFlightCount))
+			s.colReadyMu.Unlock()
+		}
+	}()
 
 	if s.headerTopic != nil {
 		headerBytes, err := json.Marshal(header)
@@ -1140,11 +1222,17 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 4. Distribute each column via P2P sender in parallel (bounded concurrency to avoid TLS stream resets)
+	// 5. Distribute each column via P2P sender in parallel over QUIC streams
+	colConcurrency := 32
+	if envSem := os.Getenv("PUBLISHER_COL_SEND_CONCURRENCY"); envSem != "" {
+		if v, err := strconv.Atoi(envSem); err == nil && v > 0 {
+			colConcurrency = v
+		}
+	}
 	n := int(eds.Width())
 	k := len(pubData.PieceComm) / n
 	var wg sync.WaitGroup
-	colSem := make(chan struct{}, 8)
+	colSem := make(chan struct{}, colConcurrency)
 	for c := 0; c < n; c++ {
 		wg.Add(1)
 		go func(colIdx int) {
@@ -1270,7 +1358,7 @@ func (s *APIService) indexTransactionsFromRawCells(txn *badger.Txn, blockID stri
 			txMeta.Key = str[:eqIdx]
 			_ = txn.Set([]byte("idx_key_"+txMeta.Key), []byte(strconv.FormatInt(height, 10)))
 			_ = txn.Set([]byte(fmt.Sprintf("meta_key_%s_%s", blockID, txMeta.Key)), []byte(txHash))
-			_ = txn.Set([]byte("data_key_"+txMeta.Key), trimmed)
+			_ = txn.Set([]byte("key_ref_"+txMeta.Key), []byte(txHash))
 		}
 		metaBytes, _ := json.Marshal(txMeta)
 		_ = txn.Set([]byte("idx_tx_"+txHash), []byte(strconv.FormatInt(height, 10)))
@@ -1366,26 +1454,24 @@ func (s *APIService) handleGetTx(w http.ResponseWriter, r *http.Request) {
 		var cachedPayload []byte
 		var foundHeight int64
 		_ = s.db.View(func(txn *badger.Txn) error {
-			keyToLookup := ""
 			if txKey != "" {
-				keyToLookup = "data_key_" + txKey
 				if hItem, err := txn.Get([]byte("idx_key_" + txKey)); err == nil {
 					_ = hItem.Value(func(hVal []byte) error {
 						foundHeight, _ = strconv.ParseInt(string(hVal), 10, 64)
 						return nil
 					})
 				}
+				if val, ok := getPayloadByKey(txn, txKey); ok {
+					cachedPayload = val
+				}
 			} else if txHash != "" {
-				keyToLookup = "data_tx_" + txHash
 				if hItem, err := txn.Get([]byte("idx_tx_" + txHash)); err == nil {
 					_ = hItem.Value(func(hVal []byte) error {
 						foundHeight, _ = strconv.ParseInt(string(hVal), 10, 64)
 						return nil
 					})
 				}
-			}
-			if keyToLookup != "" {
-				if item, err := txn.Get([]byte(keyToLookup)); err == nil {
+				if item, err := txn.Get([]byte("data_tx_" + txHash)); err == nil {
 					_ = item.Value(func(val []byte) error {
 						cachedPayload = append([]byte(nil), val...)
 						return nil
@@ -1886,11 +1972,8 @@ func (s *APIService) handleBatchGetTx(w http.ResponseWriter, r *http.Request) {
 	if s.db != nil {
 		_ = s.db.View(func(txn *badger.Txn) error {
 			for _, k := range req.Keys {
-				if item, err := txn.Get([]byte("data_key_" + k)); err == nil {
-					_ = item.Value(func(val []byte) error {
-						results[k] = string(val)
-						return nil
-					})
+				if val, ok := getPayloadByKey(txn, k); ok {
+					results[k] = string(val)
 				}
 			}
 			for _, h := range req.Hashes {

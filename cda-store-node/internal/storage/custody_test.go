@@ -108,3 +108,38 @@ func TestCustodyStore_PieceCountCacheSync(t *testing.T) {
 	assert.Equal(t, 0, store.GetPieceCount(blockID, 0, 0))
 	assert.Equal(t, 1, len(store.GetRecodedPieces(blockID, 0, 0)))
 }
+
+func TestCustodyStore_BinaryPersistenceAndBatchStore(t *testing.T) {
+	store := NewCustodyStore(0)
+	blockID := "block-batch-bin"
+
+	batch := []cda.ReceivedPiece{
+		{
+			Row:   3,
+			Col:   7,
+			Data:  rlnc.PieceData{Data: []byte("piece-payload-0"), Coeffs: []byte{1, 2, 3, 4}},
+			Proof: cda.OpeningProof([]byte("proof-bytes-0")),
+		},
+		{
+			Row:   3,
+			Col:   7,
+			Data:  rlnc.PieceData{Data: []byte("piece-payload-1"), Coeffs: []byte{5, 6, 7, 8}},
+			Proof: cda.OpeningProof([]byte("proof-bytes-1")),
+		},
+	}
+
+	store.StorePiecesForCell(blockID, 3, 7, batch)
+	assert.Equal(t, 2, store.GetPieceCount(blockID, 3, 7))
+
+	binBytes, err := marshalPiecesBinary(batch)
+	assert.NoError(t, err)
+
+	cnt, err := unmarshalPiecesCount(binBytes)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, cnt)
+
+	var decoded []cda.ReceivedPiece
+	err = unmarshalPieces(binBytes, &decoded)
+	assert.NoError(t, err)
+	assert.Equal(t, batch, decoded)
+}

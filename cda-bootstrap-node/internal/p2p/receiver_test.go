@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"math/big"
+	"sync"
 	"testing"
 	"time"
 
@@ -251,4 +252,92 @@ func TestReceiver_BlockAggregatorBarrier(t *testing.T) {
 		e1, ok1 := rcv.cache.GetCol(blockID2, 1)
 		return ok0 && ok1 && e0 != nil && e1 != nil && e0.Proofs != nil && e1.Proofs != nil
 	}, 2*time.Second, 20*time.Millisecond, "Fallback timer should flush partial batch for block 2")
+}
+
+func TestReceiver_SequentialDispatchGate(t *testing.T) {
+	n := 16
+	rcv, _ := setupTestReceiver(t, n)
+
+	// Block 1: height 1 should dispatch immediately
+	rcv.waitForDispatchTurn(1, "block-1")
+	require.Equal(t, 1, rcv.lastDispatchedHeight)
+
+	// Block 2: height 2 - launched in a goroutine because it must block until Block 1 completes
+	b2Done := make(chan bool)
+	go func() {
+		rcv.waitForDispatchTurn(2, "block-2")
+		b2Done <- true
+	}()
+
+	// Assert that Block 2 is indeed blocked waiting for Block 1
+	select {
+	case <-b2Done:
+		t.Fatal("Block 2 should NOT have dispatched while Block 1 is incomplete!")
+	case <-time.After(150 * time.Millisecond):
+		// Expected: Block 2 is still held in the gate
+	}
+
+	// Now signal that Store Nodes completed Block 1
+	rcv.OnBlockCompleted(1)
+
+	// Assert that Block 2 immediately clears the gate
+	select {
+	case <-b2Done:
+		// Success!
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Block 2 should have unblocked immediately after OnBlockCompleted(1)")
+	}
+	require.Equal(t, 2, rcv.lastDispatchedHeight)
+}
+
+func TestReceiver_SequentialDispatchQueueOrder(t *testing.T) {
+	n := 16
+	rcv, _ := setupTestReceiver(t, n)
+
+	// Block 1: height 1
+	rcv.waitForDispatchTurn(1, "block-1")
+	require.Equal(t, 1, rcv.lastDispatchedHeight)
+
+	// Enqueue Block 3 then Block 2 concurrently
+	order := make([]int, 0)
+	var orderMu sync.Mutex
+	done := make(chan bool, 2)
+
+	// Start Block 3 first
+	go func() {
+		rcv.waitForDispatchTurn(3, "block-3")
+		orderMu.Lock()
+		order = append(order, 3)
+		orderMu.Unlock()
+		done <- true
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	// Start Block 2
+	go func() {
+		rcv.waitForDispatchTurn(2, "block-2")
+		orderMu.Lock()
+		order = append(order, 2)
+		orderMu.Unlock()
+		done <- true
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Complete Block 1 -> Block 2 should unblock first because 2 < 3!
+	rcv.OnBlockCompleted(1)
+
+	// Give a short moment for Block 2 to clear
+	time.Sleep(100 * time.Millisecond)
+
+	// Complete Block 2 -> Block 3 should now unblock!
+	rcv.OnBlockCompleted(2)
+
+	<-done
+	<-done
+
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	require.Equal(t, []int{2, 3}, order, "Dispatch order must be strictly sorted by height regardless of enqueue order")
 }

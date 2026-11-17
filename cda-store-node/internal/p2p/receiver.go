@@ -1322,22 +1322,32 @@ func (rcv *Receiver) verifyAndProcessBinaryBatchWithMode(payload *p2pcommon.Bina
 				continue
 			}
 			_, seedsPerPeer, _ := p2pcommon.ComputeSeedingPlan(numCustodyPeers, rcv.kPiece)
-			if len(cellSeeds) > seedsPerPeer {
+			rcv.pruneMu.Lock()
+			pruned := rcv.prunedCells[cellKey]
+			rcv.pruneMu.Unlock()
+			curCount := rcv.cache.GetPieceCount(blockID, cc.row, cc.col)
+			if pruned || curCount >= rcv.kPiece || curCount >= seedsPerPeer {
+				continue
+			}
+			needed := seedsPerPeer - curCount
+			if needed < 1 {
+				needed = 1
+			}
+			if len(cellSeeds) > needed {
 				shuffled := make([]p2pcommon.BinarySeedPiece, len(cellSeeds))
 				copy(shuffled, cellSeeds)
 				h := fnv.New64a()
 				_, _ = h.Write([]byte(rcv.selfPeerID))
 				_, _ = h.Write([]byte(blockID))
-				var rcBuf [16]byte
+				var rcBuf [8]byte
 				binary.LittleEndian.PutUint32(rcBuf[0:4], uint32(cc.row))
 				binary.LittleEndian.PutUint32(rcBuf[4:8], uint32(cc.col))
-				binary.LittleEndian.PutUint64(rcBuf[8:16], uint64(time.Now().UnixNano()))
 				_, _ = h.Write(rcBuf[:])
 				rng := rand.New(rand.NewSource(int64(h.Sum64())))
 				rng.Shuffle(len(shuffled), func(i, j int) {
 					shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
 				})
-				cellSeeds = shuffled[:seedsPerPeer]
+				cellSeeds = shuffled[:needed]
 			}
 			sampledSeeds = append(sampledSeeds, cellSeeds...)
 		} else {
@@ -1721,16 +1731,15 @@ func (rcv *Receiver) ingestVerifiedBatch(blockID string, items []verifiedBatchPi
 				existingCoeffs[i] = p.Data.Coeffs
 			}
 
-			storedAny := false
+			var newCellPieces []cda.ReceivedPiece
 			for _, it := range cellItems {
 				if !engine.IsLinearlyIndependent(existingCoeffs, it.coeffs, rcv.kPiece) {
 					DependentPiecesDroppedTotal.Inc()
 					continue
 				}
-				rcv.cache.StorePiece(blockID, row, col, it.piece)
+				newCellPieces = append(newCellPieces, it.piece)
 				existingPieces = append(existingPieces, it.piece)
 				existingCoeffs = append(existingCoeffs, it.coeffs)
-				storedAny = true
 				if it.senderPeerID != "" {
 					rcv.contribMu.Lock()
 					if rcv.peerContributions[cellKey] == nil {
@@ -1741,10 +1750,11 @@ func (rcv *Receiver) ingestVerifiedBatch(blockID string, items []verifiedBatchPi
 				}
 			}
 
-			if !storedAny {
+			if len(newCellPieces) == 0 {
 				rcv.unlockCell(row, col)
 				continue
 			}
+			rcv.cache.StorePiecesForCell(blockID, row, col, newCellPieces)
 
 			minPieces := 2
 			if rcv.kPiece < minPieces {
@@ -1835,7 +1845,7 @@ func (rcv *Receiver) ingestVerifiedBatch(blockID string, items []verifiedBatchPi
 			existingCoeffs[i] = p.Data.Coeffs
 		}
 
-		addedForCell := 0
+		var newCellPieces []cda.ReceivedPiece
 		for _, it := range cellItems {
 			if isNativeRetention && len(existingPieces) >= rcv.kPiece {
 				break
@@ -1844,10 +1854,9 @@ func (rcv *Receiver) ingestVerifiedBatch(blockID string, items []verifiedBatchPi
 				DependentPiecesDroppedTotal.Inc()
 				continue
 			}
-			rcv.cache.StorePiece(blockID, row, col, it.piece)
+			newCellPieces = append(newCellPieces, it.piece)
 			existingPieces = append(existingPieces, it.piece)
 			existingCoeffs = append(existingCoeffs, it.coeffs)
-			addedForCell++
 
 			if it.senderPeerID != "" {
 				rcv.contribMu.Lock()
@@ -1857,6 +1866,11 @@ func (rcv *Receiver) ingestVerifiedBatch(blockID string, items []verifiedBatchPi
 				rcv.peerContributions[cellKey][it.senderPeerID]++
 				rcv.contribMu.Unlock()
 			}
+		}
+
+		addedForCell := len(newCellPieces)
+		if addedForCell > 0 {
+			rcv.cache.StorePiecesForCell(blockID, row, col, newCellPieces)
 		}
 
 		updatedPieces := make([]cda.ReceivedPiece, len(existingPieces))
@@ -1918,7 +1932,6 @@ func (rcv *Receiver) ingestVerifiedBatch(blockID string, items []verifiedBatchPi
 
 	// Batch Recode & Lock for Non-Custody cells
 	if len(ncJobs) > 0 {
-		n := rcv.getBlockN(blockID)
 		var batchReqs []cda.RecodeBatchRequest
 		var batchJobIndices []int
 		for idx, job := range ncJobs {
@@ -1937,7 +1950,7 @@ func (rcv *Receiver) ingestVerifiedBatch(blockID string, items []verifiedBatchPi
 
 		recodedResults := make(map[int]*cda.ReceivedPiece, len(batchJobIndices))
 		if len(batchReqs) > 0 {
-			if batchOut, err := rcv.rm.RecodeBatchWithVerify(batchReqs, 5, n); err == nil {
+			if batchOut, err := rcv.rm.RecodeBatchTrusted(batchReqs, 5); err == nil {
 				for i, jobIdx := range batchJobIndices {
 					if i < len(batchOut) && len(batchOut[i]) > 0 && batchOut[i][0] != nil {
 						recodedResults[jobIdx] = batchOut[i][0]
@@ -1978,7 +1991,6 @@ func (rcv *Receiver) ingestVerifiedBatch(blockID string, items []verifiedBatchPi
 			rcv.disseminationSem <- struct{}{}
 			defer func() { <-rcv.disseminationSem }()
 
-			n := rcv.getBlockN(bID)
 			batchReqs := make([]cda.RecodeBatchRequest, len(jobs))
 			jobBroadcastRounds := make([]int, len(jobs))
 			jobTargetPieces := make([][]cda.ReceivedPiece, len(jobs))
@@ -2017,7 +2029,7 @@ func (rcv *Receiver) ingestVerifiedBatch(blockID string, items []verifiedBatchPi
 				}
 			}
 
-			batchOut, _ := rcv.rm.RecodeBatchWithVerify(batchReqs, 5, n)
+			batchOut, _ := rcv.rm.RecodeBatchTrusted(batchReqs, 5)
 
 			rcv.peersMu.RLock()
 			effectiveNetRows := rcv.storesPerCol
@@ -3772,8 +3784,7 @@ func (rcv *Receiver) nonCustodyFallbackLoop(ctx context.Context) {
 
 			recodedMap := make(map[int]*cda.ReceivedPiece)
 			for bID, reqs := range byBlockReqs {
-				n := rcv.getBlockN(bID)
-				if batchOut, err := rcv.rm.RecodeBatchWithVerify(reqs, 5, n); err == nil {
+				if batchOut, err := rcv.rm.RecodeBatchTrusted(reqs, 5); err == nil {
 					indices := byBlockIdx[bID]
 					for j, expIdx := range indices {
 						if j < len(batchOut) && len(batchOut[j]) > 0 && batchOut[j][0] != nil {
@@ -3939,6 +3950,46 @@ func (rcv *Receiver) doCheckAndLogCompletion(blockID string) {
 			LinearIndependentPiecesCount.Set(float64(actualPieces))
 			CustodyPiecesCount.Set(float64(custodyPieces))
 			RecodedPiecesCount.Set(float64(recodedPieces))
+
+			// Evict completed blocks older than height-16 from in-memory caches (BadgerDB remains source of truth)
+			if height > 16 {
+				oldBlockID := fmt.Sprintf("block-%d", height-16)
+				oldN := rcv.getBlockN(oldBlockID)
+				oldColsPerNetCol := oldN / numCols
+				if oldColsPerNetCol == 0 {
+					oldColsPerNetCol = 1
+				}
+				oldStartCol := netColIdx * oldColsPerNetCol
+				oldEndCol := oldStartCol + oldColsPerNetCol
+				if oldEndCol > oldN {
+					oldEndCol = oldN
+				}
+				rcv.cache.EvictBlockFromRAM(oldBlockID, oldN, oldStartCol, oldEndCol)
+
+				for c := oldStartCol; c < oldEndCol; c++ {
+					for r := 0; r < oldN; r++ {
+						oldKey := fmt.Sprintf("%s_%d_%d", oldBlockID, r, c)
+						rcv.pruneMu.Lock()
+						delete(rcv.prunedCells, oldKey)
+						delete(rcv.cellLastActivity, oldKey)
+						rcv.pruneMu.Unlock()
+
+						rcv.nonCustodyLockedMu.Lock()
+						delete(rcv.nonCustodyLocked, oldKey)
+						delete(rcv.nonCustodyPending, oldKey)
+						rcv.nonCustodyLockedMu.Unlock()
+
+						rcv.contribMu.Lock()
+						delete(rcv.peerContributions, oldKey)
+						rcv.contribMu.Unlock()
+
+						rcv.broadcastMu.Lock()
+						delete(rcv.cellBroadcastCount, oldKey)
+						delete(rcv.cellDisseminating, oldKey)
+						rcv.broadcastMu.Unlock()
+					}
+				}
+			}
 		}(blockID)
 	}
 }

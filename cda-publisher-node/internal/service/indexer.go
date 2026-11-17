@@ -143,6 +143,42 @@ func setBadgerJSON(txn *badger.Txn, key string, in interface{}) error {
 	return txn.Set([]byte(key), data)
 }
 
+// getPayloadByKey resolves a transaction/slice payload by its key:
+// 1. First checks lightweight hash pointer key_ref_<key> -> data_tx_<upperHash> (zero payload duplication).
+// 2. Falls back to meta_key_* or direct data_key_<key> for backward compatibility with legacy entries/tests.
+func getPayloadByKey(txn *badger.Txn, key string) ([]byte, bool) {
+	if refItem, err := txn.Get([]byte("key_ref_" + key)); err == nil {
+		var txHash string
+		_ = refItem.Value(func(val []byte) error {
+			txHash = string(val)
+			return nil
+		})
+		if txHash != "" {
+			if txItem, err := txn.Get([]byte("data_tx_" + txHash)); err == nil {
+				var out []byte
+				_ = txItem.Value(func(val []byte) error {
+					out = append([]byte(nil), val...)
+					return nil
+				})
+				if len(out) > 0 {
+					return out, true
+				}
+			}
+		}
+	}
+	if item, err := txn.Get([]byte("data_key_" + key)); err == nil {
+		var out []byte
+		_ = item.Value(func(val []byte) error {
+			out = append([]byte(nil), val...)
+			return nil
+		})
+		if len(out) > 0 {
+			return out, true
+		}
+	}
+	return nil, false
+}
+
 func extractPayloadFromCells(cells [][]byte, offset, numCells, size int) []byte {
 	if offset < 0 || offset >= len(cells) {
 		return nil
@@ -438,35 +474,32 @@ func (s *APIService) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 					if getBadgerJSON(txn, fmt.Sprintf("ns_blob_%s_%s", namespace, bID), &meta) {
 						if meta.TotalSize <= 0 {
 							keysToTry := []string{
-								fmt.Sprintf("data_key_cda/%s/%s", namespace, bID),
-								fmt.Sprintf("data_key_cda/%s/%s/blob", namespace, bID),
+								fmt.Sprintf("cda/%s/%s", namespace, bID),
+								fmt.Sprintf("cda/%s/%s/blob", namespace, bID),
 							}
 							for _, k := range keysToTry {
-								if item, err := txn.Get([]byte(k)); err == nil {
-									_ = item.Value(func(val []byte) error {
-										sVal := string(val)
-										var rawBytes []byte
-										if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
-											valStr := sVal[eqIdx+1:]
-											if dec, e := hex.DecodeString(valStr); e == nil && len(dec) > 0 {
-												rawBytes = dec
-											} else {
-												rawBytes = []byte(valStr)
-											}
+								if val, ok := getPayloadByKey(txn, k); ok {
+									sVal := string(val)
+									var rawBytes []byte
+									if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
+										valStr := sVal[eqIdx+1:]
+										if dec, e := hex.DecodeString(valStr); e == nil && len(dec) > 0 {
+											rawBytes = dec
 										} else {
-											if dec, e := hex.DecodeString(sVal); e == nil && len(dec) > 0 {
-												rawBytes = dec
-											} else {
-												rawBytes = val
-											}
+											rawBytes = []byte(valStr)
 										}
-										if len(rawBytes) > 0 {
-											meta.TotalSize = int64(len(rawBytes))
-											sum := sha256.Sum256(rawBytes)
-											meta.SHA256 = hex.EncodeToString(sum[:])
+									} else {
+										if dec, e := hex.DecodeString(sVal); e == nil && len(dec) > 0 {
+											rawBytes = dec
+										} else {
+											rawBytes = val
 										}
-										return nil
-									})
+									}
+									if len(rawBytes) > 0 {
+										meta.TotalSize = int64(len(rawBytes))
+										sum := sha256.Sum256(rawBytes)
+										meta.SHA256 = hex.EncodeToString(sum[:])
+									}
 									if meta.TotalSize > 0 {
 										break
 									}
@@ -663,25 +696,22 @@ func (s *APIService) handleBlobDownload(w http.ResponseWriter, r *http.Request, 
 	if s.db != nil {
 		_ = s.db.View(func(txn *badger.Txn) error {
 			for _, bKey := range keysToTry {
-				if item, err := txn.Get([]byte("data_key_" + bKey)); err == nil {
-					_ = item.Value(func(val []byte) error {
-						sVal := string(val)
-						if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
-							valStr := sVal[eqIdx+1:]
-							if rawBytes, errDec := hex.DecodeString(valStr); errDec == nil && len(rawBytes) > 0 {
-								nativeBlobBytes = rawBytes
-							} else {
-								nativeBlobBytes = []byte(valStr)
-							}
+				if val, ok := getPayloadByKey(txn, bKey); ok {
+					sVal := string(val)
+					if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
+						valStr := sVal[eqIdx+1:]
+						if rawBytes, errDec := hex.DecodeString(valStr); errDec == nil && len(rawBytes) > 0 {
+							nativeBlobBytes = rawBytes
 						} else {
-							if rawBytes, errDec := hex.DecodeString(sVal); errDec == nil && len(rawBytes) > 0 {
-								nativeBlobBytes = rawBytes
-							} else {
-								nativeBlobBytes = val
-							}
+							nativeBlobBytes = []byte(valStr)
 						}
-						return nil
-					})
+					} else {
+						if rawBytes, errDec := hex.DecodeString(sVal); errDec == nil && len(rawBytes) > 0 {
+							nativeBlobBytes = rawBytes
+						} else {
+							nativeBlobBytes = val
+						}
+					}
 					if len(nativeBlobBytes) > 0 {
 						break
 					}
@@ -708,32 +738,29 @@ func (s *APIService) handleBlobDownload(w http.ResponseWriter, r *http.Request, 
 		if s.db != nil {
 			_ = s.db.View(func(txn *badger.Txn) error {
 				for pIdx := 0; pIdx < meta.TotalChunks; pIdx++ {
-					item, err := txn.Get([]byte(fmt.Sprintf("data_key_cda/%s/%s/part/%03d", meta.Namespace, meta.BlobID, pIdx)))
-					if err != nil {
-						item, err = txn.Get([]byte(fmt.Sprintf("data_key_cda/%s/%s/part/%d", meta.Namespace, meta.BlobID, pIdx)))
+					val, ok := getPayloadByKey(txn, fmt.Sprintf("cda/%s/%s/part/%03d", meta.Namespace, meta.BlobID, pIdx))
+					if !ok {
+						val, ok = getPayloadByKey(txn, fmt.Sprintf("cda/%s/%s/part/%d", meta.Namespace, meta.BlobID, pIdx))
 					}
-					if err != nil {
+					if !ok {
 						allPartsFound = false
 						return nil
 					}
-					_ = item.Value(func(val []byte) error {
-						sVal := string(val)
-						if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
-							valStr := sVal[eqIdx+1:]
-							if rawBytes, errDec := hex.DecodeString(valStr); errDec == nil && len(rawBytes) > 0 {
-								partsData[pIdx] = rawBytes
-							} else {
-								partsData[pIdx] = []byte(valStr)
-							}
+					sVal := string(val)
+					if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
+						valStr := sVal[eqIdx+1:]
+						if rawBytes, errDec := hex.DecodeString(valStr); errDec == nil && len(rawBytes) > 0 {
+							partsData[pIdx] = rawBytes
 						} else {
-							if rawBytes, errDec := hex.DecodeString(sVal); errDec == nil && len(rawBytes) > 0 {
-								partsData[pIdx] = rawBytes
-							} else {
-								partsData[pIdx] = val
-							}
+							partsData[pIdx] = []byte(valStr)
 						}
-						return nil
-					})
+					} else {
+						if rawBytes, errDec := hex.DecodeString(sVal); errDec == nil && len(rawBytes) > 0 {
+							partsData[pIdx] = rawBytes
+						} else {
+							partsData[pIdx] = val
+						}
+					}
 				}
 				return nil
 			})
@@ -788,25 +815,22 @@ func (s *APIService) handleBlobDownload(w http.ResponseWriter, r *http.Request, 
 
 	sliceDataMap := make(map[string][]byte, len(allSliceKeys))
 
-	// 1. Fast in-memory lookup via local BadgerDB data_key_<sliceKey>
+	// 1. Fast in-memory lookup via local BadgerDB key_ref_<sliceKey> / data_key_<sliceKey>
 	if s.db != nil {
 		_ = s.db.View(func(txn *badger.Txn) error {
 			for _, key := range allSliceKeys {
-				if item, err := txn.Get([]byte("data_key_" + key)); err == nil {
-					_ = item.Value(func(val []byte) error {
-						sVal := string(val)
-						if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
-							hexStr := sVal[eqIdx+1:]
-							if rawBytes, errDec := hex.DecodeString(hexStr); errDec == nil {
-								sliceDataMap[key] = rawBytes
-							}
-						} else {
-							if rawBytes, errDec := hex.DecodeString(sVal); errDec == nil {
-								sliceDataMap[key] = rawBytes
-							}
+				if val, ok := getPayloadByKey(txn, key); ok {
+					sVal := string(val)
+					if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
+						hexStr := sVal[eqIdx+1:]
+						if rawBytes, errDec := hex.DecodeString(hexStr); errDec == nil {
+							sliceDataMap[key] = rawBytes
 						}
-						return nil
-					})
+					} else {
+						if rawBytes, errDec := hex.DecodeString(sVal); errDec == nil {
+							sliceDataMap[key] = rawBytes
+						}
+					}
 				}
 			}
 			return nil

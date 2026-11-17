@@ -211,9 +211,9 @@ func main() {
 				if portVal, err := strconv.Atoi(portStr); err == nil {
 					pPort := portVal + 10000
 					if hostStr == "localhost" || hostStr == "127.0.0.1" {
-						resolved = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", pPort)
+						resolved = fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", pPort)
 					} else {
-						resolved = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, pPort)
+						resolved = fmt.Sprintf("/dns4/%s/udp/%d/quic-v1", hostStr, pPort)
 					}
 				}
 			}

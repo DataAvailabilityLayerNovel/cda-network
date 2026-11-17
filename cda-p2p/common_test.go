@@ -154,3 +154,65 @@ func TestComputeSeedingPlan(t *testing.T) {
 		}
 	}
 }
+
+func TestBinaryPublisherPushAndPublishBlockRoundTrip(t *testing.T) {
+	colReq := &BinaryPublisherPushRequest{
+		BlockID:      "block-77",
+		ColIdx:       5,
+		ColumnData:   [][]byte{[]byte("cell-0-data"), []byte("cell-1-data")},
+		PieceCommits: [][]byte{[]byte("commit-0"), []byte("commit-1")},
+		MerkleProofs: []SerializedMerkleProof{
+			{Index: 4, Siblings: [][]byte{[]byte("sib-0"), []byte("sib-1")}},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := WriteBinaryPublisherPush(&buf, colReq); err != nil {
+		t.Fatalf("WriteBinaryPublisherPush failed: %v", err)
+	}
+	decodedCol, err := ReadBinaryPublisherPush(&buf)
+	if err != nil {
+		t.Fatalf("ReadBinaryPublisherPush failed: %v", err)
+	}
+	if decodedCol.BlockID != colReq.BlockID || decodedCol.ColIdx != colReq.ColIdx || len(decodedCol.ColumnData) != 2 {
+		t.Fatalf("decoded column push mismatch: %+v", decodedCol)
+	}
+	if !bytes.Equal(decodedCol.ColumnData[1], colReq.ColumnData[1]) || decodedCol.MerkleProofs[0].Index != 4 {
+		t.Fatalf("decoded column data or merkle proof mismatch")
+	}
+
+	pubReq := &BinaryPublishBlockRequest{
+		BlockID: "block-77",
+		Height:  77,
+		K:       16,
+		Cells:   [][]byte{[]byte("ods-cell-0"), []byte("ods-cell-1")},
+		Header: &BinaryHeaderPayload{
+			ChainID:         "cda-test",
+			Height:          77,
+			TimeUnixNano:    1700000000,
+			DataHash:        []byte("datahash"),
+			AppHash:         []byte("apphash"),
+			ProposerAddress: "prop1",
+			CommitsRoot:     []byte("root"),
+			ColumnComm:      [][]byte{[]byte("c0"), []byte("c1")},
+			Coeffs:          []byte("coeffs"),
+		},
+		Txs: []BinaryTxSummary{
+			{Hash: "AB12", Key: "cda/ns/b1/blob", Offset: 0, Cells: 2, Size: 900},
+		},
+	}
+	rawPub, err := EncodeBinaryPublishBlock(pubReq)
+	if err != nil {
+		t.Fatalf("EncodeBinaryPublishBlock failed: %v", err)
+	}
+	decodedPub, err := DecodeBinaryPublishBlock(rawPub)
+	if err != nil {
+		t.Fatalf("DecodeBinaryPublishBlock failed: %v", err)
+	}
+	if decodedPub.BlockID != "block-77" || decodedPub.Height != 77 || len(decodedPub.Cells) != 2 || len(decodedPub.Txs) != 1 {
+		t.Fatalf("decoded publish block mismatch: %+v", decodedPub)
+	}
+	if !bytes.Equal(decodedPub.Header.CommitsRoot, []byte("root")) || decodedPub.Txs[0].Key != "cda/ns/b1/blob" {
+		t.Fatalf("decoded header or tx summary mismatch")
+	}
+}

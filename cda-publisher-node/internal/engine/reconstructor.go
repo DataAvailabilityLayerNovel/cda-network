@@ -123,64 +123,86 @@ func (r *BlockReconstructor) RecoverODS(ctx context.Context, blockID string, hei
 
 	var edsMu sync.Mutex
 	recoveredCols := make(map[int]bool)
-	var wg sync.WaitGroup
 
-	// Try recovering columns 0..N-1 concurrently
-	for col := 0; col < n; col++ {
-		wg.Add(1)
-		go func(c int) {
-			defer wg.Done()
-			colPiecesMap, err := r.fetchColCells(ctx, blockID, c, n)
-			if err != nil {
-				return
-			}
-
-			codec := rlnc.NewRLNCCodec(r.pipeline.k)
-			recoveredRowCount := 0
-
-			for row := 0; row < n; row++ {
-				key := fmt.Sprintf("%d_%d", row, c)
-				pieces := colPiecesMap[key]
-				if len(pieces) < r.pipeline.k {
-					continue
-				}
-
-				rlncPieces := make([]rlnc.PieceData, len(pieces))
-				for i := 0; i < len(pieces); i++ {
-					rlncPieces[i] = pieces[i].Data
-				}
-
-				frags, err := codec.Decode(rlncPieces)
+	fetchColumnRange := func(startCol, endCol int) {
+		var wg sync.WaitGroup
+		for col := startCol; col < endCol; col++ {
+			wg.Add(1)
+			go func(c int) {
+				defer wg.Done()
+				colPiecesMap, err := r.fetchColCells(ctx, blockID, c, n)
 				if err != nil {
-					continue
+					return
 				}
 
-				var fullCell []byte
-				for _, frag := range frags {
-					fullCell = append(fullCell, frag...)
+				codec := rlnc.NewRLNCCodec(r.pipeline.k)
+				recoveredRowCount := 0
+
+				for row := 0; row < n; row++ {
+					key := fmt.Sprintf("%d_%d", row, c)
+					pieces := colPiecesMap[key]
+					if len(pieces) < r.pipeline.k {
+						continue
+					}
+
+					rlncPieces := make([]rlnc.PieceData, len(pieces))
+					for i := 0; i < len(pieces); i++ {
+						rlncPieces[i] = pieces[i].Data
+					}
+
+					frags, err := codec.Decode(rlncPieces)
+					if err != nil {
+						continue
+					}
+
+					var fullCell []byte
+					for _, frag := range frags {
+						fullCell = append(fullCell, frag...)
+					}
+
+					edsMu.Lock()
+					edsCells[row][c] = fullCell
+					edsMu.Unlock()
+					recoveredRowCount++
 				}
 
-				edsMu.Lock()
-				edsCells[row][c] = fullCell
-				edsMu.Unlock()
-				recoveredRowCount++
-			}
-
-			if recoveredRowCount > 0 {
-				edsMu.Lock()
-				recoveredCols[c] = true
-				edsMu.Unlock()
-			}
-		}(col)
+				if recoveredRowCount > 0 {
+					edsMu.Lock()
+					recoveredCols[c] = true
+					edsMu.Unlock()
+				}
+			}(col)
+		}
+		wg.Wait()
 	}
 
-	wg.Wait()
+	// Wave 1: Fetch systematic ODS columns (0..K-1) first
+	fetchColumnRange(0, k)
+
+	// Check if all K x K ODS cells are already completely populated from Wave 1
+	allODSPopulated := true
+	edsMu.Lock()
+	for rIdx := 0; rIdx < k && allODSPopulated; rIdx++ {
+		for cIdx := 0; cIdx < k; cIdx++ {
+			if len(edsCells[rIdx][cIdx]) == 0 {
+				allODSPopulated = false
+				break
+			}
+		}
+	}
+	edsMu.Unlock()
+
+	// Wave 2 (Fallback): Only fetch parity columns (K..2K-1) if any ODS cell in 0..K-1 is missing
+	if !allODSPopulated {
+		log.Printf("[Reconstructor] Wave 1 incomplete for %s, fetching parity columns (%d..%d) for RS reconstruction...", blockID, k, n-1)
+		fetchColumnRange(k, n)
+	}
 
 	edsMu.Lock()
 	numRecoveredCols := len(recoveredCols)
 	edsMu.Unlock()
 
-	log.Printf("[Reconstructor] Successfully retrieved %d / %d columns from Store Nodes for %s", numRecoveredCols, n, blockID)
+	log.Printf("[Reconstructor] Successfully retrieved %d / %d columns from Store Nodes for %s (allODSPopulated=%v)", numRecoveredCols, n, blockID, allODSPopulated)
 
 	if numRecoveredCols == 0 {
 		return nil, fmt.Errorf("no columns recovered from Store Nodes for %s", blockID)
@@ -197,8 +219,8 @@ func (r *BlockReconstructor) RecoverODS(ctx context.Context, blockID string, hei
 		}
 	}
 
-	// Step 3: Horizontal 2D Reed-Solomon Reconstruction if we have at least K columns
-	if numRecoveredCols >= k {
+	// Step 3: Horizontal 2D Reed-Solomon Reconstruction if Wave 1 had missing ODS cells and we have at least K columns
+	if !allODSPopulated && numRecoveredCols >= k {
 		rsEncoder, err := reedsolomon.New(k, k, reedsolomon.WithLeopardGF(true))
 		if err == nil {
 			for row := 0; row < k; row++ {

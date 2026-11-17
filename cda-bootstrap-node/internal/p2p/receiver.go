@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,13 +63,12 @@ type Receiver struct {
 	pruneTTL    time.Duration
 
 	// Multi-block Pipelining & Pre-computation State
-	pipelineMu              sync.Mutex
-	pipelineCond            *sync.Cond
-	latestCompletedHeight   int
-	currentDispatchedHeight int
-	prevDispatchedHeight    int
-	dispatchedDeadline      time.Time
-	phase2Sem               chan struct{}
+	pipelineMu            sync.Mutex
+	pipelineCond          *sync.Cond
+	latestCompletedHeight int
+	lastDispatchedHeight  int
+	pendingDispatchQueue  []int
+	phase2Sem             chan struct{}
 
 	// Block-Level Aggregator Barrier
 	barrierMu      sync.Mutex
@@ -124,8 +125,9 @@ func NewReceiver(
 		peerTTL:       15 * time.Second,
 		pruneEnable:      pruneEnable,
 		pruneTTL:         pruneTTL,
-		phase2Sem:        make(chan struct{}, getEnvInt("BOOTSTRAP_PHASE2_CONCURRENCY", 4)),
-		blacklistedPeers: make(map[peer.ID]time.Time),
+		phase2Sem:            make(chan struct{}, getEnvInt("BOOTSTRAP_PHASE2_CONCURRENCY", 4)),
+		pendingDispatchQueue: make([]int, 0),
+		blacklistedPeers:     make(map[peer.ID]time.Time),
 		pendingBatches:   make(map[string]*pendingBlockBatch),
 	}
 	rcv.pipelineCond = sync.NewCond(&rcv.pipelineMu)
@@ -351,36 +353,18 @@ func (rcv *Receiver) GetCustodySummary() (map[int][]p2pcommon.PeerInfo, int, int
 func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 	defer stream.Close()
 
-	var payload p2pcommon.PublisherPushRequest
-	if err := json.NewDecoder(stream).Decode(&payload); err != nil {
-		rcv.respondWithError(stream, fmt.Sprintf("failed to decode payload: %v", err))
+	payload, err := p2pcommon.ReadBinaryPublisherPush(stream)
+	if err != nil {
+		rcv.respondWithBinaryError(stream, fmt.Sprintf("failed to decode binary payload: %v", err))
 		return
 	}
 
-	colIdx := payload.ColIdx
+	colIdx := int(payload.ColIdx)
 	height := p2pcommon.ParseHeightFromBlockID(payload.BlockID)
-	log.Printf("[Height: %d] [P2P] Received Push stream for Column %d, Block %s", height, colIdx, payload.BlockID)
+	log.Printf("[Height: %d] [P2P] Received Binary Push stream for Column %d, Block %s", height, colIdx, payload.BlockID)
 
-	// 1. Decode hex data cells and commitments
-	columnData := make([][]byte, len(payload.ColumnData))
-	for i, h := range payload.ColumnData {
-		b, err := hex.DecodeString(h)
-		if err != nil {
-			rcv.respondWithError(stream, fmt.Sprintf("invalid hex in column data: %v", err))
-			return
-		}
-		columnData[i] = b
-	}
-
-	pieceCommits := make([][]byte, len(payload.PieceCommits))
-	for i, h := range payload.PieceCommits {
-		b, err := hex.DecodeString(h)
-		if err != nil {
-			rcv.respondWithError(stream, fmt.Sprintf("invalid hex in piece commitments: %v", err))
-			return
-		}
-		pieceCommits[i] = b
-	}
+	columnData := payload.ColumnData
+	pieceCommits := payload.PieceCommits
 
 	merkleProofs := make([]cda.MerkleProof, len(payload.MerkleProofs))
 	for i, p := range payload.MerkleProofs {
@@ -397,7 +381,7 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 			log.Fatalf("[Height: %d] Verifier error for Column %d (CRASH): %v", height, colIdx, err)
 		}
 		log.Printf("[Height: %d] Verifier error for Column %d: %v", height, colIdx, err)
-		rcv.respondWithError(stream, "Verification error: "+err.Error())
+		rcv.respondWithBinaryError(stream, "Verification error: "+err.Error())
 		return
 	}
 	if !ok {
@@ -405,7 +389,7 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 			log.Fatalf("[Height: %d] Verifier failed (CRASH): data from publisher for Column %d is not consistent", height, colIdx)
 		}
 		log.Printf("[Height: %d] Verifier failed: data from publisher for Column %d is not consistent", height, colIdx)
-		rcv.respondWithError(stream, "Data consistency check failed")
+		rcv.respondWithBinaryError(stream, "Data consistency check failed")
 		return
 	}
 
@@ -414,10 +398,10 @@ func (rcv *Receiver) handleReceiveColumn(stream network.Stream) {
 	// 3. Store in Local Cache
 	rcv.cache.Store(payload.BlockID, colIdx, columnData, pieceCommits)
 
-	// Respond with success to Publisher immediately
-	json.NewEncoder(stream).Encode(struct {
-		Success bool `json:"success"`
-	}{Success: true})
+	// Respond with binary success to Publisher immediately
+	_ = p2pcommon.WriteBinaryBatchResponse(stream, &p2pcommon.BinaryBatchSeedResponse{
+		Success: true,
+	})
 
 	// 4. Block-Level Aggregator Barrier & Async Phase 2
 	rcv.enqueueColumnForPhase2(payload.BlockID, height, colIdx, columnData, pieceCommits, merkleProofs)
@@ -601,6 +585,7 @@ func (rcv *Receiver) processPhase2Batch(
 			}
 
 			piecesByRow := make([][]*cda.ReceivedPiece, n)
+			precomputedFragments := rcv.encoder.PrecomputeColumnFragments(cData)
 			var rowWg sync.WaitGroup
 			for w := 0; w < workerLimit; w++ {
 				rowWg.Add(1)
@@ -614,7 +599,13 @@ func (rcv *Receiver) processPhase2Batch(
 							totalSeeds = overrideSeeds
 						}
 
-						codedPieces, err := rcv.encoder.EncodeRowNSeeds(rowIdx, cIdx, cData, cProofs[rowIdx], totalSeeds)
+						var codedPieces []*cda.ReceivedPiece
+						var err error
+						if rowIdx < len(precomputedFragments) && len(precomputedFragments[rowIdx]) == rcv.k {
+							codedPieces, err = rcv.encoder.EncodeRowNSeedsWithFragments(rowIdx, cIdx, precomputedFragments[rowIdx], cProofs[rowIdx], totalSeeds)
+						} else {
+							codedPieces, err = rcv.encoder.EncodeRowNSeeds(rowIdx, cIdx, cData, cProofs[rowIdx], totalSeeds)
+						}
 						if err != nil {
 							encodeErrOnce.Do(func() {
 								encodeErr = fmt.Errorf("async RLNC encoding error for row %d (col %d): %w", rowIdx, cIdx, err)
@@ -656,27 +647,8 @@ func (rcv *Receiver) processPhase2Batch(
 	log.Printf("[Height: %d] [Bootstrap Pre-computation] Successfully pre-computed opening proofs and %d RLNC seeds for %d columns in Block %s",
 		height, len(allPrecomputedPieces), numCols, blockID)
 
-	// 4. Sequential Completion Gate: Wait until store nodes complete the PREVIOUS in-flight block before dispatching.
-	rcv.pipelineMu.Lock()
-	if height > rcv.currentDispatchedHeight {
-		rcv.prevDispatchedHeight = rcv.currentDispatchedHeight
-		rcv.currentDispatchedHeight = height
-		rcv.dispatchedDeadline = time.Now().Add(8 * time.Second)
-		if rcv.prevDispatchedHeight > 0 && rcv.prevDispatchedHeight > rcv.latestCompletedHeight {
-			log.Printf("[Height: %d] [Bootstrap Pipeline] Pre-computed batch ready! Waiting for in-flight block-%d to complete before dispatching...",
-				height, rcv.prevDispatchedHeight)
-		}
-	}
-	prevHeight := rcv.prevDispatchedHeight
-	deadline := rcv.dispatchedDeadline
-	if height == rcv.currentDispatchedHeight && prevHeight > 0 && prevHeight > rcv.latestCompletedHeight {
-		for rcv.latestCompletedHeight < prevHeight && time.Now().Before(deadline) {
-			rcv.pipelineMu.Unlock()
-			time.Sleep(20 * time.Millisecond)
-			rcv.pipelineMu.Lock()
-		}
-	}
-	rcv.pipelineMu.Unlock()
+	// 4. Sequential Completion Gate: Wait until store nodes complete all previous in-flight blocks before dispatching.
+	rcv.waitForDispatchTurn(height, blockID)
 
 	// 5. Broadcast Anchors for all columns in this batch
 	for colIdx := range columnsData {
@@ -746,10 +718,12 @@ func (rcv *Receiver) processPhase2Batch(
 					height, len(seeds), cIdx, nRow, p2pcommon.TopicCellRowSeed(netColIdx, nRow), subCount)
 			}
 
-			// Always deliver via persistent binary TCP stream to assigned custody peers so no (Col, NetRow) seed batch can be dropped under burst load
-			for _, tp := range custodyPeers {
-				if bErr := rcv.broadcaster.BroadcastBinaryBatchPieces(tp, batchReq); bErr != nil {
-					log.Printf("[Height: %d] Persistent seed stream to %s (Col %d NetRow %d) failed: %v", height, tp.PeerID, cIdx, nRow, bErr)
+			// Only fall back to persistent binary TCP stream when GossipSub did not reach all assigned custody peers
+			if err != nil || subCount < len(custodyPeers) {
+				for _, tp := range custodyPeers {
+					if bErr := rcv.broadcaster.BroadcastBinaryBatchPieces(tp, batchReq); bErr != nil {
+						log.Printf("[Height: %d] Persistent seed stream to %s (Col %d NetRow %d) failed: %v", height, tp.PeerID, cIdx, nRow, bErr)
+					}
 				}
 			}
 		}(crKey, sList)
@@ -758,6 +732,93 @@ func (rcv *Receiver) processPhase2Batch(
 
 	log.Printf("[Height: %d] Async Phase 2 finished successfully: published %d seed pool pieces across %d columns for Block %s",
 		height, len(allPrecomputedPieces), numCols, blockID)
+}
+
+// waitForDispatchTurn enforces sequential dissemination to Store Nodes:
+// Block H holds all precomputed seeds and anchors in Bootstrap RAM until Store Nodes have completed
+// custody of all previous blocks (or until safety timeout expires).
+func (rcv *Receiver) waitForDispatchTurn(height int, blockID string) {
+	if height <= 0 {
+		return
+	}
+
+	rcv.pipelineMu.Lock()
+	defer rcv.pipelineMu.Unlock()
+
+	// Enqueue this height into pendingDispatchQueue in sorted order if not already present
+	found := false
+	for _, h := range rcv.pendingDispatchQueue {
+		if h == height {
+			found = true
+			break
+		}
+	}
+	if !found {
+		rcv.pendingDispatchQueue = append(rcv.pendingDispatchQueue, height)
+		sort.Ints(rcv.pendingDispatchQueue)
+	}
+
+	dispatchTimeout := time.Duration(getEnvInt("BOOTSTRAP_DISPATCH_TIMEOUT_SEC", 60)) * time.Second
+	deadline := time.Now().Add(dispatchTimeout)
+	lastPollTime := time.Time{}
+
+	for {
+		// Condition 1: Must be the lowest height in the queue
+		isHeadOfQueue := len(rcv.pendingDispatchQueue) > 0 && rcv.pendingDispatchQueue[0] == height
+
+		// Condition 2: Store nodes must have completed the last dispatched block
+		prevCompleted := rcv.lastDispatchedHeight == 0 || rcv.latestCompletedHeight >= rcv.lastDispatchedHeight
+
+		if isHeadOfQueue && prevCompleted {
+			// Gate cleared! Pop from queue and advance lastDispatchedHeight
+			rcv.pendingDispatchQueue = rcv.pendingDispatchQueue[1:]
+			rcv.lastDispatchedHeight = height
+			log.Printf("[Height: %d] [Bootstrap Pipeline] Sequential gate cleared (latestCompleted=%d, lastDispatched=%d). Dispatching anchors and seeds for %s to Store Nodes!",
+				height, rcv.latestCompletedHeight, rcv.lastDispatchedHeight, blockID)
+			return
+		}
+
+		if time.Now().After(deadline) {
+			log.Printf("[Height: %d] [Bootstrap Pipeline] WARNING: Dispatch gate timed out after %v (head=%v, latestCompleted=%d, lastDispatched=%d). Forcing dispatch of %s as safety fallback.",
+				height, dispatchTimeout, isHeadOfQueue, rcv.latestCompletedHeight, rcv.lastDispatchedHeight, blockID)
+			for i, h := range rcv.pendingDispatchQueue {
+				if h == height {
+					rcv.pendingDispatchQueue = append(rcv.pendingDispatchQueue[:i], rcv.pendingDispatchQueue[i+1:]...)
+					break
+				}
+			}
+			rcv.lastDispatchedHeight = height
+			return
+		}
+
+		// Fallback active poll to Publisher status every 1.5s in case TopicBlockReady GossipSub was missed
+		if time.Since(lastPollTime) >= 1500*time.Millisecond {
+			lastPollTime = time.Now()
+			go rcv.checkPublisherStatusAsync()
+		}
+
+		rcv.pipelineMu.Unlock()
+		time.Sleep(30 * time.Millisecond)
+		rcv.pipelineMu.Lock()
+	}
+}
+
+func (rcv *Receiver) checkPublisherStatusAsync() {
+	if rcv.publisherAddr == "" {
+		return
+	}
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := client.Get(rcv.publisherAddr + "/status")
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var st struct {
+		LatestCompletedHeight int `json:"latest_completed_height"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&st); err == nil && st.LatestCompletedHeight > 0 {
+		rcv.OnBlockCompleted(st.LatestCompletedHeight)
+	}
 }
 
 // OnBlockCompleted records completion of a block height to trigger immediate dispatch of pre-computed seeds for the next block.
@@ -944,6 +1005,13 @@ func (rcv *Receiver) respondWithError(stream network.Stream, errMsg string) {
 		Success bool   `json:"success"`
 		Error   string `json:"error"`
 	}{
+		Success: false,
+		Error:   errMsg,
+	})
+}
+
+func (rcv *Receiver) respondWithBinaryError(stream network.Stream, errMsg string) {
+	_ = p2pcommon.WriteBinaryBatchResponse(stream, &p2pcommon.BinaryBatchSeedResponse{
 		Success: false,
 		Error:   errMsg,
 	})

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,8 +10,116 @@ import (
 	"sync"
 
 	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/cda"
+	"github.com/DataAvailabilityLayerNovel/rlnc-rsmt2d/rlnc"
 	"github.com/dgraph-io/badger/v4"
 )
+
+const binaryCustodyPiecesMagic uint32 = 0x43535401 // "CST\x01"
+
+func marshalPiecesBinary(pieces []cda.ReceivedPiece) ([]byte, error) {
+	totalLen := 4 + 2
+	for i := range pieces {
+		p := &pieces[i]
+		totalLen += 2 + 2 + 2 + len(p.Data.Data) + 1 + len(p.Data.Coeffs) + 2 + len(p.Proof)
+	}
+	buf := make([]byte, totalLen)
+	binary.BigEndian.PutUint32(buf[0:4], binaryCustodyPiecesMagic)
+	binary.BigEndian.PutUint16(buf[4:6], uint16(len(pieces)))
+	idx := 6
+	for i := range pieces {
+		p := &pieces[i]
+		binary.BigEndian.PutUint16(buf[idx:], uint16(p.Row))
+		idx += 2
+		binary.BigEndian.PutUint16(buf[idx:], uint16(p.Col))
+		idx += 2
+
+		dLen := len(p.Data.Data)
+		binary.BigEndian.PutUint16(buf[idx:], uint16(dLen))
+		idx += 2
+		copy(buf[idx:], p.Data.Data)
+		idx += dLen
+
+		cLen := len(p.Data.Coeffs)
+		buf[idx] = uint8(cLen)
+		idx++
+		copy(buf[idx:], p.Data.Coeffs)
+		idx += cLen
+
+		pLen := len(p.Proof)
+		binary.BigEndian.PutUint16(buf[idx:], uint16(pLen))
+		idx += 2
+		copy(buf[idx:], p.Proof)
+		idx += pLen
+	}
+	return buf[:idx], nil
+}
+
+func unmarshalPieces(data []byte, out *[]cda.ReceivedPiece) error {
+	if len(data) >= 6 && binary.BigEndian.Uint32(data[0:4]) == binaryCustodyPiecesMagic {
+		count := int(binary.BigEndian.Uint16(data[4:6]))
+		res := make([]cda.ReceivedPiece, count)
+		idx := 6
+		for i := 0; i < count; i++ {
+			if idx+6 > len(data) {
+				return fmt.Errorf("truncated binary custody piece header")
+			}
+			row := int(binary.BigEndian.Uint16(data[idx:]))
+			idx += 2
+			col := int(binary.BigEndian.Uint16(data[idx:]))
+			idx += 2
+			dLen := int(binary.BigEndian.Uint16(data[idx:]))
+			idx += 2
+			if idx+dLen+1 > len(data) {
+				return fmt.Errorf("truncated binary custody piece data")
+			}
+			dBytes := make([]byte, dLen)
+			copy(dBytes, data[idx:idx+dLen])
+			idx += dLen
+
+			cLen := int(data[idx])
+			idx++
+			if idx+cLen+2 > len(data) {
+				return fmt.Errorf("truncated binary custody piece coeffs")
+			}
+			cBytes := make([]byte, cLen)
+			copy(cBytes, data[idx:idx+cLen])
+			idx += cLen
+
+			pLen := int(binary.BigEndian.Uint16(data[idx:]))
+			idx += 2
+			if idx+pLen > len(data) {
+				return fmt.Errorf("truncated binary custody piece proof")
+			}
+			pBytes := make([]byte, pLen)
+			copy(pBytes, data[idx:idx+pLen])
+			idx += pLen
+
+			res[i] = cda.ReceivedPiece{
+				Row: row,
+				Col: col,
+				Data: rlnc.PieceData{
+					Data:   dBytes,
+					Coeffs: cBytes,
+				},
+				Proof: cda.OpeningProof(pBytes),
+			}
+		}
+		*out = res
+		return nil
+	}
+	return json.Unmarshal(data, out)
+}
+
+func unmarshalPiecesCount(data []byte) (int, error) {
+	if len(data) >= 6 && binary.BigEndian.Uint32(data[0:4]) == binaryCustodyPiecesMagic {
+		return int(binary.BigEndian.Uint16(data[4:6])), nil
+	}
+	var pieces []cda.ReceivedPiece
+	if err := json.Unmarshal(data, &pieces); err != nil {
+		return 0, err
+	}
+	return len(pieces), nil
+}
 
 type AnchoredData struct {
 	ColIdx       int      `json:"col_idx"`
@@ -18,14 +127,20 @@ type AnchoredData struct {
 }
 
 type CustodyStore struct {
-	db              *badger.DB
-	port            int
-	countMu         sync.RWMutex
-	pieceCountCache map[string]int
-	memMu           sync.RWMutex
-	piecesCache     map[string][]cda.ReceivedPiece
-	recodedCache    map[string][]cda.ReceivedPiece
-	anchorCache     map[string][][]byte
+	db                   *badger.DB
+	port                 int
+	countMu              sync.RWMutex
+	pieceCountCache      map[string]int
+	memMu                sync.RWMutex
+	piecesCache          map[string][]cda.ReceivedPiece
+	recodedCache         map[string][]cda.ReceivedPiece
+	anchorCache          map[string][][]byte
+	activeRawPieces      int
+	activeRecodedPieces  int
+	activeRawByRow       map[int]int
+	evictedRawPieces     int
+	evictedRecodedPieces int
+	evictedRawByRow      map[int]int
 }
 
 func NewCustodyStore(port int) *CustodyStore {
@@ -35,6 +150,8 @@ func NewCustodyStore(port int) *CustodyStore {
 		piecesCache:     make(map[string][]cda.ReceivedPiece),
 		recodedCache:    make(map[string][]cda.ReceivedPiece),
 		anchorCache:     make(map[string][][]byte),
+		activeRawByRow:  make(map[int]int),
+		evictedRawByRow: make(map[int]int),
 	}
 
 	if port > 0 {
@@ -137,12 +254,24 @@ func (s *CustodyStore) GetAnchoredCommitments(blockID string, colIdx int) ([][]b
 }
 
 func (s *CustodyStore) StorePiece(blockID string, row, col int, piece cda.ReceivedPiece) {
+	s.StorePiecesForCell(blockID, row, col, []cda.ReceivedPiece{piece})
+}
+
+// StorePiecesForCell appends multiple verified pieces for cell (row, col) in a single cache update
+// and triggers at most 1 asynchronous binary persistence transaction to BadgerDB.
+func (s *CustodyStore) StorePiecesForCell(blockID string, row, col int, newPieces []cda.ReceivedPiece) {
+	if len(newPieces) == 0 {
+		return
+	}
 	keyStr := fmt.Sprintf("received_%s_%d_%d", blockID, row, col)
 
 	s.memMu.Lock()
 	pieces := s.piecesCache[keyStr]
-	pieces = append(pieces, piece)
+	added := len(newPieces)
+	pieces = append(pieces, newPieces...)
 	s.piecesCache[keyStr] = pieces
+	s.activeRawPieces += added
+	s.activeRawByRow[row] += added
 	newCount := len(pieces)
 
 	// Make defensive copy to prevent data race with background persistence
@@ -156,18 +285,20 @@ func (s *CustodyStore) StorePiece(blockID string, row, col int, piece cda.Receiv
 
 	if s.db != nil {
 		go func(k string, toSave []cda.ReceivedPiece) {
-			valData, err := json.Marshal(toSave)
+			valData, err := marshalPiecesBinary(toSave)
 			if err != nil {
 				return
 			}
 			_ = s.db.Update(func(txn *badger.Txn) error {
-				// Anti-regression: do not overwrite DB with fewer pieces if an out-of-order write occurs
+				// Anti-regression: O(1) header check to ensure we do not overwrite DB with fewer pieces
 				item, err := txn.Get([]byte(k))
 				if err == nil {
-					var existing []cda.ReceivedPiece
+					var existingCount int
 					if err := item.Value(func(val []byte) error {
-						return json.Unmarshal(val, &existing)
-					}); err == nil && len(existing) >= len(toSave) {
+						var cErr error
+						existingCount, cErr = unmarshalPiecesCount(val)
+						return cErr
+					}); err == nil && existingCount >= len(toSave) {
 						return nil // Existing state has equal or more pieces; do not overwrite!
 					}
 				}
@@ -201,7 +332,7 @@ func (s *CustodyStore) GetPieces(blockID string, row, col int) []cda.ReceivedPie
 			return err
 		}
 		return item.Value(func(val []byte) error {
-			return json.Unmarshal(val, &pieces)
+			return unmarshalPieces(val, &pieces)
 		})
 	})
 
@@ -219,12 +350,14 @@ func (s *CustodyStore) StoreRecodedPiece(blockID string, row, col int, piece cda
 	pieces := []cda.ReceivedPiece{piece}
 
 	s.memMu.Lock()
+	prevLen := len(s.recodedCache[keyStr])
 	s.recodedCache[keyStr] = pieces
+	s.activeRecodedPieces += 1 - prevLen
 	s.memMu.Unlock()
 
 	if s.db != nil {
 		go func() {
-			valData, err := json.Marshal(pieces)
+			valData, err := marshalPiecesBinary(pieces)
 			if err != nil {
 				return
 			}
@@ -239,7 +372,10 @@ func (s *CustodyStore) DeleteRecodedPieces(blockID string, row, col int) {
 	keyStr := fmt.Sprintf("recoded_%s_%d_%d", blockID, row, col)
 
 	s.memMu.Lock()
-	delete(s.recodedCache, keyStr)
+	if prev, exists := s.recodedCache[keyStr]; exists {
+		s.activeRecodedPieces -= len(prev)
+		delete(s.recodedCache, keyStr)
+	}
 	s.memMu.Unlock()
 
 	if s.db != nil {
@@ -275,7 +411,7 @@ func (s *CustodyStore) GetRecodedPieces(blockID string, row, col int) []cda.Rece
 			return err
 		}
 		return item.Value(func(val []byte) error {
-			return json.Unmarshal(val, &pieces)
+			return unmarshalPieces(val, &pieces)
 		})
 	})
 
@@ -322,9 +458,8 @@ func (s *CustodyStore) GetPieceCount(blockID string, row, col int) int {
 			return err
 		}
 		return item.Value(func(val []byte) error {
-			var pieces []cda.ReceivedPiece
-			if err := json.Unmarshal(val, &pieces); err == nil {
-				count = len(pieces)
+			if c, err := unmarshalPiecesCount(val); err == nil {
+				count = c
 			}
 			return nil
 		})
@@ -345,23 +480,18 @@ func (s *CustodyStore) GetTotalPiecesForCell(blockID string, row, col int) int {
 }
 
 func (s *CustodyStore) GetTotalPieceCount() int {
-	count := 0
 	s.memMu.RLock()
-	if len(s.piecesCache) > 0 || len(s.recodedCache) > 0 {
-		for _, pieces := range s.piecesCache {
-			count += len(pieces)
-		}
-		for _, pieces := range s.recodedCache {
-			count += len(pieces)
-		}
-		s.memMu.RUnlock()
-		return count
-	}
+	total := s.activeRawPieces + s.evictedRawPieces + s.activeRecodedPieces + s.evictedRecodedPieces
+	hasMem := total > 0 || len(s.piecesCache) > 0 || len(s.recodedCache) > 0
 	s.memMu.RUnlock()
+	if hasMem {
+		return total
+	}
 
 	if s.db == nil {
 		return 0
 	}
+	count := 0
 	_ = s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		it := txn.NewIterator(opts)
@@ -371,9 +501,8 @@ func (s *CustodyStore) GetTotalPieceCount() int {
 			key := string(item.Key())
 			if strings.HasPrefix(key, "received_") || strings.HasPrefix(key, "recoded_") {
 				_ = item.Value(func(val []byte) error {
-					var pieces []cda.ReceivedPiece
-					if err := json.Unmarshal(val, &pieces); err == nil {
-						count += len(pieces)
+					if c, err := unmarshalPiecesCount(val); err == nil {
+						count += c
 					}
 					return nil
 				})
@@ -385,20 +514,18 @@ func (s *CustodyStore) GetTotalPieceCount() int {
 }
 
 func (s *CustodyStore) GetRecodedPieceCount() int {
-	count := 0
 	s.memMu.RLock()
-	if len(s.recodedCache) > 0 {
-		for _, pieces := range s.recodedCache {
-			count += len(pieces)
-		}
-		s.memMu.RUnlock()
-		return count
-	}
+	total := s.activeRecodedPieces + s.evictedRecodedPieces
+	hasMem := total > 0 || len(s.recodedCache) > 0
 	s.memMu.RUnlock()
+	if hasMem {
+		return total
+	}
 
 	if s.db == nil {
 		return 0
 	}
+	count := 0
 	_ = s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		it := txn.NewIterator(opts)
@@ -407,9 +534,8 @@ func (s *CustodyStore) GetRecodedPieceCount() int {
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			item := it.Item()
 			_ = item.Value(func(val []byte) error {
-				var pieces []cda.ReceivedPiece
-				if err := json.Unmarshal(val, &pieces); err == nil {
-					count += len(pieces)
+				if c, err := unmarshalPiecesCount(val); err == nil {
+					count += c
 				}
 				return nil
 			})
@@ -423,19 +549,17 @@ func (s *CustodyStore) GetCustodyPieceCount(storesPerCol, rowIdx int) int {
 	if storesPerCol <= 0 {
 		return 0
 	}
-	count := 0
 	s.memMu.RLock()
-	if len(s.piecesCache) > 0 {
-		for key, pieces := range s.piecesCache {
-			parts := strings.Split(key, "_")
-			if len(parts) >= 3 {
-				rowStr := parts[len(parts)-2]
-				var row int
-				if _, err := fmt.Sscanf(rowStr, "%d", &row); err == nil {
-					if (row % storesPerCol) == rowIdx {
-						count += len(pieces)
-					}
-				}
+	if len(s.activeRawByRow) > 0 || len(s.evictedRawByRow) > 0 {
+		count := 0
+		for row, c := range s.activeRawByRow {
+			if (row % storesPerCol) == rowIdx {
+				count += c
+			}
+		}
+		for row, c := range s.evictedRawByRow {
+			if (row % storesPerCol) == rowIdx {
+				count += c
 			}
 		}
 		s.memMu.RUnlock()
@@ -446,6 +570,7 @@ func (s *CustodyStore) GetCustodyPieceCount(storesPerCol, rowIdx int) int {
 	if s.db == nil {
 		return 0
 	}
+	count := 0
 	_ = s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		it := txn.NewIterator(opts)
@@ -462,9 +587,8 @@ func (s *CustodyStore) GetCustodyPieceCount(storesPerCol, rowIdx int) int {
 				if _, err := fmt.Sscanf(rowStr, "%d", &row); err == nil {
 					if (row % storesPerCol) == rowIdx {
 						_ = item.Value(func(val []byte) error {
-							var pieces []cda.ReceivedPiece
-							if err := json.Unmarshal(val, &pieces); err == nil {
-								count += len(pieces)
+							if c, err := unmarshalPiecesCount(val); err == nil {
+								count += c
 							}
 							return nil
 						})
@@ -475,6 +599,41 @@ func (s *CustodyStore) GetCustodyPieceCount(storesPerCol, rowIdx int) int {
 		return nil
 	})
 	return count
+}
+
+// EvictBlockFromRAM removes in-memory slice entries for an old completed block (already persisted in BadgerDB)
+// while preserving O(1) cumulative piece counters so memory remains bounded over thousands of blocks.
+func (s *CustodyStore) EvictBlockFromRAM(blockID string, n, startCol, endCol int) {
+	if s.db == nil || blockID == "" || n <= 0 {
+		return
+	}
+	s.memMu.Lock()
+	s.countMu.Lock()
+	for c := startCol; c < endCol; c++ {
+		delete(s.anchorCache, fmt.Sprintf("anchor_%s_%d", blockID, c))
+		for r := 0; r < n; r++ {
+			rawKey := fmt.Sprintf("received_%s_%d_%d", blockID, r, c)
+			if pieces, ok := s.piecesCache[rawKey]; ok {
+				cnt := len(pieces)
+				s.activeRawPieces -= cnt
+				s.activeRawByRow[r] -= cnt
+				s.evictedRawPieces += cnt
+				s.evictedRawByRow[r] += cnt
+				delete(s.piecesCache, rawKey)
+			}
+			delete(s.pieceCountCache, rawKey)
+
+			recKey := fmt.Sprintf("recoded_%s_%d_%d", blockID, r, c)
+			if recs, ok := s.recodedCache[recKey]; ok {
+				cnt := len(recs)
+				s.activeRecodedPieces -= cnt
+				s.evictedRecodedPieces += cnt
+				delete(s.recodedCache, recKey)
+			}
+		}
+	}
+	s.countMu.Unlock()
+	s.memMu.Unlock()
 }
 
 func (s *CustodyStore) IsComplete(blockID string, colIdx, k int) bool {
@@ -499,8 +658,7 @@ func (s *CustodyStore) IsComplete(blockID string, colIdx, k int) bool {
 					return nil
 				}
 				err = item.Value(func(val []byte) error {
-					var pieces []cda.ReceivedPiece
-					if err := json.Unmarshal(val, &pieces); err != nil || len(pieces) < k {
+					if cnt, err := unmarshalPiecesCount(val); err != nil || cnt < k {
 						complete = false
 					}
 					return nil
@@ -523,7 +681,11 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 	s.memMu.Lock()
 	rawPieces := s.piecesCache[rawKeyStr]
 	alreadyHasRecoded := len(s.recodedCache[recodedKeyStr]) > 0
-	delete(s.piecesCache, rawKeyStr)
+	if len(rawPieces) > 0 {
+		s.activeRawPieces -= len(rawPieces)
+		s.activeRawByRow[row] -= len(rawPieces)
+		delete(s.piecesCache, rawKeyStr)
+	}
 	s.countMu.Lock()
 	s.pieceCountCache[rawKeyStr] = 0
 	s.countMu.Unlock()
@@ -537,20 +699,10 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 	var compressedPiece cda.ReceivedPiece
 	if !alreadyHasRecoded && len(rawPieces) > 0 {
 		if len(rawPieces) >= 2 && rm != nil {
-			pieceCommits, _ := s.GetAnchoredCommitments(blockID, col)
-			if len(pieceCommits) > 0 {
-				if recVer, vErr := rm.RecodePiecesWithVerify(rawPieces, pieceCommits, 5, domainSizes...); vErr == nil && recVer != nil {
-					compressedPiece = *recVer
-				} else {
-					compressedPiece = rawPieces[0]
-				}
+			if recFast, fErr := rm.RecodePiecesFastCheck(rawPieces, 5); fErr == nil && recFast != nil {
+				compressedPiece = *recFast
 			} else {
-				recoded, err := rm.RecodePieces(rawPieces)
-				if err == nil && recoded != nil {
-					compressedPiece = *recoded
-				} else {
-					compressedPiece = rawPieces[0]
-				}
+				compressedPiece = rawPieces[0]
 			}
 		} else {
 			compressedPiece = rawPieces[0]
@@ -559,6 +711,7 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 		s.memMu.Lock()
 		if len(s.recodedCache[recodedKeyStr]) == 0 {
 			s.recodedCache[recodedKeyStr] = []cda.ReceivedPiece{compressedPiece}
+			s.activeRecodedPieces++
 		} else {
 			alreadyHasRecoded = true
 		}
@@ -572,7 +725,7 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 				if !hadRecoded && len(pList) > 0 {
 					_, err := txn.Get(recKey)
 					if err != nil {
-						valData, err := json.Marshal([]cda.ReceivedPiece{compPiece})
+						valData, err := marshalPiecesBinary([]cda.ReceivedPiece{compPiece})
 						if err == nil {
 							_ = txn.Set(recKey, valData)
 						}
@@ -589,6 +742,10 @@ func (s *CustodyStore) PruneRawPieces(blockID string, row, col int, rm *cda.Reci
 func (s *CustodyStore) GetDBSize() int64 {
 	if s.db == nil {
 		return 0
+	}
+	lsm, vlog := s.db.Size()
+	if lsm+vlog > 0 {
+		return lsm + vlog
 	}
 	var totalBytes int64
 	_ = s.db.View(func(txn *badger.Txn) error {

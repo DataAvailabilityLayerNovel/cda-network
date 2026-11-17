@@ -473,3 +473,451 @@ func DecodeBinaryGossipPiece(data []byte) (*BinaryGossipPiece, error) {
 		SenderPeerID: senderPeerID,
 	}, nil
 }
+
+const (
+	// BinaryPublisherPushMagic identifies the binary column push wire protocol (Publisher -> Bootstrap)
+	BinaryPublisherPushMagic uint32 = 0x43444102 // "CDA\x02"
+	// BinaryPublishBlockMagic identifies the binary block publish wire protocol (CometBFT -> Publisher)
+	BinaryPublishBlockMagic uint32 = 0x43444103 // "CDA\x03"
+)
+
+// BinaryPublisherPushRequest represents a raw binary column push from Publisher to Bootstrap Node
+type BinaryPublisherPushRequest struct {
+	BlockID      string
+	ColIdx       uint16
+	ColumnData   [][]byte
+	PieceCommits [][]byte
+	MerkleProofs []SerializedMerkleProof
+}
+
+// WriteBinaryPublisherPush encodes a BinaryPublisherPushRequest directly to an io.Writer without hex/JSON overhead
+func WriteBinaryPublisherPush(w io.Writer, req *BinaryPublisherPushRequest) error {
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.BigEndian, BinaryPublisherPushMagic); err != nil {
+		return err
+	}
+
+	bIDBytes := []byte(req.BlockID)
+	if len(bIDBytes) > 255 {
+		return fmt.Errorf("blockID too long: %d", len(bIDBytes))
+	}
+	buf.WriteByte(uint8(len(bIDBytes)))
+	buf.Write(bIDBytes)
+
+	_ = binary.Write(&buf, binary.BigEndian, req.ColIdx)
+
+	// ColumnData
+	_ = binary.Write(&buf, binary.BigEndian, uint16(len(req.ColumnData)))
+	for _, cell := range req.ColumnData {
+		_ = binary.Write(&buf, binary.BigEndian, uint16(len(cell)))
+		if len(cell) > 0 {
+			buf.Write(cell)
+		}
+	}
+
+	// PieceCommits
+	_ = binary.Write(&buf, binary.BigEndian, uint16(len(req.PieceCommits)))
+	for _, c := range req.PieceCommits {
+		_ = binary.Write(&buf, binary.BigEndian, uint16(len(c)))
+		if len(c) > 0 {
+			buf.Write(c)
+		}
+	}
+
+	// MerkleProofs
+	_ = binary.Write(&buf, binary.BigEndian, uint16(len(req.MerkleProofs)))
+	for _, mp := range req.MerkleProofs {
+		_ = binary.Write(&buf, binary.BigEndian, uint32(mp.Index))
+		_ = binary.Write(&buf, binary.BigEndian, uint16(len(mp.Siblings)))
+		for _, sib := range mp.Siblings {
+			_ = binary.Write(&buf, binary.BigEndian, uint16(len(sib)))
+			if len(sib) > 0 {
+				buf.Write(sib)
+			}
+		}
+	}
+
+	_, err := w.Write(buf.Bytes())
+	return err
+}
+
+// ReadBinaryPublisherPush decodes a BinaryPublisherPushRequest from an io.Reader
+func ReadBinaryPublisherPush(r io.Reader) (*BinaryPublisherPushRequest, error) {
+	var magic uint32
+	if err := binary.Read(r, binary.BigEndian, &magic); err != nil {
+		return nil, err
+	}
+	if magic != BinaryPublisherPushMagic {
+		return nil, fmt.Errorf("invalid binary publisher push magic: 0x%X (expected 0x%X)", magic, BinaryPublisherPushMagic)
+	}
+
+	var bIDLen uint8
+	if err := binary.Read(r, binary.BigEndian, &bIDLen); err != nil {
+		return nil, err
+	}
+	bIDBuf := make([]byte, bIDLen)
+	if _, err := io.ReadFull(r, bIDBuf); err != nil {
+		return nil, err
+	}
+
+	var colIdx uint16
+	if err := binary.Read(r, binary.BigEndian, &colIdx); err != nil {
+		return nil, err
+	}
+
+	var numCells uint16
+	if err := binary.Read(r, binary.BigEndian, &numCells); err != nil {
+		return nil, err
+	}
+	colData := make([][]byte, numCells)
+	for i := 0; i < int(numCells); i++ {
+		var cellLen uint16
+		if err := binary.Read(r, binary.BigEndian, &cellLen); err != nil {
+			return nil, err
+		}
+		cellBuf := make([]byte, cellLen)
+		if cellLen > 0 {
+			if _, err := io.ReadFull(r, cellBuf); err != nil {
+				return nil, err
+			}
+		}
+		colData[i] = cellBuf
+	}
+
+	var numCommits uint16
+	if err := binary.Read(r, binary.BigEndian, &numCommits); err != nil {
+		return nil, err
+	}
+	commits := make([][]byte, numCommits)
+	for i := 0; i < int(numCommits); i++ {
+		var cLen uint16
+		if err := binary.Read(r, binary.BigEndian, &cLen); err != nil {
+			return nil, err
+		}
+		cBuf := make([]byte, cLen)
+		if cLen > 0 {
+			if _, err := io.ReadFull(r, cBuf); err != nil {
+				return nil, err
+			}
+		}
+		commits[i] = cBuf
+	}
+
+	var numProofs uint16
+	if err := binary.Read(r, binary.BigEndian, &numProofs); err != nil {
+		return nil, err
+	}
+	proofs := make([]SerializedMerkleProof, numProofs)
+	for i := 0; i < int(numProofs); i++ {
+		var idxVal uint32
+		if err := binary.Read(r, binary.BigEndian, &idxVal); err != nil {
+			return nil, err
+		}
+		var numSibs uint16
+		if err := binary.Read(r, binary.BigEndian, &numSibs); err != nil {
+			return nil, err
+		}
+		sibs := make([][]byte, numSibs)
+		for j := 0; j < int(numSibs); j++ {
+			var sLen uint16
+			if err := binary.Read(r, binary.BigEndian, &sLen); err != nil {
+				return nil, err
+			}
+			sBuf := make([]byte, sLen)
+			if sLen > 0 {
+				if _, err := io.ReadFull(r, sBuf); err != nil {
+					return nil, err
+				}
+			}
+			sibs[j] = sBuf
+		}
+		proofs[i] = SerializedMerkleProof{
+			Index:    int(idxVal),
+			Siblings: sibs,
+		}
+	}
+
+	return &BinaryPublisherPushRequest{
+		BlockID:      string(bIDBuf),
+		ColIdx:       colIdx,
+		ColumnData:   colData,
+		PieceCommits: commits,
+		MerkleProofs: proofs,
+	}, nil
+}
+
+// BinaryHeaderPayload holds consensus header commitments in raw binary form
+type BinaryHeaderPayload struct {
+	ChainID         string
+	Height          int64
+	TimeUnixNano    int64
+	DataHash        []byte
+	AppHash         []byte
+	ProposerAddress string
+	CommitsRoot     []byte
+	ColumnComm      [][]byte
+	Coeffs          []byte
+}
+
+// BinaryTxSummary holds transaction cell offset metadata
+type BinaryTxSummary struct {
+	Hash   string
+	Key    string
+	Offset int
+	Cells  int
+	Size   int
+}
+
+// BinaryPublishBlockRequest represents a raw binary block publish request from CometBFT to Publisher
+type BinaryPublishBlockRequest struct {
+	BlockID   string
+	Height    int64
+	K         int
+	Cells     [][]byte
+	Header    *BinaryHeaderPayload
+	Txs       []BinaryTxSummary
+	Signature []byte
+}
+
+func writeString16(buf *bytes.Buffer, s string) {
+	b := []byte(s)
+	_ = binary.Write(buf, binary.BigEndian, uint16(len(b)))
+	if len(b) > 0 {
+		buf.Write(b)
+	}
+}
+
+func readString16(r io.Reader) (string, error) {
+	var l uint16
+	if err := binary.Read(r, binary.BigEndian, &l); err != nil {
+		return "", err
+	}
+	if l == 0 {
+		return "", nil
+	}
+	b := make([]byte, l)
+	if _, err := io.ReadFull(r, b); err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func writeBytes16(buf *bytes.Buffer, b []byte) {
+	_ = binary.Write(buf, binary.BigEndian, uint16(len(b)))
+	if len(b) > 0 {
+		buf.Write(b)
+	}
+}
+
+func readBytes16(r io.Reader) ([]byte, error) {
+	var l uint16
+	if err := binary.Read(r, binary.BigEndian, &l); err != nil {
+		return nil, err
+	}
+	if l == 0 {
+		return nil, nil
+	}
+	b := make([]byte, l)
+	if _, err := io.ReadFull(r, b); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// EncodeBinaryPublishBlock serializes a BinaryPublishBlockRequest into a byte slice
+func EncodeBinaryPublishBlock(req *BinaryPublishBlockRequest) ([]byte, error) {
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.BigEndian, BinaryPublishBlockMagic)
+
+	writeString16(&buf, req.BlockID)
+	_ = binary.Write(&buf, binary.BigEndian, req.Height)
+	_ = binary.Write(&buf, binary.BigEndian, uint16(req.K))
+
+	// Raw ODS cells
+	_ = binary.Write(&buf, binary.BigEndian, uint32(len(req.Cells)))
+	for _, cell := range req.Cells {
+		writeBytes16(&buf, cell)
+	}
+
+	// Optional Header
+	if req.Header != nil {
+		buf.WriteByte(1)
+		writeString16(&buf, req.Header.ChainID)
+		_ = binary.Write(&buf, binary.BigEndian, req.Header.Height)
+		_ = binary.Write(&buf, binary.BigEndian, req.Header.TimeUnixNano)
+		writeBytes16(&buf, req.Header.DataHash)
+		writeBytes16(&buf, req.Header.AppHash)
+		writeString16(&buf, req.Header.ProposerAddress)
+		writeBytes16(&buf, req.Header.CommitsRoot)
+		_ = binary.Write(&buf, binary.BigEndian, uint16(len(req.Header.ColumnComm)))
+		for _, cc := range req.Header.ColumnComm {
+			writeBytes16(&buf, cc)
+		}
+		writeBytes16(&buf, req.Header.Coeffs)
+	} else {
+		buf.WriteByte(0)
+	}
+
+	// Txs
+	_ = binary.Write(&buf, binary.BigEndian, uint32(len(req.Txs)))
+	for _, tx := range req.Txs {
+		writeString16(&buf, tx.Hash)
+		writeString16(&buf, tx.Key)
+		_ = binary.Write(&buf, binary.BigEndian, uint32(tx.Offset))
+		_ = binary.Write(&buf, binary.BigEndian, uint32(tx.Cells))
+		_ = binary.Write(&buf, binary.BigEndian, uint32(tx.Size))
+	}
+
+	// Signature
+	writeBytes16(&buf, req.Signature)
+
+	return buf.Bytes(), nil
+}
+
+// DecodeBinaryPublishBlock deserializes a BinaryPublishBlockRequest from a byte slice
+func DecodeBinaryPublishBlock(data []byte) (*BinaryPublishBlockRequest, error) {
+	r := bytes.NewReader(data)
+	var magic uint32
+	if err := binary.Read(r, binary.BigEndian, &magic); err != nil {
+		return nil, err
+	}
+	if magic != BinaryPublishBlockMagic {
+		return nil, fmt.Errorf("invalid binary publish block magic: 0x%X", magic)
+	}
+
+	blockID, err := readString16(r)
+	if err != nil {
+		return nil, err
+	}
+	var height int64
+	if err := binary.Read(r, binary.BigEndian, &height); err != nil {
+		return nil, err
+	}
+	var kVal uint16
+	if err := binary.Read(r, binary.BigEndian, &kVal); err != nil {
+		return nil, err
+	}
+
+	var numCells uint32
+	if err := binary.Read(r, binary.BigEndian, &numCells); err != nil {
+		return nil, err
+	}
+	cells := make([][]byte, numCells)
+	for i := 0; i < int(numCells); i++ {
+		c, err := readBytes16(r)
+		if err != nil {
+			return nil, err
+		}
+		cells[i] = c
+	}
+
+	var hasHeader uint8
+	if err := binary.Read(r, binary.BigEndian, &hasHeader); err != nil {
+		return nil, err
+	}
+	var hdr *BinaryHeaderPayload
+	if hasHeader == 1 {
+		chainID, err := readString16(r)
+		if err != nil {
+			return nil, err
+		}
+		var hHeight, timeNano int64
+		if err := binary.Read(r, binary.BigEndian, &hHeight); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(r, binary.BigEndian, &timeNano); err != nil {
+			return nil, err
+		}
+		dataHash, err := readBytes16(r)
+		if err != nil {
+			return nil, err
+		}
+		appHash, err := readBytes16(r)
+		if err != nil {
+			return nil, err
+		}
+		propAddr, err := readString16(r)
+		if err != nil {
+			return nil, err
+		}
+		commitsRoot, err := readBytes16(r)
+		if err != nil {
+			return nil, err
+		}
+		var numCols uint16
+		if err := binary.Read(r, binary.BigEndian, &numCols); err != nil {
+			return nil, err
+		}
+		colComm := make([][]byte, numCols)
+		for i := 0; i < int(numCols); i++ {
+			cc, err := readBytes16(r)
+			if err != nil {
+				return nil, err
+			}
+			colComm[i] = cc
+		}
+		coeffs, err := readBytes16(r)
+		if err != nil {
+			return nil, err
+		}
+		hdr = &BinaryHeaderPayload{
+			ChainID:         chainID,
+			Height:          hHeight,
+			TimeUnixNano:    timeNano,
+			DataHash:        dataHash,
+			AppHash:         appHash,
+			ProposerAddress: propAddr,
+			CommitsRoot:     commitsRoot,
+			ColumnComm:      colComm,
+			Coeffs:          coeffs,
+		}
+	}
+
+	var numTxs uint32
+	if err := binary.Read(r, binary.BigEndian, &numTxs); err != nil {
+		return nil, err
+	}
+	txs := make([]BinaryTxSummary, numTxs)
+	for i := 0; i < int(numTxs); i++ {
+		txHash, err := readString16(r)
+		if err != nil {
+			return nil, err
+		}
+		txKey, err := readString16(r)
+		if err != nil {
+			return nil, err
+		}
+		var offset, numC, sz uint32
+		if err := binary.Read(r, binary.BigEndian, &offset); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(r, binary.BigEndian, &numC); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(r, binary.BigEndian, &sz); err != nil {
+			return nil, err
+		}
+		txs[i] = BinaryTxSummary{
+			Hash:   txHash,
+			Key:    txKey,
+			Offset: int(offset),
+			Cells:  int(numC),
+			Size:   int(sz),
+		}
+	}
+
+	sig, err := readBytes16(r)
+	if err != nil {
+		return nil, err
+	}
+
+	return &BinaryPublishBlockRequest{
+		BlockID:   blockID,
+		Height:    height,
+		K:         int(kVal),
+		Cells:     cells,
+		Header:    hdr,
+		Txs:       txs,
+		Signature: sig,
+	}, nil
+}
