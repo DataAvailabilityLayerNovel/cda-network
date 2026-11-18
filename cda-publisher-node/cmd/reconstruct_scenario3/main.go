@@ -61,7 +61,7 @@ func main() {
 
 	for i := 0; i < k*k; i++ {
 		share := make([]byte, cellSize)
-		cellHash := sha256.Sum256([]byte(fmt.Sprintf("cda-scenario3-cell-%d-%s", i, blockID)))
+		cellHash := sha256.Sum256(fmt.Appendf(nil, "cda-scenario3-cell-%d-%s", i, blockID))
 		copy(share[:32], cellHash[:])
 		copy(share[32:], cellHash[:])
 		originalODSShares[i] = share

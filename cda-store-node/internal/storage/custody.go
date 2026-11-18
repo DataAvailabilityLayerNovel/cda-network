@@ -651,7 +651,7 @@ func (s *CustodyStore) IsComplete(blockID string, colIdx, k int) bool {
 	_ = s.db.View(func(txn *badger.Txn) error {
 		for c := colIdx; c < colIdx+colsPerNetCol; c++ {
 			for r := 0; r < n; r++ {
-				key := []byte(fmt.Sprintf("received_%s_%d_%d", blockID, r, c))
+				key := fmt.Appendf(nil, "received_%s_%d_%d", blockID, r, c)
 				item, err := txn.Get(key)
 				if err != nil {
 					complete = false

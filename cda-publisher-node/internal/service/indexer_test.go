@@ -301,7 +301,7 @@ func TestHandleBlobDownload_FastInMemory(t *testing.T) {
 		_ = txn.Set([]byte("data_key_"+sliceKey0), []byte(sliceKey0+"="+hex.EncodeToString(slice1Bytes)))
 		_ = txn.Set([]byte("data_key_"+sliceKey1), []byte(sliceKey1+"="+hex.EncodeToString(slice2Bytes)))
 		metaBytes, _ := json.Marshal(meta)
-		_ = txn.Set([]byte(fmt.Sprintf("ns_blob_%s_%s", ns, blobID)), metaBytes)
+		_ = txn.Set(fmt.Appendf(nil, "ns_blob_%s_%s", ns, blobID), metaBytes)
 		return nil
 	})
 
@@ -354,7 +354,7 @@ func TestHandleBlobDownload_NativeBlob(t *testing.T) {
 	_ = db.Update(func(txn *badger.Txn) error {
 		_ = txn.Set([]byte("data_key_"+blobKey), []byte(blobKey+"="+hex.EncodeToString(rawContent)))
 		metaBytes, _ := json.Marshal(meta)
-		_ = txn.Set([]byte(fmt.Sprintf("ns_blob_%s_%s", ns, blobID)), metaBytes)
+		_ = txn.Set(fmt.Appendf(nil, "ns_blob_%s_%s", ns, blobID), metaBytes)
 		return nil
 	})
 

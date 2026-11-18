@@ -360,7 +360,7 @@ func (s *APIService) indexBlockTOCAndNamespaces(txn *badger.Txn, blockID string,
 
 	_ = setBadgerJSON(txn, "block_toc_"+blockID, toc)
 	if height > 0 {
-		_ = txn.Set([]byte(fmt.Sprintf("block_toc_height_%d", height)), []byte(blockID))
+		_ = txn.Set(fmt.Appendf(nil, "block_toc_height_%d", height), []byte(blockID))
 	}
 	_ = setBadgerJSON(txn, "ns_all_namespaces", allNamespaces)
 }
@@ -400,7 +400,7 @@ func (s *APIService) handleGetBlockTOC(w http.ResponseWriter, r *http.Request, t
 	_ = s.db.View(func(txn *badger.Txn) error {
 		found = getBadgerJSON(txn, "block_toc_"+blockID, &toc)
 		if !found && height > 0 {
-			if item, err := txn.Get([]byte(fmt.Sprintf("block_toc_height_%d", height))); err == nil {
+			if item, err := txn.Get(fmt.Appendf(nil, "block_toc_height_%d", height)); err == nil {
 				_ = item.Value(func(val []byte) error {
 					blockID = string(val)
 					found = getBadgerJSON(txn, "block_toc_"+blockID, &toc)

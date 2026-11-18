@@ -278,7 +278,7 @@ func (s *APIService) markBlockRejected(blockID string, height int64, reason stri
 		_ = s.db.Update(func(txn *badger.Txn) error {
 			_ = txn.Set([]byte("status_"+blockID), []byte("STATUS_INVALID_REJECTED"))
 			_ = txn.Set([]byte("block_status_"+blockID), []byte("STATUS_INVALID_REJECTED"))
-			_ = txn.Set([]byte(fmt.Sprintf("block_status_height_%d", height)), []byte("STATUS_INVALID_REJECTED"))
+			_ = txn.Set(fmt.Appendf(nil, "block_status_height_%d", height), []byte("STATUS_INVALID_REJECTED"))
 			_ = txn.Set([]byte("reject_reason_"+blockID), []byte(reason))
 			return nil
 		})
@@ -1090,7 +1090,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		wb := s.db.NewWriteBatch()
 		_ = wb.Set([]byte("header_"+headerCopy.BlockID), headerBytes)
 		if height > 0 {
-			_ = wb.Set([]byte(fmt.Sprintf("block_height_%d", height)), []byte(headerCopy.BlockID))
+			_ = wb.Set(fmt.Appendf(nil, "block_height_%d", height), []byte(headerCopy.BlockID))
 		}
 		heightBytes := []byte(strconv.FormatInt(height, 10))
 		for _, tx := range txsCopy {
@@ -1103,7 +1103,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 			}
 			if upperHash != "" {
 				_ = wb.Set([]byte("idx_tx_"+upperHash), heightBytes)
-				_ = wb.Set([]byte(fmt.Sprintf("meta_tx_%s_%s", headerCopy.BlockID, upperHash)), txBytes)
+				_ = wb.Set(fmt.Appendf(nil, "meta_tx_%s_%s", headerCopy.BlockID, upperHash), txBytes)
 				if len(payload) > 0 {
 					_ = wb.Set([]byte("data_tx_"+upperHash), payload)
 				}
@@ -1112,7 +1112,7 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 				_ = wb.Set([]byte("idx_key_"+tx.Key), heightBytes)
 				if upperHash != "" {
 					hashBytes := []byte(upperHash)
-					_ = wb.Set([]byte(fmt.Sprintf("meta_key_%s_%s", headerCopy.BlockID, tx.Key)), hashBytes)
+					_ = wb.Set(fmt.Appendf(nil, "meta_key_%s_%s", headerCopy.BlockID, tx.Key), hashBytes)
 					_ = wb.Set([]byte("key_ref_"+tx.Key), hashBytes)
 				} else if len(payload) > 0 {
 					_ = wb.Set([]byte("data_key_"+tx.Key), payload)
@@ -1357,12 +1357,12 @@ func (s *APIService) indexTransactionsFromRawCells(txn *badger.Txn, blockID stri
 		if eqIdx := strings.IndexByte(str, '='); eqIdx > 0 {
 			txMeta.Key = str[:eqIdx]
 			_ = txn.Set([]byte("idx_key_"+txMeta.Key), []byte(strconv.FormatInt(height, 10)))
-			_ = txn.Set([]byte(fmt.Sprintf("meta_key_%s_%s", blockID, txMeta.Key)), []byte(txHash))
+			_ = txn.Set(fmt.Appendf(nil, "meta_key_%s_%s", blockID, txMeta.Key), []byte(txHash))
 			_ = txn.Set([]byte("key_ref_"+txMeta.Key), []byte(txHash))
 		}
 		metaBytes, _ := json.Marshal(txMeta)
 		_ = txn.Set([]byte("idx_tx_"+txHash), []byte(strconv.FormatInt(height, 10)))
-		_ = txn.Set([]byte(fmt.Sprintf("meta_tx_%s_%s", blockID, txHash)), metaBytes)
+		_ = txn.Set(fmt.Appendf(nil, "meta_tx_%s_%s", blockID, txHash), metaBytes)
 		_ = txn.Set([]byte("data_tx_"+txHash), trimmed)
 		rawSummaries = append(rawSummaries, txMeta)
 	}
@@ -1660,7 +1660,7 @@ func (s *APIService) handleGetTx(w http.ResponseWriter, r *http.Request) {
 
 	if s.db != nil && height > 0 {
 		_ = s.db.View(func(txn *badger.Txn) error {
-			if item, err := txn.Get([]byte(fmt.Sprintf("block_height_%d", height))); err == nil {
+			if item, err := txn.Get(fmt.Appendf(nil, "block_height_%d", height)); err == nil {
 				_ = item.Value(func(val []byte) error {
 					blockID = string(val)
 					return nil
@@ -1671,7 +1671,7 @@ func (s *APIService) handleGetTx(w http.ResponseWriter, r *http.Request) {
 			}
 			lookupHash := txHash
 			if lookupHash == "" && txKey != "" {
-				if item, err := txn.Get([]byte(fmt.Sprintf("meta_key_%s_%s", blockID, txKey))); err == nil {
+				if item, err := txn.Get(fmt.Appendf(nil, "meta_key_%s_%s", blockID, txKey)); err == nil {
 					_ = item.Value(func(val []byte) error {
 						lookupHash = string(val)
 						return nil
@@ -1679,7 +1679,7 @@ func (s *APIService) handleGetTx(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if lookupHash != "" {
-				if item, err := txn.Get([]byte(fmt.Sprintf("meta_tx_%s_%s", blockID, lookupHash))); err == nil {
+				if item, err := txn.Get(fmt.Appendf(nil, "meta_tx_%s_%s", blockID, lookupHash)); err == nil {
 					_ = item.Value(func(val []byte) error {
 						var summary TxSummary
 						if err := json.Unmarshal(val, &summary); err == nil {
