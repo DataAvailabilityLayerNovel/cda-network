@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -53,6 +54,9 @@ type BlobMetadata struct {
 	ReceivedSlices int      `json:"received_slices"`
 	BlockHeights   []int64  `json:"block_heights"`
 	Status         string   `json:"status"` // "UPLOADING", "READY"
+	SignerPubKey   string   `json:"signer_pub_key,omitempty"`
+	SignerAddress  string   `json:"signer_address,omitempty"`
+	SignatureValid bool     `json:"signature_valid,omitempty"`
 	CreatedAt      int64    `json:"created_at"`
 	UpdatedAt      int64    `json:"updated_at"`
 }
@@ -194,6 +198,49 @@ func extractPayloadFromCells(cells [][]byte, offset, numCells, size int) []byte 
 	return bytes.TrimRight(all, "\x00")
 }
 
+// parseSignedCDAPayload splits a raw transaction string (`<key>=<hex_or_raw>[@<pubHex>.<sigHex>]`)
+// into the decoded payload bytes, plus optional verified Ed25519 signer metadata.
+func parseSignedCDAPayload(fullPayload []byte) (decodedData []byte, signerPubHex string, signerAddr string, sigValid bool) {
+	if len(fullPayload) == 0 {
+		return nil, "", "", false
+	}
+	sVal := string(fullPayload)
+	var keyPart string
+	valStr := sVal
+	if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
+		keyPart = sVal[:eqIdx]
+		valStr = sVal[eqIdx+1:]
+	}
+
+	rawValPart := valStr
+	if atIdx := strings.LastIndexByte(valStr, '@'); atIdx > 0 {
+		sigBundle := valStr[atIdx+1:]
+		if dotIdx := strings.IndexByte(sigBundle, '.'); dotIdx > 0 && dotIdx < len(sigBundle)-1 {
+			candPubHex := sigBundle[:dotIdx]
+			candSigHex := sigBundle[dotIdx+1:]
+			pubBytes, errP := hex.DecodeString(candPubHex)
+			sigBytes, errS := hex.DecodeString(candSigHex)
+			if errP == nil && len(pubBytes) == ed25519.PublicKeySize && errS == nil && len(sigBytes) == ed25519.SignatureSize {
+				rawValPart = valStr[:atIdx]
+				signerPubHex = candPubHex
+				sum := sha256.Sum256(pubBytes)
+				signerAddr = "cda1_" + hex.EncodeToString(sum[:8])
+				if keyPart != "" {
+					canonicalMsg := []byte(keyPart + "=" + rawValPart)
+					sigValid = ed25519.Verify(ed25519.PublicKey(pubBytes), canonicalMsg, sigBytes)
+				}
+			}
+		}
+	}
+
+	if dec, err := hex.DecodeString(rawValPart); err == nil && len(dec) > 0 {
+		decodedData = dec
+	} else {
+		decodedData = []byte(rawValPart)
+	}
+	return
+}
+
 // indexBlockTOCAndNamespaces indexes the block transactions into the Block TOC
 // and updates the namespace catalog in BadgerDB.
 func (s *APIService) indexBlockTOCAndNamespaces(txn *badger.Txn, blockID string, height int64, txs []TxSummary, decodedCells [][]byte) {
@@ -214,6 +261,10 @@ func (s *APIService) indexBlockTOCAndNamespaces(txn *badger.Txn, blockID string,
 	for _, ns := range allNamespaces {
 		allNsMap[ns] = true
 	}
+
+	// Track per-namespace blob lists in memory for this block transaction batch
+	nsBlobLists := make(map[string][]string)
+	nsBlobSets := make(map[string]map[string]bool)
 
 	for _, tx := range txs {
 		ns, blobID, kType, seq := ParseCDAKey(tx.Key)
@@ -239,19 +290,19 @@ func (s *APIService) indexBlockTOCAndNamespaces(txn *badger.Txn, blockID string,
 
 		// Namespace catalog tracking
 		if ns != "default" && blobID != "" {
-			// Update namespace blob list
-			var blobList []string
-			getBadgerJSON(txn, "ns_blobs_"+ns, &blobList)
-			hasBlob := false
-			for _, b := range blobList {
-				if b == blobID {
-					hasBlob = true
-					break
+			if _, loaded := nsBlobSets[ns]; !loaded {
+				var blobList []string
+				getBadgerJSON(txn, "ns_blobs_"+ns, &blobList)
+				bSet := make(map[string]bool, len(blobList))
+				for _, b := range blobList {
+					bSet[b] = true
 				}
+				nsBlobLists[ns] = blobList
+				nsBlobSets[ns] = bSet
 			}
-			if !hasBlob {
-				blobList = append(blobList, blobID)
-				_ = setBadgerJSON(txn, "ns_blobs_"+ns, blobList)
+			if !nsBlobSets[ns][blobID] {
+				nsBlobSets[ns][blobID] = true
+				nsBlobLists[ns] = append(nsBlobLists[ns], blobID)
 			}
 
 			// Load or init BlobMetadata
@@ -280,61 +331,63 @@ func (s *APIService) indexBlockTOCAndNamespaces(txn *badger.Txn, blockID string,
 				meta.BlockHeights = append(meta.BlockHeights, height)
 			}
 
-			if kType == "manifest" {
-				payload := extractPayloadFromCells(decodedCells, tx.Offset, tx.Cells, tx.Size)
-				payloadStr := string(payload)
-				if eqIdx := strings.IndexByte(payloadStr, '='); eqIdx >= 0 {
-					valStr := payloadStr[eqIdx+1:]
-					jsonBytes := []byte(valStr)
-					if raw, err := hex.DecodeString(valStr); err == nil && len(raw) > 0 {
-						jsonBytes = raw
-					}
+			payload := extractPayloadFromCells(decodedCells, tx.Offset, tx.Cells, tx.Size)
+			rawData, signerPub, signerAddr, sigValid := parseSignedCDAPayload(payload)
+			if signerPub != "" {
+				meta.SignerPubKey = signerPub
+				meta.SignerAddress = signerAddr
+				meta.SignatureValid = sigValid
+			}
+
+			switch kType {
+			case "manifest":
+				if len(rawData) > 0 {
 					var manifest OnChainManifest
-					if err := json.Unmarshal(jsonBytes, &manifest); err == nil {
-						meta.Filename = manifest.Filename
-						meta.TotalSize = manifest.TotalSize
-						meta.SHA256 = manifest.SHA256
-						meta.TotalChunks = manifest.TotalChunks
-						meta.ChunkSize = manifest.ChunkSize
-						meta.SliceSize = manifest.SliceSize
-						meta.TotalSlices = manifest.TotalSlices
+					if err := json.Unmarshal(rawData, &manifest); err == nil {
+						if manifest.Filename != "" {
+							meta.Filename = manifest.Filename
+						}
+						if manifest.TotalSize > 0 {
+							meta.TotalSize = manifest.TotalSize
+						}
+						if manifest.SHA256 != "" {
+							meta.SHA256 = manifest.SHA256
+						}
+						if manifest.TotalChunks > 0 {
+							meta.TotalChunks = manifest.TotalChunks
+						}
+						if manifest.ChunkSize > 0 {
+							meta.ChunkSize = manifest.ChunkSize
+						}
+						if manifest.SliceSize > 0 {
+							meta.SliceSize = manifest.SliceSize
+						}
+						if manifest.TotalSlices > 0 {
+							meta.TotalSlices = manifest.TotalSlices
+						}
 						if manifest.CreatedAt > 0 {
 							meta.CreatedAt = manifest.CreatedAt
 						}
 					}
 				}
-			} else if kType == "blob" {
+			case "blob":
 				meta.ReceivedSlices = 1
 				if meta.TotalSlices <= 0 {
 					meta.TotalSlices = 1
 				}
 				meta.Status = "READY"
+				if seq != "" && meta.Filename == "" {
+					meta.Filename = seq
+				}
 
-				payload := extractPayloadFromCells(decodedCells, tx.Offset, tx.Cells, tx.Size)
-				if len(payload) > 0 {
-					payloadStr := string(payload)
-					var rawData []byte
-					if eqIdx := strings.IndexByte(payloadStr, '='); eqIdx >= 0 {
-						valStr := payloadStr[eqIdx+1:]
-						if decoded, errDec := hex.DecodeString(valStr); errDec == nil && len(decoded) > 0 {
-							rawData = decoded
-						} else {
-							rawData = []byte(valStr)
-						}
-					} else {
-						if decoded, errDec := hex.DecodeString(payloadStr); errDec == nil && len(decoded) > 0 {
-							rawData = decoded
-						} else {
-							rawData = payload
-						}
-					}
+				if len(rawData) > 0 {
 					meta.TotalSize = int64(len(rawData))
 					sum := sha256.Sum256(rawData)
 					meta.SHA256 = hex.EncodeToString(sum[:])
-				} else if tx.Size > 0 {
+				} else if tx.Size > 0 && meta.TotalSize <= 0 {
 					meta.TotalSize = int64(tx.Size)
 				}
-			} else if kType == "part" {
+			case "part":
 				meta.ReceivedSlices++
 				totalExpected := meta.TotalChunks
 				if totalExpected <= 0 {
@@ -343,7 +396,7 @@ func (s *APIService) indexBlockTOCAndNamespaces(txn *badger.Txn, blockID string,
 				if totalExpected > 0 && meta.ReceivedSlices >= totalExpected {
 					meta.Status = "READY"
 				}
-			} else if kType == "slice" {
+			case "slice":
 				meta.ReceivedSlices++
 			}
 
@@ -352,6 +405,10 @@ func (s *APIService) indexBlockTOCAndNamespaces(txn *badger.Txn, blockID string,
 			}
 			_ = setBadgerJSON(txn, metaKey, meta)
 		}
+	}
+
+	for ns, blobList := range nsBlobLists {
+		_ = setBadgerJSON(txn, "ns_blobs_"+ns, blobList)
 	}
 
 	for ns := range nsSet {
@@ -477,23 +534,16 @@ func (s *APIService) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 								fmt.Sprintf("cda/%s/%s", namespace, bID),
 								fmt.Sprintf("cda/%s/%s/blob", namespace, bID),
 							}
+							if meta.Filename != "" {
+								keysToTry = append(keysToTry, fmt.Sprintf("cda/%s/%s/blob/%s", namespace, bID, meta.Filename))
+							}
 							for _, k := range keysToTry {
 								if val, ok := getPayloadByKey(txn, k); ok {
-									sVal := string(val)
-									var rawBytes []byte
-									if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
-										valStr := sVal[eqIdx+1:]
-										if dec, e := hex.DecodeString(valStr); e == nil && len(dec) > 0 {
-											rawBytes = dec
-										} else {
-											rawBytes = []byte(valStr)
-										}
-									} else {
-										if dec, e := hex.DecodeString(sVal); e == nil && len(dec) > 0 {
-											rawBytes = dec
-										} else {
-											rawBytes = val
-										}
+									rawBytes, signerPub, signerAddr, sigValid := parseSignedCDAPayload(val)
+									if signerPub != "" {
+										meta.SignerPubKey = signerPub
+										meta.SignerAddress = signerAddr
+										meta.SignatureValid = sigValid
 									}
 									if len(rawBytes) > 0 {
 										meta.TotalSize = int64(len(rawBytes))
@@ -527,39 +577,35 @@ func (s *APIService) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 				if err := json.Unmarshal(body, &rpcResp); err == nil {
 					for _, t := range rpcResp.Result.Txs {
 						if decoded, errDec := base64.StdEncoding.DecodeString(t.Tx); errDec == nil {
-							sVal := string(decoded)
-							if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
-								rawHex := sVal[eqIdx+1:]
-								var manifestBytes []byte
-								if mBytes, errHex := hex.DecodeString(rawHex); errHex == nil {
-									manifestBytes = mBytes
-								} else {
-									manifestBytes = []byte(rawHex)
+							manifestBytes, signerPub, signerAddr, sigValid := parseSignedCDAPayload(decoded)
+							var onChain OnChainManifest
+							if errM := json.Unmarshal(manifestBytes, &onChain); errM == nil && onChain.Namespace == namespace {
+								bMeta := BlobMetadata{
+									Namespace:      onChain.Namespace,
+									BlobID:         onChain.BlobID,
+									Filename:       onChain.Filename,
+									TotalSize:      onChain.TotalSize,
+									SHA256:         onChain.SHA256,
+									TotalChunks:    onChain.TotalChunks,
+									ChunkSize:      onChain.ChunkSize,
+									SliceSize:      onChain.SliceSize,
+									TotalSlices:    onChain.TotalSlices,
+									ReceivedSlices: onChain.TotalSlices,
+									Status:         "READY",
+									SignerPubKey:   signerPub,
+									SignerAddress:  signerAddr,
+									SignatureValid: sigValid,
+									CreatedAt:      onChain.CreatedAt,
+									UpdatedAt:      time.Now().Unix(),
 								}
-								var onChain OnChainManifest
-								if errM := json.Unmarshal(manifestBytes, &onChain); errM == nil && onChain.Namespace == namespace {
-									bMeta := BlobMetadata{
-										Namespace:      onChain.Namespace,
-										BlobID:         onChain.BlobID,
-										Filename:       onChain.Filename,
-										TotalSize:      onChain.TotalSize,
-										SHA256:         onChain.SHA256,
-										TotalChunks:    onChain.TotalChunks,
-										ChunkSize:      onChain.ChunkSize,
-										SliceSize:      onChain.SliceSize,
-										TotalSlices:    onChain.TotalSlices,
-										ReceivedSlices: onChain.TotalSlices,
-										Status:         "READY",
-										CreatedAt:      onChain.CreatedAt,
-										UpdatedAt:      time.Now().Unix(),
-									}
-									blobs = append(blobs, bMeta)
-									if s.db != nil {
-										_ = s.db.Update(func(txn *badger.Txn) error {
-											setBadgerJSON(txn, fmt.Sprintf("ns_blob_%s_%s", namespace, onChain.BlobID), bMeta)
-											return nil
-										})
-									}
+								blobs = append(blobs, bMeta)
+								if s.db != nil {
+									s.indexMu.Lock()
+									_ = s.db.Update(func(txn *badger.Txn) error {
+										setBadgerJSON(txn, fmt.Sprintf("ns_blob_%s_%s", namespace, onChain.BlobID), bMeta)
+										return nil
+									})
+									s.indexMu.Unlock()
 								}
 							}
 						}
@@ -604,52 +650,48 @@ func (s *APIService) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 				}
 				if err := json.Unmarshal(body, &rpcResp); err == nil && len(rpcResp.Result.Txs) > 0 {
 					if decoded, errDec := base64.StdEncoding.DecodeString(rpcResp.Result.Txs[0].Tx); errDec == nil {
-						sVal := string(decoded)
-						if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
-							rawHex := sVal[eqIdx+1:]
-							var manifestBytes []byte
-							if mBytes, errHex := hex.DecodeString(rawHex); errHex == nil {
-								manifestBytes = mBytes
-							} else {
-								manifestBytes = []byte(rawHex)
+						manifestBytes, signerPub, signerAddr, sigValid := parseSignedCDAPayload(decoded)
+						var onChain OnChainManifest
+						if errM := json.Unmarshal(manifestBytes, &onChain); errM == nil {
+							meta = BlobMetadata{
+								Namespace:      onChain.Namespace,
+								BlobID:         onChain.BlobID,
+								Filename:       onChain.Filename,
+								TotalSize:      onChain.TotalSize,
+								SHA256:         onChain.SHA256,
+								TotalChunks:    onChain.TotalChunks,
+								ChunkSize:      onChain.ChunkSize,
+								SliceSize:      onChain.SliceSize,
+								TotalSlices:    onChain.TotalSlices,
+								ReceivedSlices: onChain.TotalSlices,
+								Status:         "READY",
+								SignerPubKey:   signerPub,
+								SignerAddress:  signerAddr,
+								SignatureValid: sigValid,
+								CreatedAt:      onChain.CreatedAt,
+								UpdatedAt:      time.Now().Unix(),
 							}
-							var onChain OnChainManifest
-							if errM := json.Unmarshal(manifestBytes, &onChain); errM == nil {
-								meta = BlobMetadata{
-									Namespace:      onChain.Namespace,
-									BlobID:         onChain.BlobID,
-									Filename:       onChain.Filename,
-									TotalSize:      onChain.TotalSize,
-									SHA256:         onChain.SHA256,
-									TotalChunks:    onChain.TotalChunks,
-									ChunkSize:      onChain.ChunkSize,
-									SliceSize:      onChain.SliceSize,
-									TotalSlices:    onChain.TotalSlices,
-									ReceivedSlices: onChain.TotalSlices,
-									Status:         "READY",
-									CreatedAt:      onChain.CreatedAt,
-									UpdatedAt:      time.Now().Unix(),
-								}
-								found = true
-								if s.db != nil {
-									_ = s.db.Update(func(txn *badger.Txn) error {
-										setBadgerJSON(txn, fmt.Sprintf("ns_blob_%s_%s", namespace, blobID), meta)
-										var bIDs []string
-										getBadgerJSON(txn, "ns_blobs_"+namespace, &bIDs)
-										hasB := false
-										for _, id := range bIDs {
-											if id == blobID {
-												hasB = true
-												break
-											}
+							found = true
+							if s.db != nil {
+								s.indexMu.Lock()
+								_ = s.db.Update(func(txn *badger.Txn) error {
+									setBadgerJSON(txn, fmt.Sprintf("ns_blob_%s_%s", namespace, blobID), meta)
+									var bIDs []string
+									getBadgerJSON(txn, "ns_blobs_"+namespace, &bIDs)
+									hasB := false
+									for _, id := range bIDs {
+										if id == blobID {
+											hasB = true
+											break
 										}
-										if !hasB {
-											bIDs = append(bIDs, blobID)
-											setBadgerJSON(txn, "ns_blobs_"+namespace, bIDs)
-										}
-										return nil
-									})
-								}
+									}
+									if !hasB {
+										bIDs = append(bIDs, blobID)
+										setBadgerJSON(txn, "ns_blobs_"+namespace, bIDs)
+									}
+									return nil
+								})
+								s.indexMu.Unlock()
 							}
 						}
 					}
@@ -686,33 +728,23 @@ func (s *APIService) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleBlobDownload streams the reconstructed file data directly to the HTTP client.
-func (s *APIService) handleBlobDownload(w http.ResponseWriter, r *http.Request, meta BlobMetadata) {
-	// 0. Fast Path: Native Single Blob (cda/<ns>/<blobID> OR cda/<ns>/<blobID>/blob)
+func (s *APIService) handleBlobDownload(w http.ResponseWriter, _ *http.Request, meta BlobMetadata) {
+	// 0. Fast Path: Native Single Blob (cda/<ns>/<blobID>, cda/<ns>/<blobID>/blob, OR cda/<ns>/<blobID>/blob/<filename>)
 	keysToTry := []string{
 		fmt.Sprintf("cda/%s/%s", meta.Namespace, meta.BlobID),
 		fmt.Sprintf("cda/%s/%s/blob", meta.Namespace, meta.BlobID),
+	}
+	if meta.Filename != "" {
+		keysToTry = append([]string{fmt.Sprintf("cda/%s/%s/blob/%s", meta.Namespace, meta.BlobID, meta.Filename)}, keysToTry...)
 	}
 	var nativeBlobBytes []byte
 	if s.db != nil {
 		_ = s.db.View(func(txn *badger.Txn) error {
 			for _, bKey := range keysToTry {
 				if val, ok := getPayloadByKey(txn, bKey); ok {
-					sVal := string(val)
-					if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
-						valStr := sVal[eqIdx+1:]
-						if rawBytes, errDec := hex.DecodeString(valStr); errDec == nil && len(rawBytes) > 0 {
-							nativeBlobBytes = rawBytes
-						} else {
-							nativeBlobBytes = []byte(valStr)
-						}
-					} else {
-						if rawBytes, errDec := hex.DecodeString(sVal); errDec == nil && len(rawBytes) > 0 {
-							nativeBlobBytes = rawBytes
-						} else {
-							nativeBlobBytes = val
-						}
-					}
-					if len(nativeBlobBytes) > 0 {
+					rawBytes, _, _, _ := parseSignedCDAPayload(val)
+					if len(rawBytes) > 0 {
+						nativeBlobBytes = rawBytes
 						break
 					}
 				}
@@ -721,10 +753,12 @@ func (s *APIService) handleBlobDownload(w http.ResponseWriter, r *http.Request, 
 		})
 	}
 	if len(nativeBlobBytes) > 0 {
-		w.Header().Set("Content-Type", "application/octet-stream")
-		if meta.Filename != "" {
-			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", meta.Filename))
+		filename := meta.Filename
+		if filename == "" {
+			filename = fmt.Sprintf("%s.bin", meta.BlobID)
 		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
 		w.Header().Set("Content-Length", strconv.Itoa(len(nativeBlobBytes)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(nativeBlobBytes)
@@ -746,30 +780,24 @@ func (s *APIService) handleBlobDownload(w http.ResponseWriter, r *http.Request, 
 						allPartsFound = false
 						return nil
 					}
-					sVal := string(val)
-					if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
-						valStr := sVal[eqIdx+1:]
-						if rawBytes, errDec := hex.DecodeString(valStr); errDec == nil && len(rawBytes) > 0 {
-							partsData[pIdx] = rawBytes
-						} else {
-							partsData[pIdx] = []byte(valStr)
-						}
-					} else {
-						if rawBytes, errDec := hex.DecodeString(sVal); errDec == nil && len(rawBytes) > 0 {
-							partsData[pIdx] = rawBytes
-						} else {
-							partsData[pIdx] = val
-						}
-					}
+					rawBytes, _, _, _ := parseSignedCDAPayload(val)
+					partsData[pIdx] = rawBytes
 				}
 				return nil
 			})
 		}
 		if allPartsFound && len(partsData) > 0 && len(partsData[0]) > 0 {
-			w.Header().Set("Content-Type", "application/octet-stream")
-			if meta.Filename != "" {
-				w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", meta.Filename))
+			filename := meta.Filename
+			if filename == "" {
+				filename = fmt.Sprintf("%s.bin", meta.BlobID)
 			}
+			totalLen := 0
+			for _, p := range partsData {
+				totalLen += len(p)
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+			w.Header().Set("Content-Length", strconv.Itoa(totalLen))
 			w.WriteHeader(http.StatusOK)
 			for _, p := range partsData {
 				_, _ = w.Write(p)
@@ -820,16 +848,9 @@ func (s *APIService) handleBlobDownload(w http.ResponseWriter, r *http.Request, 
 		_ = s.db.View(func(txn *badger.Txn) error {
 			for _, key := range allSliceKeys {
 				if val, ok := getPayloadByKey(txn, key); ok {
-					sVal := string(val)
-					if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
-						hexStr := sVal[eqIdx+1:]
-						if rawBytes, errDec := hex.DecodeString(hexStr); errDec == nil {
-							sliceDataMap[key] = rawBytes
-						}
-					} else {
-						if rawBytes, errDec := hex.DecodeString(sVal); errDec == nil {
-							sliceDataMap[key] = rawBytes
-						}
+					rawBytes, _, _, _ := parseSignedCDAPayload(val)
+					if len(rawBytes) > 0 {
+						sliceDataMap[key] = rawBytes
 					}
 				}
 			}
@@ -869,14 +890,11 @@ func (s *APIService) handleBlobDownload(w http.ResponseWriter, r *http.Request, 
 					}
 					if err := json.Unmarshal(body, &rpcResp); err == nil && len(rpcResp.Result.Txs) > 0 {
 						if decoded, errDec := base64.StdEncoding.DecodeString(rpcResp.Result.Txs[0].Tx); errDec == nil {
-							sVal := string(decoded)
-							if eqIdx := strings.IndexByte(sVal, '='); eqIdx >= 0 {
-								hexStr := sVal[eqIdx+1:]
-								if rawBytes, errDecHex := hex.DecodeString(hexStr); errDecHex == nil {
-									mu.Lock()
-									sliceDataMap[key] = rawBytes
-									mu.Unlock()
-								}
+							rawBytes, _, _, _ := parseSignedCDAPayload(decoded)
+							if len(rawBytes) > 0 {
+								mu.Lock()
+								sliceDataMap[key] = rawBytes
+								mu.Unlock()
 							}
 						}
 					}
@@ -932,11 +950,4 @@ func (s *APIService) handleBlobDownload(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Content-Length", strconv.Itoa(len(assembled)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(assembled)
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

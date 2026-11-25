@@ -61,8 +61,21 @@ type APIService struct {
 	dasTriggeredMu sync.Mutex
 	dasTriggered   map[string]bool
 
+	dasHistoryMu sync.RWMutex
+	dasHistory   []DASSummaryRecord
+
 	blacklistMu      sync.RWMutex
 	blacklistedPeers map[string]time.Time
+}
+
+type DASSummaryRecord struct {
+	BlockID       string `json:"block_id"`
+	Height        int64  `json:"height"`
+	VerifiedCells int    `json:"verified_cells"`
+	TotalSampled  int    `json:"total_sampled"`
+	Success       bool   `json:"success"`
+	DurationMs    int64  `json:"duration_ms"`
+	Timestamp     int64  `json:"timestamp"`
 }
 
 type BlockHeader = p2pcommon.BlockHeader
@@ -317,6 +330,7 @@ func (s *APIService) TriggerAutoDAS(header *BlockHeader, numRandomSamples int) {
 	}
 
 	duration := time.Since(startTime)
+	s.recordDASSummary(blockID, height, verifiedCount, len(results), verifiedCount == len(results), duration.Milliseconds())
 	if verifiedCount == len(results) {
 		log.Printf("[Auto-DAS] [Height: %d] ✅ DAS VERIFIED for %s (%d/%d sampled cells verified in %v)",
 			height, blockID, verifiedCount, len(results), duration)
@@ -332,9 +346,58 @@ func (s *APIService) TriggerAutoDAS(header *BlockHeader, numRandomSamples int) {
 	}
 }
 
+func (s *APIService) recordDASSummary(blockID string, height int64, verifiedCount int, totalSampled int, success bool, durationMs int64) {
+	if height <= 0 {
+		height = int64(p2pcommon.ParseHeightFromBlockID(blockID))
+	}
+	rec := DASSummaryRecord{
+		BlockID:       blockID,
+		Height:        height,
+		VerifiedCells: verifiedCount,
+		TotalSampled:  totalSampled,
+		Success:       success,
+		DurationMs:    durationMs,
+		Timestamp:     time.Now().Unix(),
+	}
+	s.dasHistoryMu.Lock()
+	s.dasHistory = append([]DASSummaryRecord{rec}, s.dasHistory...)
+	if len(s.dasHistory) > 25 {
+		s.dasHistory = s.dasHistory[:25]
+	}
+	s.dasHistoryMu.Unlock()
+}
 
 func (s *APIService) RegisterHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/das/sample/", s.handleDASSample)
+	mux.HandleFunc("/light/status", s.handleLightStatus)
+}
+
+func (s *APIService) handleLightStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	s.headersMu.RLock()
+	headersCount := len(s.headers)
+	s.headersMu.RUnlock()
+
+	s.dasHistoryMu.RLock()
+	histCopy := make([]DASSummaryRecord, len(s.dasHistory))
+	copy(histCopy, s.dasHistory)
+	s.dasHistoryMu.RUnlock()
+
+	peerID := ""
+	if s.host != nil {
+		peerID = s.host.ID().String()
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"peer_id":              peerID,
+		"port":                 s.port,
+		"p2p_port":             s.port + 10000,
+		"num_cols":             s.numCols,
+		"publisher_addr":       s.publisherAddr,
+		"bootstraps":           s.bootstrapsMap,
+		"cached_headers_count": headersCount,
+		"das_history":          histCopy,
+	})
 }
 
 func (s *APIService) handleDASSample(w http.ResponseWriter, r *http.Request) {
@@ -501,22 +564,48 @@ func (s *APIService) handleDASSample(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		for i := 0; i < numSamples; i++ {
-			row := rand.Intn(n)
-			col := activeCols[rand.Intn(len(activeCols))]
-			res := s.sampleCell(blockID, row, col, header)
-			results = append(results, res)
+		// Build unique cell pool across active columns and perform Fisher-Yates partial shuffle
+		var cellPool [][2]int
+		for rIdx := 0; rIdx < n; rIdx++ {
+			for _, cIdx := range activeCols {
+				cellPool = append(cellPool, [2]int{rIdx, cIdx})
+			}
 		}
+		if numSamples > len(cellPool) {
+			numSamples = len(cellPool)
+		}
+		for i := 0; i < numSamples; i++ {
+			j := i + rand.Intn(len(cellPool)-i)
+			cellPool[i], cellPool[j] = cellPool[j], cellPool[i]
+		}
+		targetCells := cellPool[:numSamples]
+
+		results = make([]SampleResult, len(targetCells))
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 16)
+		for idx, cell := range targetCells {
+			wg.Add(1)
+			go func(idx int, r, c int) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				results[idx] = s.sampleCell(blockID, r, c, header)
+			}(idx, cell[0], cell[1])
+		}
+		wg.Wait()
 	}
 
 	// 3. Respond with results
+	verifiedCount := 0
 	allSuccess := true
 	for _, res := range results {
-		if !res.Verified {
+		if res.Verified {
+			verifiedCount++
+		} else {
 			allSuccess = false
-			break
 		}
 	}
+	s.recordDASSummary(blockID, header.Height, verifiedCount, len(results), allSuccess, 0)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(DASResponse{
@@ -1419,7 +1508,7 @@ func (s *APIService) fetchCellDirectly(
 	}
 	var storesToQuery []p2pcommon.PeerInfo
 	if routingInfo.rowCustodyMap != nil {
-		storesToQuery = append(storesToQuery, routingInfo.rowCustodyMap[row%netRows]...)
+		storesToQuery = append(storesToQuery, p2pcommon.GetOrderedCustodyPeersForBlockRow("", blockID, row, netRows, routingInfo.rowCustodyMap)...)
 	}
 	storesToQuery = append(storesToQuery, stores...)
 

@@ -62,6 +62,8 @@ type APIService struct {
 	rejectedBlocksMu     sync.RWMutex
 	rejectedBlocks       map[string]string // blockID -> reason
 	latestRejectedHeight int64
+
+	indexMu sync.Mutex // serializes BadgerDB TOC & Namespace catalog updates to prevent ErrConflict
 }
 
 type HeaderPayload struct {
@@ -332,10 +334,6 @@ func (s *APIService) isNetColActiveForN(colIdx int, n int) bool {
 	return netColNumber < activeCols
 }
 
-func (s *APIService) isNetColActive(colIdx int) bool {
-	return s.isNetColActiveForN(colIdx, 2*s.kVal)
-}
-
 func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload) {
 	s.colReadyMu.Lock()
 	if s.storeReadyMap == nil {
@@ -440,6 +438,11 @@ func (s *APIService) handleStoreReady(payload p2pcommon.GossipStoreReadyPayload)
 	} else if bftQuorumPeers > activePeersInCol {
 		bftQuorumPeers = activePeersInCol
 	}
+	// When multi-node cells exist (activePeersInCol > netRows), cap the peer quorum at bftQuorumRows
+	// so a single heavily populated cell does not skew or block column readiness once >= 2/3 of distinct rows are ready.
+	if activePeersInCol > netRows && bftQuorumPeers > bftQuorumRows {
+		bftQuorumPeers = bftQuorumRows
+	}
 
 	quorumRows := bftQuorumRows
 	quorumPeers := bftQuorumPeers
@@ -535,6 +538,28 @@ func (s *APIService) broadcastBlockReady(blockID string, height int, activeCols 
 		BlockDuration.Observe(duration)
 	}
 	s.colReadyMu.Unlock()
+
+	if duration > 0 && s.db != nil {
+		_ = s.db.Update(func(txn *badger.Txn) error {
+			item, err := txn.Get([]byte("header_" + blockID))
+			if err != nil {
+				return nil
+			}
+			var hdr engine.BlockHeader
+			if err := item.Value(func(val []byte) error {
+				return json.Unmarshal(val, &hdr)
+			}); err == nil {
+				hdr.DADurationSec = duration
+				if hdr.Time.IsZero() || hdr.Time.Year() <= 1 {
+					hdr.Time = startTime.UTC()
+				}
+				if updatedBytes, errM := json.Marshal(&hdr); errM == nil {
+					_ = txn.Set([]byte("header_"+blockID), updatedBytes)
+				}
+			}
+			return nil
+		})
+	}
 
 	odsCells := kVal * kVal
 	edsCells := (2 * kVal) * (2 * kVal)
@@ -1052,8 +1077,10 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		if req.Header.ChainID != "" {
 			header.ChainID = req.Header.ChainID
 		}
-		if !req.Header.Time.IsZero() {
+		if !req.Header.Time.IsZero() && req.Header.Time.Year() > 1 {
 			header.Time = req.Header.Time
+		} else {
+			header.Time = time.Now().UTC()
 		}
 		if req.Header.DataHash != "" {
 			header.DataHash = req.Header.DataHash
@@ -1065,6 +1092,8 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 			header.ProposerAddress = req.Header.ProposerAddress
 		}
 		log.Printf("[Height: %d] [Publisher] SUCCESS: Header verification passed for BlockID %s against BFT consensus!", height, req.BlockID)
+	} else {
+		header.Time = time.Now().UTC()
 	}
 
 	// 3. Immediate ODS Cache & Async WriteBatch Indexing Phase (decoupled from publishMu and P2P in-flight queue)
@@ -1121,16 +1150,25 @@ func (s *APIService) handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = wb.Flush()
 
-		// Async TOC & Namespace catalog indexing outside the hot publish path
+		// Async TOC & Namespace catalog indexing outside the hot publish path,
+		// serialized via indexMu with conflict retry so concurrent blocks never drop TOC or namespace catalog updates.
 		go func(bID string, h int64, txs []TxSummary, rawData []string, cells [][]byte) {
-			_ = s.db.Update(func(txn *badger.Txn) error {
-				if len(txs) > 0 {
-					s.indexBlockTOCAndNamespaces(txn, bID, h, txs, cells)
-				} else if len(rawData) > 0 {
-					s.indexTransactionsFromRawCells(txn, bID, h, rawData)
+			s.indexMu.Lock()
+			defer s.indexMu.Unlock()
+			for attempt := 0; attempt < 3; attempt++ {
+				err := s.db.Update(func(txn *badger.Txn) error {
+					if len(txs) > 0 {
+						s.indexBlockTOCAndNamespaces(txn, bID, h, txs, cells)
+					} else if len(rawData) > 0 {
+						s.indexTransactionsFromRawCells(txn, bID, h, rawData)
+					}
+					return nil
+				})
+				if err == nil {
+					break
 				}
-				return nil
-			})
+				time.Sleep(10 * time.Millisecond)
+			}
 		}(headerCopy.BlockID, height, txsCopy, dataCopy, cellsCopy)
 	}
 

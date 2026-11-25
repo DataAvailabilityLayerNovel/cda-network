@@ -31,3 +31,15 @@ publisher_config_docker.json
 .agents
 
 .scratch
+
+./scripts/__pycache__
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Root compiled binaries
+/bootstrap
+/publisher
+/light
+/main

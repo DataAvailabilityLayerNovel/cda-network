@@ -121,9 +121,10 @@ type Receiver struct {
 	nonCustodyLocked   map[string]bool
 	nonCustodyPending  map[string]nonCustodyPendingCell
 
-	// Track globally subscribed topics to prevent duplicate subscriptions
+	// Track globally subscribed topics to prevent duplicate subscriptions and support unsubscribing
 	subscribedTopicsMu sync.Mutex
 	subscribedTopics   map[string]bool
+	topicSubs          map[string]*pubsub.Subscription
 
 	// Sharded worker queues by cell hash to ensure cell-level ordering and eliminate race conditions
 	workerChans []chan func()
@@ -254,6 +255,7 @@ func NewReceiver(
 		nonCustodyLocked:    make(map[string]bool),
 		nonCustodyPending:   make(map[string]nonCustodyPendingCell),
 		subscribedTopics:    make(map[string]bool),
+		topicSubs:           make(map[string]*pubsub.Subscription),
 		peerContributions:   make(map[string]map[string]int),
 		workerChans:         chans,
 		numWorkers:          nWorkers,
@@ -377,10 +379,10 @@ func (rcv *Receiver) SetRoutingState(rowPeers, colPeers []p2pcommon.PeerInfo, cu
 	}
 }
 
-// evalCustody evaluates whether this Store Node is an assigned Custody Node for data row,
-// whether it retains full rank kPiece pieces (native retention) vs pruning down to 1 (cross-row backup),
-// and the total number M of custody nodes assigned to data row's cell.
-func (rcv *Receiver) evalCustody(row int) (isCustody bool, isNativeRetention bool, numCustodyPeers int) {
+// evalCustodyForBlock evaluates whether this Store Node is an assigned active Custody Node (Primary or Backup)
+// for (blockID, row), whether it retains full rank kPiece pieces (Primary) vs pruning down to 1 (Backup),
+// and the active custody committee size (2 when Primary + Backup exist).
+func (rcv *Receiver) evalCustodyForBlock(blockID string, row int) (isCustody bool, isNativeRetention bool, numCustodyPeers int) {
 	rcv.peersMu.RLock()
 	cmap := rcv.rowCustodyMap
 	netRows := rcv.storesPerCol
@@ -392,11 +394,17 @@ func (rcv *Receiver) evalCustody(row int) (isCustody bool, isNativeRetention boo
 	if netRows <= 0 {
 		netRows = 8
 	}
-	isCustody, isNativeRetention, numCustodyPeers = p2pcommon.EvaluateNodeCustodyForRow(rcv.selfPeerID, rcv.rowIdx, row, netRows, cmap)
-	if isCustody && activeInCol > 0 && activeInCol <= rcv.kPiece {
+	isCustody, isNativeRetention, numCustodyPeers = p2pcommon.EvaluateNodeCustodyForBlockRow(rcv.selfPeerID, rcv.rowIdx, blockID, row, netRows, cmap)
+	// In tiny under-populated columns (< kPiece total nodes in the column), promote Backup to retain kPiece
+	// so the column still holds >= kPiece pieces even if the Primary Custody node leaves.
+	if isCustody && activeInCol > 0 && activeInCol < rcv.kPiece {
 		isNativeRetention = true
 	}
 	return isCustody, isNativeRetention, numCustodyPeers
+}
+
+func (rcv *Receiver) evalCustody(row int) (isCustody bool, isNativeRetention bool, numCustodyPeers int) {
+	return rcv.evalCustodyForBlock("", row)
 }
 
 func (rcv *Receiver) getCustodyNetRows() []int {
@@ -424,7 +432,7 @@ func (rcv *Receiver) getActivePeersInCol() int {
 	return 8
 }
 
-func (rcv *Receiver) getCustodyPeersForRow(row int) []p2pcommon.PeerInfo {
+func (rcv *Receiver) getCustodyPeersForBlockRow(blockID string, row int) []p2pcommon.PeerInfo {
 	rcv.peersMu.RLock()
 	cmap := rcv.rowCustodyMap
 	netRows := rcv.storesPerCol
@@ -433,20 +441,14 @@ func (rcv *Receiver) getCustodyPeersForRow(row int) []p2pcommon.PeerInfo {
 	if netRows <= 0 {
 		netRows = 8
 	}
+	if len(cmap) > 0 {
+		if ordered := p2pcommon.GetOrderedCustodyPeersForBlockRow(rcv.selfPeerID, blockID, row, netRows, cmap); len(ordered) > 0 {
+			return ordered
+		}
+	}
 	targetNetRow := row % netRows
 	if targetNetRow < 0 {
 		targetNetRow += netRows
-	}
-	if len(cmap) > 0 {
-		if peers := cmap[targetNetRow]; len(peers) > 0 {
-			var res []p2pcommon.PeerInfo
-			for _, p := range peers {
-				if p.PeerID != rcv.selfPeerID {
-					res = append(res, p)
-				}
-			}
-			return res
-		}
 	}
 	var fallback []p2pcommon.PeerInfo
 	backupRow := (targetNetRow + 1) % netRows
@@ -460,6 +462,10 @@ func (rcv *Receiver) getCustodyPeersForRow(row int) []p2pcommon.PeerInfo {
 		}
 	}
 	return fallback
+}
+
+func (rcv *Receiver) getCustodyPeersForRow(row int) []p2pcommon.PeerInfo {
+	return rcv.getCustodyPeersForBlockRow("", row)
 }
 
 func (rcv *Receiver) getNetColIdx() int {
@@ -487,6 +493,9 @@ func (rcv *Receiver) subscribeToTopicOnce(ctx context.Context, topicName string,
 	if rcv.subscribedTopics == nil {
 		rcv.subscribedTopics = make(map[string]bool)
 	}
+	if rcv.topicSubs == nil {
+		rcv.topicSubs = make(map[string]*pubsub.Subscription)
+	}
 	if rcv.subscribedTopics[topicName] {
 		rcv.subscribedTopicsMu.Unlock()
 		return
@@ -496,17 +505,34 @@ func (rcv *Receiver) subscribeToTopicOnce(ctx context.Context, topicName string,
 
 	topic, err := rcv.broadcaster.JoinTopic(topicName)
 	if err != nil {
+		rcv.subscribedTopicsMu.Lock()
+		delete(rcv.subscribedTopics, topicName)
+		rcv.subscribedTopicsMu.Unlock()
 		log.Printf("[StoreNode] Failed to join topic %s: %v", topicName, err)
 		return
 	}
 	sub, err := topic.Subscribe(pubsub.WithBufferSize(4096))
 	if err != nil {
+		rcv.subscribedTopicsMu.Lock()
+		delete(rcv.subscribedTopics, topicName)
+		rcv.subscribedTopicsMu.Unlock()
 		log.Printf("[StoreNode] Failed to subscribe to topic %s: %v", topicName, err)
 		return
 	}
+	rcv.subscribedTopicsMu.Lock()
+	rcv.topicSubs[topicName] = sub
+	rcv.subscribedTopicsMu.Unlock()
 	log.Printf("[StoreNode] Subscribed to %s topic %s", logLabel, topicName)
 
 	go func(sub *pubsub.Subscription) {
+		defer func() {
+			rcv.subscribedTopicsMu.Lock()
+			if rcv.topicSubs[topicName] == sub {
+				delete(rcv.topicSubs, topicName)
+				delete(rcv.subscribedTopics, topicName)
+			}
+			rcv.subscribedTopicsMu.Unlock()
+		}()
 		for {
 			msg, err := sub.Next(ctx)
 			if err != nil {
@@ -546,11 +572,26 @@ func (rcv *Receiver) subscribeToTopicOnce(ctx context.Context, topicName string,
 	}(sub)
 }
 
+func (rcv *Receiver) unsubscribeFromTopic(topicName string) {
+	rcv.subscribedTopicsMu.Lock()
+	sub, exists := rcv.topicSubs[topicName]
+	if exists {
+		delete(rcv.topicSubs, topicName)
+		delete(rcv.subscribedTopics, topicName)
+	}
+	rcv.subscribedTopicsMu.Unlock()
+	if exists && sub != nil {
+		sub.Cancel()
+		log.Printf("[StoreNode] Unsubscribed from seed topic %s (relieved of borrowed backup duty)", topicName)
+	}
+}
+
 // subscribeToRowChannels subscribes to:
 // 1. All NetRows recode channels in this column: /cda/1.0.0/col/<netColIdx>/row/<0..netRows-1>/recode
 //    (both Custody Nodes and Non-Custody Nodes receive recoded pieces here).
 // 2. Assigned custody seed channels: /cda/1.0.0/col/<netColIdx>/row/<custodyRow>/seed
-//    (only Custody Nodes assigned to custodyRow receive Bootstrap's 2*kPiece seed pool here).
+//    (only Custody Nodes assigned to custodyRow receive Bootstrap's 2*kPiece seed pool here),
+//    and dynamically unsubscribes from any seed channel for which this node is no longer a custody/backup holder.
 func (rcv *Receiver) subscribeToRowChannels(ctx context.Context) {
 	rcv.peersMu.RLock()
 	netRows := rcv.storesPerCol
@@ -563,9 +604,17 @@ func (rcv *Receiver) subscribeToRowChannels(ctx context.Context) {
 		recodeTopic := p2pcommon.TopicCellRowRecode(netColIdx, r)
 		rcv.subscribeToTopicOnce(ctx, recodeTopic, fmt.Sprintf("network matrix recode channel (col=%d, row=%d)", netColIdx, r))
 	}
+	activeCustodyRows := make(map[int]bool, netRows)
 	for _, custodyRow := range rcv.getCustodyNetRows() {
+		activeCustodyRows[custodyRow] = true
 		seedTopic := p2pcommon.TopicCellRowSeed(netColIdx, custodyRow)
 		rcv.subscribeToTopicOnce(ctx, seedTopic, fmt.Sprintf("network matrix seed channel (col=%d, row=%d)", netColIdx, custodyRow))
+	}
+	for r := 0; r < netRows; r++ {
+		if !activeCustodyRows[r] {
+			seedTopic := p2pcommon.TopicCellRowSeed(netColIdx, r)
+			rcv.unsubscribeFromTopic(seedTopic)
+		}
 	}
 }
 
@@ -753,7 +802,7 @@ func (rcv *Receiver) workerLoop(ctx context.Context, ch chan func()) {
 // shouldDropGossipPiece checks if an incoming piece is for a block that is already complete,
 // or for a cell that is already pruned or non-custody locked.
 func (rcv *Receiver) shouldDropGossipPiece(blockID string, row, col int) bool {
-	isCustody, isNativeRetention, _ := rcv.evalCustody(row)
+	isCustody, isNativeRetention, _ := rcv.evalCustodyForBlock(blockID, row)
 	rcv.completedMu.Lock()
 	if rcv.completedBlocks != nil && rcv.completedBlocks[blockID] {
 		rcv.completedMu.Unlock()
@@ -1313,7 +1362,7 @@ func (rcv *Receiver) verifyAndProcessBinaryBatchWithMode(payload *p2pcommon.Bina
 	var sampledSeeds []p2pcommon.BinarySeedPiece
 	for _, cc := range cellOrder {
 		cellSeeds := seedsByCell[cc]
-		isCustodyCell, isNativeCell, numCustodyPeers := rcv.evalCustody(cc.row)
+		isCustodyCell, isNativeCell, numCustodyPeers := rcv.evalCustodyForBlock(blockID, cc.row)
 		cellKey := fmt.Sprintf("%s_%d_%d", blockID, cc.row, cc.col)
 
 		if !isRecodeBatch {
@@ -1430,7 +1479,7 @@ func (rcv *Receiver) verifyAndProcessBinaryBatchWithMode(payload *p2pcommon.Bina
 		col := int(s.Col)
 		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
 
-		isCustodyEarly, isNativeEarly, _ := rcv.evalCustody(row)
+		isCustodyEarly, isNativeEarly, _ := rcv.evalCustodyForBlock(blockID, row)
 
 		rcv.completedMu.Lock()
 		isBlockCompleted := rcv.completedBlocks != nil && rcv.completedBlocks[blockID]
@@ -1539,7 +1588,7 @@ func (rcv *Receiver) verifyAndProcessBatch(seeds []p2pcommon.SeedCellRequest) {
 
 	for _, s := range seeds {
 		cellKey := fmt.Sprintf("%s_%d_%d", s.BlockID, s.Row, s.Col)
-		isCustodyEarly, isNativeEarly, _ := rcv.evalCustody(s.Row)
+		isCustodyEarly, isNativeEarly, _ := rcv.evalCustodyForBlock(s.BlockID, s.Row)
 
 		rcv.completedMu.Lock()
 		isBlockCompleted := rcv.completedBlocks != nil && rcv.completedBlocks[s.BlockID]
@@ -1714,7 +1763,7 @@ func (rcv *Receiver) ingestVerifiedBatch(blockID string, items []verifiedBatchPi
 		row, col := cc.row, cc.col
 		cellItems := byCell[cc]
 		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
-		isCustody, isNativeRetention, numCustodyPeers := rcv.evalCustody(row)
+		isCustody, isNativeRetention, numCustodyPeers := rcv.evalCustodyForBlock(blockID, row)
 
 		if !isCustody {
 			rcv.nonCustodyLockedMu.Lock()
@@ -1916,7 +1965,7 @@ func (rcv *Receiver) ingestVerifiedBatch(blockID string, items []verifiedBatchPi
 			})
 		}
 
-		if len(updatedPieces) < rcv.kPiece {
+		if (isNativeRetention && len(updatedPieces) < rcv.kPiece) || (!isNativeRetention && len(updatedPieces) < minRecodePieces) {
 			rcv.scheduleActivePull(blockID, row, col, cellKey)
 		}
 	}
@@ -2134,7 +2183,11 @@ func (rcv *Receiver) ingestVerifiedBatch(blockID string, items []verifiedBatchPi
 						if meta.retainedPiece != nil {
 							rcv.cache.StoreRecodedPiece(bID, meta.row, meta.col, *meta.retainedPiece)
 						}
+						rcv.cache.PruneRawPieces(bID, meta.row, meta.col, rcv.rm)
 						rcv.unlockCell(meta.row, meta.col)
+						rcv.pruneMu.Lock()
+						rcv.prunedCells[meta.cellKey] = true
+						rcv.pruneMu.Unlock()
 					}
 				}
 			}
@@ -2179,7 +2232,7 @@ func (rcv *Receiver) scheduleActivePull(blockID string, row, col int, cellKey st
 func (rcv *Receiver) processPiece(blockID string, row, col int, dataStr, coeffsStr, proofStr string, pieceCommitsStr []string, senderPeerID string, isGossip bool) error {
 	cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
 
-	isCustodyEarly, isNativeEarly, _ := rcv.evalCustody(row)
+	isCustodyEarly, isNativeEarly, _ := rcv.evalCustodyForBlock(blockID, row)
 
 	// Early exit 1: drop incoming pieces if this block is already completed and locked
 	rcv.completedMu.Lock()
@@ -2340,9 +2393,9 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string, attempt int) {
 
 	for c := startCol; c < endCol; c++ {
 		for r := 0; r < n; r++ {
-			isCustody, isNativeRetention, _ := rcv.evalCustody(r)
+			isCustody, isNativeRetention, _ := rcv.evalCustodyForBlock(blockID, r)
 			cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
-			rowCustodyPeers := rcv.getCustodyPeersForRow(r)
+			rowCustodyPeers := rcv.getCustodyPeersForBlockRow(blockID, r)
 
 			if isCustody && isNativeRetention {
 				rcv.broadcastMu.Lock()
@@ -2446,7 +2499,7 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string, attempt int) {
 		missingBootstrapBatches := make(map[colRowPair]bool)
 		for c := startCol; c < endCol; c++ {
 			for r := 0; r < n; r++ {
-				isCustody, isNativeRetention, _ := rcv.evalCustody(r)
+				isCustody, isNativeRetention, _ := rcv.evalCustodyForBlock(blockID, r)
 				if !isCustody {
 					continue
 				}
@@ -2454,8 +2507,13 @@ func (rcv *Receiver) fallbackPullMissingCells(blockID string, attempt int) {
 				rcv.pruneMu.Lock()
 				pruned := rcv.prunedCells[cellKey]
 				rcv.pruneMu.Unlock()
-				if !isNativeRetention && pruned {
-					continue
+				if !isNativeRetention {
+					rcv.broadcastMu.Lock()
+					bCount := rcv.cellBroadcastCount[cellKey]
+					rcv.broadcastMu.Unlock()
+					if pruned || bCount >= 1 || rcv.cache.GetPieceCount(blockID, r, c) >= 2 {
+						continue
+					}
 				}
 				if rcv.cache.GetPieceCount(blockID, r, c) < rcv.kPiece {
 					missingBootstrapBatches[colRowPair{col: c, netRow: r % effNetRows}] = true
@@ -2573,7 +2631,7 @@ func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, send
 			col = pList[0].Col
 		}
 
-		isCustody, isNativeRetention, numCustodyPeers := rcv.evalCustody(row)
+		isCustody, isNativeRetention, numCustodyPeers := rcv.evalCustodyForBlock(blockID, row)
 		cellKey := fmt.Sprintf("%s_%d_%d", blockID, row, col)
 
 		if isCustody && isNativeRetention {
@@ -2860,7 +2918,11 @@ func (rcv *Receiver) processBatchFetchPieces(blockID string, senderRow int, send
 				if retained != nil {
 					rcv.cache.StoreRecodedPiece(blockID, job.row, job.col, *retained)
 				}
+				rcv.cache.PruneRawPieces(blockID, job.row, job.col, rcv.rm)
 				rcv.unlockCell(job.row, job.col)
+				rcv.pruneMu.Lock()
+				rcv.prunedCells[job.cellKey] = true
+				rcv.pruneMu.Unlock()
 			}
 		}
 
@@ -3013,9 +3075,9 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 		return
 	}
 
-	// Prioritize assigned Custody Nodes for this row
+	// Prioritize assigned Custody Nodes for this (blockID, row)
 	custodySet := make(map[string]bool)
-	for _, cp := range rcv.getCustodyPeersForRow(row) {
+	for _, cp := range rcv.getCustodyPeersForBlockRow(blockID, row) {
 		custodySet[cp.PeerID] = true
 	}
 	sort.SliceStable(peersCopy, func(i, j int) bool {
@@ -3140,7 +3202,7 @@ func (rcv *Receiver) pullMissingPiecesFromPeers(blockID string, row, col int) {
 	if len(allPieces) >= rcv.kPiece {
 		pieceCommits, _ := rcv.cache.GetAnchoredCommitments(blockID, col)
 		n := rcv.getBlockN(blockID)
-		isPullCustody, isPullNativeRetention, numCustodyPeers := rcv.evalCustody(row)
+		isPullCustody, isPullNativeRetention, numCustodyPeers := rcv.evalCustodyForBlock(blockID, row)
 
 		targetPieces := allPieces
 		if len(targetPieces) > rcv.kPiece {
@@ -3221,7 +3283,7 @@ func (rcv *Receiver) pullNonCustodyPiece(blockID string, row, col int) {
 	}
 	rcv.nonCustodyLockedMu.Unlock()
 
-	custodyPeers := rcv.getCustodyPeersForRow(row)
+	custodyPeers := rcv.getCustodyPeersForBlockRow(blockID, row)
 	if len(custodyPeers) == 0 {
 		return
 	}
@@ -3384,24 +3446,13 @@ func (rcv *Receiver) handleFetchStream(stream network.Stream) {
 		copy(peersCopy, rcv.colPeers)
 		rcv.peersMu.RUnlock()
 
-		// Prioritize honest custody peers for req.Row % effNetRows, then remaining column peers
+		// Prioritize honest active custody peers (Primary first, then Backup) for (req.BlockID, req.Row), then remaining column peers
 		var prioritizedPeers []p2pcommon.PeerInfo
 		seenPID := make(map[string]bool)
-		cmap := rcv.rowCustodyMap
-		if cmap != nil {
-			effNetRows := rcv.kBlock * 2
-			if rcv.numCols > 0 {
-				effNetRows = (rcv.kBlock * 2) / rcv.numCols
-			}
-			if effNetRows <= 0 {
-				effNetRows = 8
-			}
-			custodyPeers := cmap[req.Row%effNetRows]
-			for _, cp := range custodyPeers {
-				if cp.PeerID != "" && cp.PeerID != rcv.selfPeerID && !rcv.IsPeerBlacklisted(cp.PeerID) && !seenPID[cp.PeerID] {
-					seenPID[cp.PeerID] = true
-					prioritizedPeers = append(prioritizedPeers, cp)
-				}
+		for _, cp := range rcv.getCustodyPeersForBlockRow(req.BlockID, req.Row) {
+			if cp.PeerID != "" && cp.PeerID != rcv.selfPeerID && !rcv.IsPeerBlacklisted(cp.PeerID) && !seenPID[cp.PeerID] {
+				seenPID[cp.PeerID] = true
+				prioritizedPeers = append(prioritizedPeers, cp)
 			}
 		}
 		for _, p := range peersCopy {
@@ -3627,7 +3678,7 @@ func (rcv *Receiver) DiagnoseCompletion(blockID string) (bool, map[string]interf
 
 	for c := startCol; c < endCol; c++ {
 		for r := 0; r < n; r++ {
-			isCustody, isNativeRetention, _ := rcv.evalCustody(r)
+			isCustody, isNativeRetention, _ := rcv.evalCustodyForBlock(blockID, r)
 			cellKey := fmt.Sprintf("%s_%d_%d", blockID, r, c)
 			if isCustody && isNativeRetention {
 				// Native custody node (including all M nodes in a multi-node cell):
@@ -3675,6 +3726,57 @@ func (rcv *Receiver) DiagnoseCompletion(blockID string) (bool, map[string]interf
 		"unmet_reasons": unmetReasons,
 	}
 	return len(unmetReasons) == 0, details
+}
+
+// GetNodeInfo returns a snapshot of this Store Node's network matrix coordinates, custody duties, and storage counters.
+func (rcv *Receiver) GetNodeInfo() map[string]interface{} {
+	rcv.peersMu.RLock()
+	netRows := rcv.storesPerCol
+	if netRows <= 0 {
+		netRows = 8
+	}
+	cmap := rcv.rowCustodyMap
+	activeInCol := rcv.activePeersInCol
+	if activeInCol <= 0 {
+		activeInCol = len(rcv.colPeers)
+	}
+	rcv.peersMu.RUnlock()
+
+	normRow := rcv.rowIdx % netRows
+	if normRow < 0 {
+		normRow += netRows
+	}
+	cellPeers := cmap[normRow]
+	cellPeerIDs := make([]string, 0, len(cellPeers))
+	for _, p := range cellPeers {
+		cellPeerIDs = append(cellPeerIDs, p.PeerID)
+	}
+
+	rcv.completedMu.Lock()
+	completedCount := len(rcv.completedBlocks)
+	rcv.completedMu.Unlock()
+
+	return map[string]interface{}{
+		"peer_id":                rcv.selfPeerID,
+		"port":                   rcv.cache.Port(),
+		"p2p_port":               rcv.cache.Port() + 10000,
+		"row_idx":                rcv.rowIdx,
+		"net_row_idx":            normRow,
+		"col_idx":                rcv.colIdx,
+		"net_col_idx":            rcv.getNetColIdx(),
+		"net_rows":               netRows,
+		"num_cols":               rcv.numCols,
+		"k_block":                rcv.kBlock,
+		"k_piece":                rcv.kPiece,
+		"custody_net_rows":       rcv.getCustodyNetRows(),
+		"active_peers_in_col":    activeInCol,
+		"cell_peer_count":        len(cellPeers),
+		"cell_peers":             cellPeerIDs,
+		"total_stored_pieces":    rcv.cache.GetTotalPieceCount(),
+		"custody_pieces":         rcv.cache.GetCustodyPieceCount(netRows, normRow),
+		"recoded_pieces":         rcv.cache.GetRecodedPieceCount(),
+		"completed_blocks_count": completedCount,
+	}
 }
 
 // IsComplete returns true if all custody requirements for blockID are satisfied.
@@ -3924,7 +4026,7 @@ func (rcv *Receiver) doCheckAndLogCompletion(blockID string) {
 
 			for c := startCol; c < endCol; c++ {
 				for r := 0; r < n; r++ {
-					_, isNativeRetention, _ := rcv.evalCustody(r)
+					_, isNativeRetention, _ := rcv.evalCustodyForBlock(bID, r)
 					if isNativeRetention {
 						rcv.lockCell(r, c)
 						rcv.cache.DeleteRecodedPieces(bID, r, c)
@@ -4125,7 +4227,7 @@ func (rcv *Receiver) startPruner(ctx context.Context) {
 					_, err1 := fmt.Sscanf(rowStr, "%d", &row)
 					_, err2 := fmt.Sscanf(colStr, "%d", &col)
 					if err1 == nil && err2 == nil {
-						_, isNativeRetention, _ := rcv.evalCustody(row)
+						_, isNativeRetention, _ := rcv.evalCustodyForBlock(blockID, row)
 						if !isNativeRetention {
 							rcv.pruneMu.Lock()
 							if rcv.prunedCells[key] {

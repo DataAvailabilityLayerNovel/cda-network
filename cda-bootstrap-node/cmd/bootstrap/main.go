@@ -256,6 +256,7 @@ func main() {
 			}
 			var payload p2pcommon.GossipStoreReadyPayload
 			if err := json.Unmarshal(msg.Data, &payload); err == nil {
+				receiver.OnStoreReady(payload)
 				log.Printf("[GossipSub] Bootstrap relayed StoreReady for Col %d Row %d, block %s (height %d) from %s",
 					payload.ColIdx, payload.RowIdx, payload.BlockID, payload.Height, msg.ReceivedFrom)
 			}
@@ -384,6 +385,54 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"blacklisted_peers": blacklist,
 			"count":             len(blacklist),
+		})
+	})
+	mux.HandleFunc("/bootstrap/reputation", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		records := receiver.GetReputationRecords()
+		custodyMap, netRows, activeCount := receiver.GetCustodySummary()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":              "success",
+			"reputation_records":  records,
+			"row_custody_map":     custodyMap,
+			"net_rows":            netRows,
+			"active_peers_in_col": activeCount,
+		})
+	})
+	mux.HandleFunc("/bootstrap/reputation/event", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			PeerID  string `json:"peer_id"`
+			Row     int    `json:"row"`
+			Event   string `json:"event"`
+			BlockID string `json:"block_id"`
+			Count   int    `json:"count"`
+		}
+		req.Row = -1
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		rec, err := receiver.ApplyReputationEvent(req.PeerID, req.Row, req.Event, req.BlockID, req.Count)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "error",
+				"message": err.Error(),
+			})
+			return
+		}
+		custodyMap, netRows, activeCount := receiver.GetCustodySummary()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":              "success",
+			"updated_record":      rec,
+			"row_custody_map":     custodyMap,
+			"net_rows":            netRows,
+			"active_peers_in_col": activeCount,
 		})
 	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

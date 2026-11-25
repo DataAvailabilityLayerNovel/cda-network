@@ -81,6 +81,66 @@ func main() {
 		netCols = 8
 	}
 
+	// Auto-Join Least-Loaded Cell Discovery:
+	// If RowIdx < 0 or ColIdx < 0, query Bootstrap /bootstrap/peers to discover the active column
+	// and assign this Store Node to the network row with the fewest active Store Nodes (Least-Loaded Cell).
+	if cfg.RowIdx < 0 || cfg.ColIdx < 0 {
+		discoveredRow := -1
+		discoveredCol := cfg.ColIdx
+		if cfg.BootstrapAddr != "" && strings.HasPrefix(cfg.BootstrapAddr, "http") {
+			client := &http.Client{Timeout: 1500 * time.Millisecond}
+			resp, err := client.Get(strings.TrimSuffix(cfg.BootstrapAddr, "/") + "/bootstrap/peers")
+			if err == nil {
+				var peerData struct {
+					RowCustodyMap map[string][]p2pcommon.PeerInfo `json:"row_custody_map"`
+					NetRows       int                             `json:"net_rows"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&peerData) == nil {
+					if peerData.NetRows > 0 {
+						netRows = peerData.NetRows
+					}
+					rowCounts := make([]int, netRows)
+					seenPeers := make(map[string]bool)
+					for _, plist := range peerData.RowCustodyMap {
+						for _, p := range plist {
+							if p.PeerID != "" && !seenPeers[p.PeerID] && p.Row >= 0 {
+								seenPeers[p.PeerID] = true
+								r := p.Row % netRows
+								rowCounts[r]++
+								if discoveredCol < 0 && p.Col >= 0 {
+									discoveredCol = p.Col
+								}
+							}
+						}
+					}
+					bestRow := 0
+					bestCount := int(^uint(0) >> 1)
+					startOffset := cfg.Port % netRows
+					for i := 0; i < netRows; i++ {
+						r := (startOffset + i) % netRows
+						if rowCounts[r] < bestCount {
+							bestCount = rowCounts[r]
+							bestRow = r
+						}
+					}
+					discoveredRow = bestRow
+					log.Printf("[Auto-Join Discovery] Selected Least-Loaded Cell: Row=%d (current nodes in cell: %d)", discoveredRow, bestCount)
+				}
+				resp.Body.Close()
+			}
+		}
+		if cfg.ColIdx < 0 {
+			if discoveredCol >= 0 {
+				cfg.ColIdx = discoveredCol
+			} else {
+				cfg.ColIdx = 0
+			}
+		}
+		if cfg.RowIdx < 0 && discoveredRow >= 0 {
+			cfg.RowIdx = discoveredRow
+		}
+	}
+
 	if privKey == nil {
 		if cfg.RowIdx >= 0 && cfg.ColIdx >= 0 {
 			// Targeted cell key generation (supports multiple nodes in the same cell via instanceID)
@@ -144,6 +204,10 @@ func main() {
 
 	// Expose HTTP server for local status check and health endpoint
 	mux := http.NewServeMux()
+	mux.HandleFunc("/store/info", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(receiver.GetNodeInfo())
+	})
 	mux.HandleFunc("/store/status/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		bID := r.URL.Path[len("/store/status/"):]

@@ -77,6 +77,9 @@ type Receiver struct {
 	// Byzantine Blacklist & Peer Isolation
 	blacklistMu      sync.RWMutex
 	blacklistedPeers map[peer.ID]time.Time
+
+	// Contention-Safe Node Trust & Reputation Engine
+	repEngine *p2pcommon.ReputationEngine
 }
 
 type pendingBlockBatch struct {
@@ -134,6 +137,16 @@ func NewReceiver(
 	// Connect broadcaster back to registry
 	broadcaster.SetRegistry(rcv)
 
+	rcv.repEngine = p2pcommon.NewReputationEngine(func(rec p2pcommon.PeerReputationRecord) {
+		if rcv.db != nil && rec.PeerID != "" {
+			if valData, err := json.Marshal(rec); err == nil {
+				_ = rcv.db.Update(func(txn *badger.Txn) error {
+					return txn.Set([]byte("rep_"+rec.PeerID), valData)
+				})
+			}
+		}
+	})
+
 	if colID >= 0 {
 		baseDir := fmt.Sprintf("data/bootstrap_%d", colID)
 		dbPath := filepath.Join(baseDir, "badger")
@@ -145,6 +158,24 @@ func NewReceiver(
 			panic(fmt.Sprintf("failed to open badger db on bootstrap: %v", err))
 		}
 		rcv.db = db
+
+		// Load persisted reputation records from BadgerDB first
+		_ = db.View(func(txn *badger.Txn) error {
+			opts := badger.DefaultIteratorOptions
+			it := txn.NewIterator(opts)
+			defer it.Close()
+			prefix := []byte("rep_")
+			for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+				_ = it.Item().Value(func(val []byte) error {
+					var rec p2pcommon.PeerReputationRecord
+					if err := json.Unmarshal(val, &rec); err == nil && rec.PeerID != "" {
+						rcv.repEngine.LoadRecord(rec)
+					}
+					return nil
+				})
+			}
+			return nil
+		})
 
 		// Load active peers from BadgerDB
 		_ = db.View(func(txn *badger.Txn) error {
@@ -163,6 +194,7 @@ func NewReceiver(
 				_ = item.Value(func(val []byte) error {
 					var info p2pcommon.PeerInfo
 					if err := json.Unmarshal(val, &info); err == nil {
+						info = rcv.repEngine.EnsurePeer(info)
 						rcv.activePeers[pid] = info
 						rcv.lastSeenPeer[pid] = time.Now() // Give peerTTL to re-register
 					}
@@ -338,6 +370,9 @@ func (rcv *Receiver) getCustodySnapshot() (map[int][]p2pcommon.PeerInfo, int, in
 	}
 	var allPeers []p2pcommon.PeerInfo
 	for _, info := range rcv.activePeers {
+		if rcv.repEngine != nil {
+			info = rcv.repEngine.EnsurePeer(info)
+		}
 		allPeers = append(allPeers, info)
 	}
 	activeStores := p2pcommon.GetActiveColumnStores(allPeers)
@@ -879,6 +914,9 @@ func (rcv *Receiver) handleRouting(stream network.Stream) {
 			return
 		}
 
+		if rcv.repEngine != nil {
+			req.Peer = rcv.repEngine.EnsurePeer(req.Peer)
+		}
 		if rcv.db != nil {
 			valData, _ := json.Marshal(req.Peer)
 			_ = rcv.db.Update(func(txn *badger.Txn) error {
@@ -895,6 +933,10 @@ func (rcv *Receiver) handleRouting(stream network.Stream) {
 	var allStorePeers []p2pcommon.PeerInfo
 
 	for p, info := range rcv.activePeers {
+		if rcv.repEngine != nil {
+			info = rcv.repEngine.EnsurePeer(info)
+			rcv.activePeers[p] = info
+		}
 		if info.Row >= 0 {
 			allStorePeers = append(allStorePeers, info)
 		}
@@ -1122,6 +1164,9 @@ func (rcv *Receiver) VerifyAndHandleByzantineReport(report p2pcommon.ByzantineNo
 	if err != nil {
 		// If combining fails (e.g. invalid coeffs length), the piece served by reportedPID is genuinely invalid!
 		log.Printf("[Byzantine] Combine piece commitments failed for reported peer %s: %v. Confirming byzantine fault.", reportedPID, err)
+		if rcv.repEngine != nil {
+			rcv.repEngine.RecordEvent(reportedPID.String(), p2pcommon.RepEventByzantineFault, report.BlockID, 1)
+		}
 		rcv.BlacklistPeer(reportedPID, 24*time.Hour, fmt.Sprintf("invalid coefficients/commitments format: %v", err))
 		return true, nil
 	}
@@ -1144,6 +1189,9 @@ func (rcv *Receiver) VerifyAndHandleByzantineReport(report p2pcommon.ByzantineNo
 		// Piece is genuinely INVALID! Accusation is TRUE!
 		log.Printf("[Byzantine Report VERIFIED] Peer %s distributed corrupted piece for block %s cell [%d, %d]! Isolating peer.",
 			reportedPID, report.BlockID, report.Row, report.Col)
+		if rcv.repEngine != nil {
+			rcv.repEngine.RecordEvent(reportedPID.String(), p2pcommon.RepEventByzantineFault, report.BlockID, 1)
+		}
 		rcv.BlacklistPeer(reportedPID, 2*time.Minute, fmt.Sprintf("distributed invalid piece for block %s cell [%d, %d] (reason: %s)", report.BlockID, report.Row, report.Col, report.Reason))
 		return true, nil
 	}
@@ -1151,7 +1199,88 @@ func (rcv *Receiver) VerifyAndHandleByzantineReport(report p2pcommon.ByzantineNo
 	// Piece is actually VALID! Reporter attempted a FALSE ACCUSATION (Griefing Attack)!
 	log.Printf("[Byzantine Report REJECTED - GRIEFING DETECTED] Reporter %s falsely accused peer %s for valid piece on block %s cell [%d, %d]! Isolating reporter.",
 		reporterPID, reportedPID, report.BlockID, report.Row, report.Col)
+	if rcv.repEngine != nil {
+		rcv.repEngine.RecordEvent(reporterPID.String(), p2pcommon.RepEventGriefingFault, report.BlockID, 1)
+	}
 	rcv.BlacklistPeer(reporterPID, 2*time.Minute, fmt.Sprintf("false accusation/griefing against peer %s on block %s cell [%d, %d]", reportedPID, report.BlockID, report.Row, report.Col))
 	return false, nil
+}
+
+// OnStoreReady records a Store Node's custody completion signal in the ReputationEngine.
+// Even if StoreReady arrives after the 2/3 BlockReady threshold due to single-machine CPU contention,
+// the peer is credited (+2.0) and any straggler miss for that block is automatically forgiven.
+func (rcv *Receiver) OnStoreReady(payload p2pcommon.GossipStoreReadyPayload) {
+	if rcv.repEngine == nil {
+		return
+	}
+	peerID := payload.PeerID
+	if peerID == "" {
+		rcv.peersMu.RLock()
+		for _, info := range rcv.activePeers {
+			if info.Row == payload.RowIdx {
+				peerID = info.PeerID
+				break
+			}
+		}
+		rcv.peersMu.RUnlock()
+	}
+	if peerID != "" {
+		rcv.repEngine.RecordBlockCompleted(peerID, payload.BlockID, payload.RowIdx, payload.ColIdx)
+	}
+}
+
+// GetReputationRecords returns all tracked Store Node reputation records enriched with current active status.
+func (rcv *Receiver) GetReputationRecords() []p2pcommon.PeerReputationRecord {
+	if rcv.repEngine == nil {
+		return nil
+	}
+	rcv.peersMu.RLock()
+	for _, info := range rcv.activePeers {
+		rcv.repEngine.EnsurePeer(info)
+	}
+	rcv.peersMu.RUnlock()
+	return rcv.repEngine.GetAllRecords()
+}
+
+// ApplyReputationEvent applies a reputation event (or simulated batch of events) to a target peer (matched by PeerID prefix or row).
+func (rcv *Receiver) ApplyReputationEvent(peerQuery string, targetRow int, eventType string, blockID string, count int) (p2pcommon.PeerReputationRecord, error) {
+	if rcv.repEngine == nil {
+		return p2pcommon.PeerReputationRecord{}, fmt.Errorf("reputation engine not initialized")
+	}
+	resolvedPeerID := ""
+	rcv.peersMu.RLock()
+	for _, info := range rcv.activePeers {
+		if peerQuery != "" && (info.PeerID == peerQuery || strings.Contains(info.PeerID, peerQuery)) {
+			resolvedPeerID = info.PeerID
+			break
+		}
+		if peerQuery == "" && targetRow >= 0 && info.Row == targetRow {
+			resolvedPeerID = info.PeerID
+			break
+		}
+	}
+	rcv.peersMu.RUnlock()
+
+	if resolvedPeerID == "" {
+		if peerQuery != "" {
+			resolvedPeerID = peerQuery
+		} else {
+			return p2pcommon.PeerReputationRecord{}, fmt.Errorf("no matching peer found for query=%q row=%d", peerQuery, targetRow)
+		}
+	}
+
+	rec := rcv.repEngine.RecordEvent(resolvedPeerID, eventType, blockID, count)
+	if rec.TrustTier == p2pcommon.TrustTierQuarantined {
+		if pid, err := peer.Decode(resolvedPeerID); err == nil {
+			rcv.BlacklistPeer(pid, 2*time.Minute, fmt.Sprintf("reputation quarantined via event %s", eventType))
+		}
+	} else if eventType == p2pcommon.RepEventManualReset {
+		if pid, err := peer.Decode(resolvedPeerID); err == nil {
+			rcv.blacklistMu.Lock()
+			delete(rcv.blacklistedPeers, pid)
+			rcv.blacklistMu.Unlock()
+		}
+	}
+	return rec, nil
 }
 

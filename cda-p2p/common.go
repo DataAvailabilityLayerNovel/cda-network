@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strconv"
 	"strings"
@@ -199,12 +200,17 @@ func TopicNode(peerID string) string {
 	return fmt.Sprintf("/cda/1.0.0/node/%s", peerID)
 }
 
-// PeerInfo wraps Peer ID and Multiaddrs
+// PeerInfo wraps Peer ID, Multiaddrs, Matrix Coordinates, and Node Reputation Metadata
 type PeerInfo struct {
-	PeerID     string   `json:"peer_id"`
-	Multiaddrs []string `json:"multiaddrs"`
-	Row        int      `json:"row"`
-	Col        int      `json:"col"`
+	PeerID          string   `json:"peer_id"`
+	Multiaddrs      []string `json:"multiaddrs"`
+	Row             int      `json:"row"`
+	Col             int      `json:"col"`
+	TrustScore      float64  `json:"trust_score,omitempty"`
+	TrustTier       string   `json:"trust_tier,omitempty"`
+	BlocksCompleted int      `json:"blocks_completed,omitempty"`
+	BlocksMissed    int      `json:"blocks_missed,omitempty"`
+	FaultCount      int      `json:"fault_count,omitempty"`
 }
 
 // BootstrapRoutingRequest payload for Discovery Stream
@@ -224,13 +230,22 @@ type BootstrapRoutingResponse struct {
 	ActivePeersInCol int                `json:"active_peers_in_col,omitempty"`
 }
 
-// GetActiveColumnStores filters and deduplicates valid Store Node peers (Row >= 0),
-// sorted deterministically by (Row, PeerID).
+// GetActiveColumnStores filters and deduplicates valid non-quarantined Store Node peers (Row >= 0),
+// sorted deterministically by (Row, TrustScore DESC, PeerID).
 func GetActiveColumnStores(colPeers []PeerInfo) []PeerInfo {
 	seen := make(map[string]bool, len(colPeers))
 	var active []PeerInfo
 	for _, p := range colPeers {
 		if p.Row >= 0 && p.PeerID != "" && !seen[p.PeerID] {
+			if p.TrustTier == TrustTierQuarantined || (p.TrustTier != "" && EffectiveTrustScore(p) < ThresholdProbation) {
+				continue
+			}
+			if p.TrustScore <= 0 && p.TrustTier == "" {
+				p.TrustScore = DefaultInitialTrustScore
+				p.TrustTier = TrustTierStandard
+			} else if p.TrustTier == "" {
+				p.TrustTier = ClassifyTrustTier(p.TrustScore)
+			}
 			seen[p.PeerID] = true
 			active = append(active, p)
 		}
@@ -239,18 +254,27 @@ func GetActiveColumnStores(colPeers []PeerInfo) []PeerInfo {
 		if active[i].Row != active[j].Row {
 			return active[i].Row < active[j].Row
 		}
+		si := EffectiveTrustScore(active[i])
+		sj := EffectiveTrustScore(active[j])
+		if si != sj {
+			return si > sj
+		}
 		return active[i].PeerID < active[j].PeerID
 	})
 	return active
 }
 
 // ComputeColumnCustodyMap deterministically computes the Custody Store Nodes assigned to each
-// network row netRow in [0, netRows-1] for a given column's active store peers:
-//  1. If cell (netRow, netCol) has >= 2 store nodes: all M store nodes in that cell are active Custody Nodes.
-//  2. If cell (netRow, netCol) has == 1 store node: that node is the primary custody node, and 1 additional
-//     store node is borrowed from the next active row in the column so M_effective = 2.
-//  3. If cell (netRow, netCol) has == 0 store nodes (empty/left): up to 2 store nodes are borrowed from
-//     subsequent active rows in the column so no data row is ever orphaned.
+// network row netRow in [0, netRows-1] for a given column's active store peers, taking into account
+// each node's TrustScore and TrustTier:
+//  1. If cell (netRow, netCol) has >= 2 store nodes with at least 1 healthy node (score >= 40.0):
+//     all M store nodes in that cell form the cell's custody pool (if all M nodes in the cell are in PROBATION,
+//     1 healthy node from another row is also borrowed as co-custody safety guardian).
+//  2. If cell (netRow, netCol) has == 1 store node: that node is included, and 1 additional healthy store node
+//     is borrowed from another active row (prioritizing TRUSTED/STANDARD nodes from surplus cells M >= 2,
+//     lowest borrowCount, and highest TrustScore). If the sole native node is in PROBATION (score < 40.0),
+//     the borrowed healthy node is promoted to co-Primary retention so the cell never relies solely on a PROBATION node.
+//  3. If cell (netRow, netCol) has == 0 store nodes (empty/left): up to 2 distinct healthy store nodes are borrowed.
 func ComputeColumnCustodyMap(colPeers []PeerInfo, netRows int) map[int][]PeerInfo {
 	if netRows <= 0 {
 		netRows = 8
@@ -270,57 +294,227 @@ func ComputeColumnCustodyMap(colPeers []PeerInfo, netRows int) map[int][]PeerInf
 		grouped[r] = append(grouped[r], p)
 	}
 
+	borrowCount := make(map[string]int, len(active))
+
+	// pickBestBorrowedPeer selects a backup peer not in usedPeerIDs, prioritizing:
+	// 1. Healthy eligibility (TrustScore >= 40.0, i.e., TRUSTED or STANDARD over PROBATION).
+	// 2. Peers from surplus multi-node cells (len(grouped[candRow]) >= 2) over single-node cells.
+	// 3. Peers with the lowest borrowCount so backup load is spread evenly across the column.
+	// 4. Peers with the highest TrustScore.
+	// 5. Deterministic circular row distance offset = 1..netRows-1 from targetRow.
+	pickBestBorrowedPeer := func(targetRow int, usedPeerIDs map[string]bool) (PeerInfo, bool) {
+		var bestPeer PeerInfo
+		found := false
+		bestHealthy := -1
+		bestSurplus := -1
+		bestBorrows := int(^uint(0) >> 1)
+		bestScore := -1.0
+
+		for offset := 1; offset < netRows; offset++ {
+			candRow := (targetRow + offset) % netRows
+			candPeers := grouped[candRow]
+			if len(candPeers) == 0 {
+				continue
+			}
+			surplusTier := 0
+			if len(candPeers) >= 2 {
+				surplusTier = 1
+			}
+			startIdx := 0
+			if len(candPeers) > 1 {
+				startIdx = (targetRow + offset) % len(candPeers)
+			}
+			for i := 0; i < len(candPeers); i++ {
+				cand := candPeers[(startIdx+i)%len(candPeers)]
+				if usedPeerIDs[cand.PeerID] {
+					continue
+				}
+				healthyTier := 0
+				if IsEligibleForPrimaryCustody(cand) {
+					healthyTier = 1
+				}
+				bCount := borrowCount[cand.PeerID]
+				cScore := EffectiveTrustScore(cand)
+
+				better := false
+				if !found {
+					better = true
+				} else if healthyTier != bestHealthy {
+					better = healthyTier > bestHealthy
+				} else if surplusTier != bestSurplus {
+					better = surplusTier > bestSurplus
+				} else if bCount != bestBorrows {
+					better = bCount < bestBorrows
+				} else if cScore != bestScore {
+					better = cScore > bestScore
+				}
+
+				if better {
+					bestPeer = cand
+					found = true
+					bestHealthy = healthyTier
+					bestSurplus = surplusTier
+					bestBorrows = bCount
+					bestScore = cScore
+				}
+			}
+		}
+		return bestPeer, found
+	}
+
 	for targetRow := 0; targetRow < netRows; targetRow++ {
 		cellPeers := grouped[targetRow]
 		if len(cellPeers) >= 2 {
 			assigned := make([]PeerInfo, len(cellPeers))
 			copy(assigned, cellPeers)
+			// Check if at least one native peer in the cell is healthy (score >= 40.0).
+			// If all native peers in the cell are in PROBATION, borrow 1 healthy guardian from another row.
+			hasHealthyNative := false
+			used := make(map[string]bool, len(assigned))
+			for _, p := range assigned {
+				used[p.PeerID] = true
+				if IsEligibleForPrimaryCustody(p) {
+					hasHealthyNative = true
+				}
+			}
+			if !hasHealthyNative {
+				if borrowed, ok := pickBestBorrowedPeer(targetRow, used); ok && IsEligibleForPrimaryCustody(borrowed) {
+					assigned = append([]PeerInfo{borrowed}, assigned...)
+					borrowCount[borrowed.PeerID]++
+				}
+			}
 			custodyMap[targetRow] = assigned
 			continue
 		}
 
 		if len(cellPeers) == 1 {
 			assigned := []PeerInfo{cellPeers[0]}
-			// Borrow 1 additional peer from the next available row in the column
-			// Note: in legacy 1-node-per-cell mode, row r was backed up by rowIdx = (r + 1) % netRows.
-			for offset := 1; offset < netRows; offset++ {
-				candRow := (targetRow + offset) % netRows
-				candPeers := grouped[candRow]
-				if len(candPeers) > 0 {
-					// If candRow has multiple nodes, pick a secondary node to balance load; otherwise pick candPeers[0]
-					pickIdx := 0
-					if len(candPeers) > 1 {
-						pickIdx = (targetRow + offset) % len(candPeers)
-					}
-					if candPeers[pickIdx].PeerID != assigned[0].PeerID {
-						assigned = append(assigned, candPeers[pickIdx])
-						break
-					}
-				}
+			used := map[string]bool{cellPeers[0].PeerID: true}
+			if borrowed, ok := pickBestBorrowedPeer(targetRow, used); ok {
+				assigned = append(assigned, borrowed)
+				borrowCount[borrowed.PeerID]++
 			}
 			custodyMap[targetRow] = assigned
 			continue
 		}
 
-		// len(cellPeers) == 0: borrow up to 2 distinct peers from subsequent active rows
+		// len(cellPeers) == 0: borrow up to 2 distinct peers from active rows
 		var assigned []PeerInfo
 		used := make(map[string]bool)
-		for offset := 1; offset < netRows && len(assigned) < 2; offset++ {
-			candRow := (targetRow + offset) % netRows
-			for _, p := range grouped[candRow] {
-				if !used[p.PeerID] {
-					used[p.PeerID] = true
-					assigned = append(assigned, p)
-					if len(assigned) >= 2 {
-						break
-					}
-				}
+		for len(assigned) < 2 {
+			borrowed, ok := pickBestBorrowedPeer(targetRow, used)
+			if !ok {
+				break
 			}
+			used[borrowed.PeerID] = true
+			assigned = append(assigned, borrowed)
+			borrowCount[borrowed.PeerID]++
 		}
 		custodyMap[targetRow] = assigned
 	}
 
 	return custodyMap
+}
+
+// DeterministicCustodyOffset computes a deterministic rotation index for (blockID, targetNetRow, subRowIdx).
+// Within a given blockID and targetNetRow, consecutive sub-rows (subRowIdx = dataRow / netRows = 0, 1, 2...)
+// increment the offset by +1, guaranteeing strict round-robin striping across all M nodes in the cell.
+// Across different blockIDs, the starting offset rotates deterministically via FNV-1a.
+func DeterministicCustodyOffset(blockID string, targetNetRow int, subRowIdx int) uint64 {
+	if subRowIdx < 0 {
+		subRowIdx = 0
+	}
+	if blockID == "" {
+		return uint64(subRowIdx)
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(blockID))
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], uint32(targetNetRow))
+	_, _ = h.Write(buf[:])
+	baseOffset := h.Sum64() % 1048576
+	return baseOffset + uint64(subRowIdx)
+}
+
+// SelectActiveCustodyPairForBlockRow deterministically selects the active (Primary, Backup) custody pair
+// for a specific (blockID, dataRow) from custodyMap[dataRow % netRows], factoring in Node Reputation Tiers:
+//   - Only healthy peers (TRUSTED or STANDARD, TrustScore >= 40.0) are eligible for Primary Custody when
+//     at least one healthy peer exists in the cell's custody pool.
+//   - If a cell has >= 2 healthy peers, (Primary, Backup) are striped across the healthy peers, while any
+//     PROBATION peer (20.0 <= TrustScore < 40.0) in that cell serves as lightweight Non-Custody (1 piece)
+//     and continues earning +2.0/block until it recovers to STANDARD.
+//   - If a single-node cell's native peer drops to PROBATION (< 40.0), its healthy borrowed backup peer is
+//     promoted to co-retain kPiece pieces alongside it so no cell ever depends solely on a PROBATION node.
+func SelectActiveCustodyPairForBlockRow(blockID string, dataRow int, netRows int, custodyMap map[int][]PeerInfo) (primary *PeerInfo, backup *PeerInfo, activeCommitteeSize int) {
+	if netRows <= 0 {
+		netRows = 8
+	}
+	targetNetRow := dataRow % netRows
+	if targetNetRow < 0 {
+		targetNetRow += netRows
+	}
+	assigned := custodyMap[targetNetRow]
+	if len(assigned) == 0 {
+		return nil, nil, 0
+	}
+	if len(assigned) == 1 {
+		p0 := assigned[0]
+		return &p0, nil, 1
+	}
+
+	// Case 1: Single native peer (assigned[0]) + 1 cross-row borrowed backup (assigned[1])
+	p0NetRow := assigned[0].Row % netRows
+	if p0NetRow < 0 {
+		p0NetRow += netRows
+	}
+	p1NetRow := assigned[1].Row % netRows
+	if p1NetRow < 0 {
+		p1NetRow += netRows
+	}
+	if len(assigned) == 2 && p0NetRow == targetNetRow && p1NetRow != targetNetRow {
+		p0 := assigned[0]
+		p1 := assigned[1]
+		return &p0, &p1, 2
+	}
+
+	// Case 2: Multi-node cell (M >= 2) or empty cell with 2 borrowed peers.
+	// Partition into healthy peers (score >= 40.0) and probation peers (20.0 <= score < 40.0).
+	var healthyPool []PeerInfo
+	var probationPool []PeerInfo
+	for _, p := range assigned {
+		if IsEligibleForPrimaryCustody(p) {
+			healthyPool = append(healthyPool, p)
+		} else {
+			probationPool = append(probationPool, p)
+		}
+	}
+
+	subRowIdx := dataRow / netRows
+	if subRowIdx < 0 {
+		subRowIdx = 0
+	}
+	rot := DeterministicCustodyOffset(blockID, targetNetRow, subRowIdx)
+
+	if len(healthyPool) >= 2 {
+		primaryIdx := int(rot % uint64(len(healthyPool)))
+		backupIdx := (primaryIdx + 1) % len(healthyPool)
+		pPrimary := healthyPool[primaryIdx]
+		pBackup := healthyPool[backupIdx]
+		return &pPrimary, &pBackup, 2
+	}
+	if len(healthyPool) == 1 && len(probationPool) >= 1 {
+		pPrimary := healthyPool[0]
+		bIdx := int(rot % uint64(len(probationPool)))
+		pBackup := probationPool[bIdx]
+		return &pPrimary, &pBackup, 2
+	}
+
+	// Fallback if all peers in assigned are in probationPool
+	primaryIdx := int(rot % uint64(len(assigned)))
+	backupIdx := (primaryIdx + 1) % len(assigned)
+	pPrimary := assigned[primaryIdx]
+	pBackup := assigned[backupIdx]
+	return &pPrimary, &pBackup, 2
 }
 
 // ComputeSeedingPlan returns:
@@ -350,11 +544,12 @@ func ComputeSeedingPlan(numCustodyPeers int, kPiece int) (totalSeeds int, seedsP
 	return totalSeeds, seedsPerPeer, recodesPerPeer
 }
 
-// EvaluateNodeCustodyForRow checks a Store Node's custody role for dataRow given custodyMap:
-// - isCustody: true if selfPeerID is assigned in custodyMap[dataRow % netRows]
-// - isNativeRetention: true if this node retains all kPiece raw pieces long-term (native cell member, or first borrowed holder when cell is empty)
-// - numCustodyPeers: M (number of custody peers assigned to this cell)
-func EvaluateNodeCustodyForRow(selfPeerID string, selfNetRow int, dataRow int, netRows int, custodyMap map[int][]PeerInfo) (isCustody bool, isNativeRetention bool, numCustodyPeers int) {
+// EvaluateNodeCustodyForBlockRow checks a Store Node's dynamic custody role for (blockID, dataRow):
+//   - isCustody: true if selfPeerID is selected as either the Primary Custody Node or Backup Custody Node for (blockID, dataRow)
+//   - isNativeRetention: true if selfPeerID is the Primary Custody Node for (blockID, dataRow), OR if the Primary Custody Node
+//     is in PROBATION (< 40.0) and selfPeerID is the healthy Backup guardian co-retaining kPiece pieces.
+//   - numCustodyPeers: active custody committee size for this dataRow (2 when Primary + Backup exist, 1 if single node)
+func EvaluateNodeCustodyForBlockRow(selfPeerID string, selfNetRow int, blockID string, dataRow int, netRows int, custodyMap map[int][]PeerInfo) (isCustody bool, isNativeRetention bool, numCustodyPeers int) {
 	if netRows <= 0 {
 		netRows = 8
 	}
@@ -364,26 +559,72 @@ func EvaluateNodeCustodyForRow(selfPeerID string, selfNetRow int, dataRow int, n
 	}
 
 	if len(custodyMap) > 0 {
-		assigned := custodyMap[targetNetRow]
-		numCustodyPeers = len(assigned)
-		for idx, p := range assigned {
-			if p.PeerID == selfPeerID {
-				isCustody = true
-				pNetRow := p.Row % netRows
-				if pNetRow == targetNetRow || idx == 0 {
-					isNativeRetention = true
-				}
-				return isCustody, isNativeRetention, numCustodyPeers
-			}
+		primary, backup, activeSize := SelectActiveCustodyPairForBlockRow(blockID, dataRow, netRows, custodyMap)
+		if activeSize == 0 {
+			return false, false, 0
 		}
-		return false, false, numCustodyPeers
+		if primary != nil && primary.PeerID == selfPeerID {
+			return true, true, activeSize
+		}
+		if backup != nil && backup.PeerID == selfPeerID {
+			// If the sole native primary peer in a single-node cell is in PROBATION (< 40.0),
+			// promote the healthy borrowed backup peer to also retain kPiece pieces (co-Primary safety guardian).
+			coRetain := primary != nil && !IsEligibleForPrimaryCustody(*primary) && IsEligibleForPrimaryCustody(*backup)
+			return true, coRetain, activeSize
+		}
+		return false, false, activeSize
 	}
 
 	// Fallback if custodyMap is not yet populated from Bootstrap
 	normSelfRow := selfNetRow % netRows
+	if normSelfRow < 0 {
+		normSelfRow += netRows
+	}
 	isPrimary := targetNetRow == normSelfRow
 	isBackup := ((targetNetRow + 1) % netRows) == normSelfRow
 	return isPrimary || isBackup, isPrimary, 2
+}
+
+// EvaluateNodeCustodyForRow checks a Store Node's custody role for dataRow given custodyMap (using empty blockID offset).
+func EvaluateNodeCustodyForRow(selfPeerID string, selfNetRow int, dataRow int, netRows int, custodyMap map[int][]PeerInfo) (isCustody bool, isNativeRetention bool, numCustodyPeers int) {
+	return EvaluateNodeCustodyForBlockRow(selfPeerID, selfNetRow, "", dataRow, netRows, custodyMap)
+}
+
+// GetOrderedCustodyPeersForBlockRow returns the prioritized custody peers for (blockID, dataRow),
+// placing the active Primary Custody Node first, the active Backup Custody Node second, and any remaining
+// cell custody peers after them (excluding selfPeerID).
+func GetOrderedCustodyPeersForBlockRow(selfPeerID string, blockID string, dataRow int, netRows int, custodyMap map[int][]PeerInfo) []PeerInfo {
+	if netRows <= 0 {
+		netRows = 8
+	}
+	targetNetRow := dataRow % netRows
+	if targetNetRow < 0 {
+		targetNetRow += netRows
+	}
+	if len(custodyMap) == 0 {
+		return nil
+	}
+	primary, backup, _ := SelectActiveCustodyPairForBlockRow(blockID, dataRow, netRows, custodyMap)
+	var res []PeerInfo
+	seen := make(map[string]bool)
+	if selfPeerID != "" {
+		seen[selfPeerID] = true
+	}
+	if primary != nil && !seen[primary.PeerID] {
+		seen[primary.PeerID] = true
+		res = append(res, *primary)
+	}
+	if backup != nil && !seen[backup.PeerID] {
+		seen[backup.PeerID] = true
+		res = append(res, *backup)
+	}
+	for _, p := range custodyMap[targetNetRow] {
+		if !seen[p.PeerID] {
+			seen[p.PeerID] = true
+			res = append(res, p)
+		}
+	}
+	return res
 }
 
 // GetNodeCustodyNetRows returns the list of network rows (0..netRows-1) for which selfPeerID holds custody.

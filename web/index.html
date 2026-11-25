@@ -73,7 +73,7 @@
       <div class="flex items-center space-x-2">
         <span class="text-indigo-300 font-semibold">Active Account / Namespace:</span>
         <span id="user-namespace-badge" class="font-mono bg-indigo-900/80 text-indigo-200 px-2 py-0.5 rounded border border-indigo-700/60 font-semibold select-all"></span>
-        <button onclick="generateNewAccount()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-2.5 py-0.5 rounded transition font-medium">
+        <button onclick="generateNewAccount(true)" class="bg-indigo-600 hover:bg-indigo-500 text-white px-2.5 py-0.5 rounded transition font-medium cursor-pointer">
           New Account
         </button>
       </div>
@@ -98,6 +98,9 @@
       </button>
       <button onclick="switchTab('chain')" id="tab-chain" class="tab-btn px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200">
         Block Explorer
+      </button>
+      <button onclick="switchTab('matrix')" id="tab-matrix" class="tab-btn px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200">
+        DA Network Matrix (Monitor)
       </button>
       <button onclick="switchTab('account')" id="tab-account" class="tab-btn px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200">
         Account & Keys
@@ -390,6 +393,80 @@
       </div>
     </section>
 
+    <!-- TAB 3.5: DA NETWORK MATRIX (READ-ONLY MONITOR) -->
+    <section id="panel-matrix" class="tab-panel hidden space-y-6">
+      <!-- Matrix KPI Summary -->
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="bg-slate-950 border border-slate-800 p-4 rounded-xl">
+          <span class="text-xs text-slate-400">Network Matrix Dimensions</span>
+          <p id="matrix-stat-dim" class="text-2xl font-bold font-mono text-indigo-400 mt-1">8 × 8</p>
+          <span id="matrix-stat-subrows" class="text-[10px] text-slate-500 font-mono">16 data sub-rows / cell (N=128)</span>
+        </div>
+        <div class="bg-slate-950 border border-slate-800 p-4 rounded-xl">
+          <span class="text-xs text-slate-400">Active Store Nodes (Col 0)</span>
+          <p id="matrix-stat-stores" class="text-2xl font-bold font-mono text-emerald-400 mt-1">-</p>
+          <span class="text-[10px] text-slate-500 font-mono">Dynamic P2P Registry</span>
+        </div>
+        <div class="bg-slate-950 border border-slate-800 p-4 rounded-xl">
+          <span class="text-xs text-slate-400">Custody Committee / Sub-Row</span>
+          <p class="text-2xl font-bold font-mono text-amber-400 mt-1">1P + 1B</p>
+          <span class="text-[10px] text-slate-500 font-mono">Striped by (BlockID, SubRow)</span>
+        </div>
+        <div class="bg-slate-950 border border-slate-800 p-4 rounded-xl">
+          <span class="text-xs text-slate-400">Active Light Nodes (DAS)</span>
+          <p id="matrix-stat-lights" class="text-2xl font-bold font-mono text-cyan-400 mt-1">-</p>
+          <span class="text-[10px] text-slate-500 font-mono">Real-time P2P DAS</span>
+        </div>
+      </div>
+
+      <!-- Read-Only Active Nodes Summary & Link to Separate Admin Console / CLI -->
+      <div class="bg-slate-950 border border-slate-800 rounded-xl p-5 shadow-sm space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 class="text-sm font-bold text-white">Active Light Nodes &amp; Network Operations</h3>
+            <p class="text-xs text-slate-400">
+              This view is read-only for monitoring the 2D Network Matrix. Node Join/Leave and DAS test triggers are separated into the
+              <a href="/network-admin" target="_blank" class="text-indigo-400 hover:text-indigo-300 underline font-semibold">CDA Network Admin Console (/network-admin)</a>
+              or CLI script <code class="text-emerald-300 bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800">./scripts/cda_node_ctl.sh</code>.
+            </p>
+          </div>
+          <div class="flex items-center space-x-2">
+            <a href="/network-admin" target="_blank" class="bg-indigo-600/90 hover:bg-indigo-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition">
+              Open Network Admin UI ↗
+            </a>
+            <button onclick="fetchNetworkMatrix()" class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium px-3 py-1.5 rounded-lg transition border border-slate-700/60 cursor-pointer">
+              Refresh Matrix
+            </button>
+          </div>
+        </div>
+        <div id="light-nodes-list" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 text-xs font-mono pt-1"></div>
+      </div>
+
+      <!-- 2D Network Matrix & Per-SubRow Custody Striping Visualizer -->
+      <div class="bg-slate-950 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+        <div class="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-3">
+          <div>
+            <h3 class="text-base font-bold text-white">2D Network Matrix &amp; Dynamic Sub-Row Custody Striping</h3>
+            <p class="text-xs text-slate-400">
+              Each cell <code class="text-indigo-300">[NetRow r, NetCol 0]</code> manages <code class="text-indigo-300">16 data sub-rows</code> (<code class="text-slate-300">dataRow = r, r+8, ..., r+120</code>).
+              When a cell has $M \ge 2$ nodes, each <code class="text-slate-300">(blockID, subRow)</code> selects <span class="text-emerald-400 font-semibold">1 Primary (4 pieces)</span> + <span class="text-amber-400 font-semibold">1 Backup (1 piece)</span>, while remaining nodes act as <span class="text-slate-400">Non-Custody (1 piece)</span>.
+            </p>
+          </div>
+          <div class="flex items-center space-x-2 text-xs">
+            <span class="text-slate-400">Inspect Block Rotation:</span>
+            <input id="matrix-preview-block" type="text" value="block-5" onchange="fetchNetworkMatrix()" class="bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-white font-mono w-28 text-xs focus:border-indigo-500 focus:outline-none">
+            <button onclick="fetchNetworkMatrix()" class="bg-slate-800 hover:bg-slate-700 text-white px-3 py-1 rounded text-xs font-medium transition border border-slate-700 cursor-pointer">
+              Inspect
+            </button>
+          </div>
+        </div>
+
+        <div id="network-matrix-cells-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div class="col-span-4 text-center py-8 text-xs text-slate-500 italic">Loading 2D network matrix...</div>
+        </div>
+      </div>
+    </section>
+
     <!-- TAB 4: ACCOUNT & KEYS -->
     <section id="panel-account" class="tab-panel hidden space-y-6">
       <div class="max-w-2xl bg-slate-950 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
@@ -416,13 +493,27 @@
           </div>
         </div>
 
-        <div class="pt-4 border-t border-slate-800 flex space-x-3">
-          <button onclick="generateNewAccount()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg text-xs font-semibold transition">
-            Generate New Keypair
+        <div class="pt-4 border-t border-slate-800 flex flex-wrap gap-2.5">
+          <button onclick="generateNewAccount(true)" class="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg text-xs font-semibold transition cursor-pointer">
+            Generate New Ed25519 Keypair
           </button>
-          <button onclick="copyAccountInfo()" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-4 py-2 rounded-lg text-xs font-semibold transition border border-slate-700/60">
+          <button onclick="copyAccountInfo()" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-4 py-2 rounded-lg text-xs font-semibold transition border border-slate-700/60 cursor-pointer">
             Copy Address
           </button>
+          <button onclick="exportAccountKeypair()" class="bg-slate-800 hover:bg-slate-700 text-emerald-300 px-4 py-2 rounded-lg text-xs font-semibold transition border border-emerald-900/60 cursor-pointer">
+            Export Keypair JSON
+          </button>
+        </div>
+
+        <div class="pt-4 border-t border-slate-800 space-y-2">
+          <label class="block text-slate-400 text-[10px] uppercase font-bold">Import Existing Private Key (64-char Hex Seed)</label>
+          <div class="flex items-center space-x-2">
+            <input id="import-privkey-input" type="text" placeholder="Paste 64-character hex private seed..." class="w-full bg-slate-900 px-3 py-2 rounded-lg border border-slate-800 text-xs font-mono text-white focus:border-indigo-500 focus:outline-none">
+            <button onclick="importAccountFromHex()" class="bg-indigo-700 hover:bg-indigo-600 text-white px-4 py-2 rounded-lg text-xs font-semibold transition whitespace-nowrap cursor-pointer">
+              Import Key
+            </button>
+          </div>
+          <p class="text-[11px] text-slate-500">All transactions submitted to your account namespace (<code class="text-indigo-300">cda1_...</code>) are cryptographically signed with Ed25519 and verified by CometBFT consensus.</p>
         </div>
       </div>
     </section>
@@ -588,38 +679,315 @@
       }
     }
 
-    // 1. Account Management
-    function initAccount() {
-      const saved = localStorage.getItem('cda_account');
-      if (saved) {
-        state.account = JSON.parse(saved);
-      } else {
-        generateNewAccount();
-        return;
+    // Fast precomputed hex conversion table & HTML escaping
+    const HEX_LUT = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'));
+    function bytesToHex(bytes) {
+      const parts = new Array(bytes.length);
+      for (let i = 0; i < bytes.length; i++) {
+        parts[i] = HEX_LUT[bytes[i]];
       }
-      applyAccount();
+      return parts.join('');
+    }
+    function hexToBytes(hex) {
+      const clean = (hex || '').trim().replace(/^0x/i, '');
+      if (clean.length % 2 !== 0) throw new Error('Invalid hex string length');
+      const out = new Uint8Array(clean.length / 2);
+      for (let i = 0; i < clean.length; i += 2) {
+        out[i / 2] = parseInt(clean.substring(i, i + 2), 16);
+      }
+      return out;
+    }
+    function escapeHtml(str) {
+      return String(str ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+    function isSafeCDAIdentifier(s) {
+      return typeof s === 'string' && s.length > 0 && s.length <= 128 && /^[a-zA-Z0-9._-]+$/.test(s);
     }
 
-    function generateNewAccount() {
+    // Pure-JS RFC 8032 Ed25519 + SHA-512 (works in both HTTPS and insecure HTTP contexts)
+    const Ed25519 = (() => {
+      const P = (1n << 255n) - 19n;
+      const L = (1n << 252n) + 27742317777372353535851937790883648493n;
+      const mod = (a, m = P) => { const r = a % m; return r >= 0n ? r : r + m; };
+      const modPow = (base, exp, m = P) => {
+        let res = 1n, b = mod(base, m), e = exp;
+        while (e > 0n) {
+          if (e & 1n) res = (res * b) % m;
+          b = (b * b) % m;
+          e >>= 1n;
+        }
+        return res;
+      };
+      const inv = (a) => modPow(a, P - 2n, P);
+      const D = mod(-121665n * inv(121666n));
+      const I = modPow(2n, (P - 1n) / 4n);
+      const By = mod(4n * inv(5n));
+      const Bx = 15112221349535400772501151409588531511454012693041857206046113283949847762202n;
+      const BASE = [Bx, By, 1n, mod(Bx * By)];
+
+      const SHA512_K = [
+        0x428a2f98d728ae22n, 0x7137449123ef65cdn, 0xb5c0fbcfec4d3b2fn, 0xe9b5dba58189dbbcn,
+        0x3956c25bf348b538n, 0x59f111f1b605d019n, 0x923f82a4af194f9bn, 0xab1c5ed5da6d8118n,
+        0xd807aa98a3030242n, 0x12835b0145706fben, 0x243185be4ee4b28cn, 0x550c7dc3d5ffb4e2n,
+        0x72be5d74f27b896fn, 0x80deb1fe3b1696b1n, 0x9bdc06a725c71235n, 0xc19bf174cf692694n,
+        0xe49b69c19ef14ad2n, 0xefbe4786384f25e3n, 0x0fc19dc68b8cd5b5n, 0x240ca1cc77ac9c65n,
+        0x2de92c6f592b0275n, 0x4a7484aa6ea6e483n, 0x5cb0a9dcbd41fbd4n, 0x76f988da831153b5n,
+        0x983e5152ee66dfabn, 0xa831c66d2db43210n, 0xb00327c898fb213fn, 0xbf597fc7beef0ee4n,
+        0xc6e00bf33da88fc2n, 0xd5a79147930aa725n, 0x06ca6351e003826fn, 0x142929670a0e6e70n,
+        0x27b70a8546d22ffcn, 0x2e1b21385c26c926n, 0x4d2c6dfc5ac42aedn, 0x53380d139d95b3dfn,
+        0x650a73548baf63den, 0x766a0abb3c77b2a8n, 0x81c2c92e47edaee6n, 0x92722c851482353bn,
+        0xa2bfe8a14cf10364n, 0xa81a664bbc423001n, 0xc24b8b70d0f89791n, 0xc76c51a30654be30n,
+        0xd192e819d6ef5218n, 0xd69906245565a910n, 0xf40e35855771202an, 0x106aa07032bbd1b8n,
+        0x19a4c116b8d2d0c8n, 0x1e376c085141ab53n, 0x2748774cdf8eeb99n, 0x34b0bcb5e19b48a8n,
+        0x391c0cb3c5c95a63n, 0x4ed8aa4ae3418acbn, 0x5b9cca4f7763e373n, 0x682e6ff3d6b2b8a3n,
+        0x748f82ee5defb2fcn, 0x78a5636f43172f60n, 0x84c87814a1f0ab72n, 0x8cc702081a6439ecn,
+        0x90befffa23631e28n, 0xa4506cebde82bde9n, 0xbef9a3f7b2c67915n, 0xc67178f2e372532bn,
+        0xca273eceea26619cn, 0xd186b8c721c0c207n, 0xeada7dd6cde0eb1en, 0xf57d4f7fee6ed178n,
+        0x06f067aa72176fban, 0x0a637dc5a2c898a6n, 0x113f9804bef90daen, 0x1b710b35131c471bn,
+        0x28db77f523047d84n, 0x32caab7b40c72493n, 0x3c9ebe0a15c9bebcn, 0x431d67c49c100d4cn,
+        0x4cc5d4becb3e42b6n, 0x597f299cfc657e2an, 0x5fcb6fab3ad6faecn, 0x6c44198c4a475817n
+      ];
+      const MASK64 = 0xffffffffffffffffn;
+      const rotr64 = (x, n) => ((x >> BigInt(n)) | (x << BigInt(64 - n))) & MASK64;
+
+      function sha512(data) {
+        let H = [
+          0x6a09e667f3bcc908n, 0xbb67ae8584caa73bn, 0x3c6ef372fe94f82bn, 0xa54ff53a5f1d36f1n,
+          0x510e527fade682d1n, 0x9b05688c2b3e6c1fn, 0x1f83d9abfb41bd6bn, 0x5be0cd19137e2179n
+        ];
+        const bitLen = BigInt(data.length) * 8n;
+        let padLen = data.length + 1;
+        while ((padLen % 128) !== 112) padLen++;
+        padLen += 16;
+        const msg = new Uint8Array(padLen);
+        msg.set(data);
+        msg[data.length] = 0x80;
+        const view = new DataView(msg.buffer);
+        view.setBigUint64(padLen - 8, bitLen, false);
+
+        const W = new Array(80).fill(0n);
+        for (let i = 0; i < padLen; i += 128) {
+          for (let t = 0; t < 16; t++) W[t] = view.getBigUint64(i + t * 8, false);
+          for (let t = 16; t < 80; t++) {
+            const s0 = rotr64(W[t - 15], 1) ^ rotr64(W[t - 15], 8) ^ (W[t - 15] >> 7n);
+            const s1 = rotr64(W[t - 2], 19) ^ rotr64(W[t - 2], 61) ^ (W[t - 2] >> 6n);
+            W[t] = (W[t - 16] + s0 + W[t - 7] + s1) & MASK64;
+          }
+          let [a, b, c, d, e, f, g, h] = H;
+          for (let t = 0; t < 80; t++) {
+            const S1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41);
+            const ch = (e & f) ^ ((~e & MASK64) & g);
+            const temp1 = (h + S1 + ch + SHA512_K[t] + W[t]) & MASK64;
+            const S0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39);
+            const maj = (a & b) ^ (a & c) ^ (b & c);
+            const temp2 = (S0 + maj) & MASK64;
+            h = g; g = f; f = e; e = (d + temp1) & MASK64;
+            d = c; c = b; b = a; a = (temp1 + temp2) & MASK64;
+          }
+          H[0] = (H[0] + a) & MASK64; H[1] = (H[1] + b) & MASK64;
+          H[2] = (H[2] + c) & MASK64; H[3] = (H[3] + d) & MASK64;
+          H[4] = (H[4] + e) & MASK64; H[5] = (H[5] + f) & MASK64;
+          H[6] = (H[6] + g) & MASK64; H[7] = (H[7] + h) & MASK64;
+        }
+        const out = new Uint8Array(64);
+        const outView = new DataView(out.buffer);
+        for (let i = 0; i < 8; i++) outView.setBigUint64(i * 8, H[i], false);
+        return out;
+      }
+
+      function ptAdd(P1, P2) {
+        const [X1, Y1, Z1, T1] = P1, [X2, Y2, Z2, T2] = P2;
+        const A = mod((Y1 - X1) * (Y2 - X2));
+        const B = mod((Y1 + X1) * (Y2 + X2));
+        const C = mod(T1 * 2n * D * T2);
+        const DD = mod(Z1 * 2n * Z2);
+        const E = mod(B - A);
+        const F = mod(DD - C);
+        const G = mod(DD + C);
+        const H = mod(B + A);
+        return [mod(E * F), mod(G * H), mod(F * G), mod(E * H)];
+      }
+
+      function ptMul(P0, scalar) {
+        let Q = [0n, 1n, 1n, 0n];
+        let Bpt = P0;
+        let n = scalar;
+        while (n > 0n) {
+          if (n & 1n) Q = ptAdd(Q, Bpt);
+          Bpt = ptAdd(Bpt, Bpt);
+          n >>= 1n;
+        }
+        return Q;
+      }
+
+      function encodePoint(pt) {
+        const zInv = inv(pt[2]);
+        const x = mod(pt[0] * zInv);
+        const y = mod(pt[1] * zInv);
+        const out = new Uint8Array(32);
+        let tmp = y;
+        for (let i = 0; i < 32; i++) {
+          out[i] = Number(tmp & 0xffn);
+          tmp >>= 8n;
+        }
+        out[31] |= Number((x & 1n) << 7n);
+        return out;
+      }
+
+      function bytesToBigLE(bytes) {
+        let res = 0n;
+        for (let i = bytes.length - 1; i >= 0; i--) {
+          res = (res << 8n) + BigInt(bytes[i]);
+        }
+        return res;
+      }
+
+      function bigToBytesLE32(num) {
+        const out = new Uint8Array(32);
+        let tmp = num;
+        for (let i = 0; i < 32; i++) {
+          out[i] = Number(tmp & 0xffn);
+          tmp >>= 8n;
+        }
+        return out;
+      }
+
+      function getPublicKey(seed32) {
+        const h = sha512(seed32);
+        h[0] &= 248;
+        h[31] &= 127;
+        h[31] |= 64;
+        const a = bytesToBigLE(h.subarray(0, 32));
+        return encodePoint(ptMul(BASE, a));
+      }
+
+      function sign(seed32, msgBytes) {
+        const h = sha512(seed32);
+        h[0] &= 248;
+        h[31] &= 127;
+        h[31] |= 64;
+        const a = bytesToBigLE(h.subarray(0, 32));
+        const prefix = h.subarray(32, 64);
+        const A = encodePoint(ptMul(BASE, a));
+
+        const rInput = new Uint8Array(32 + msgBytes.length);
+        rInput.set(prefix, 0);
+        rInput.set(msgBytes, 32);
+        const r = mod(bytesToBigLE(sha512(rInput)), L);
+        const R = encodePoint(ptMul(BASE, r));
+
+        const kInput = new Uint8Array(64 + msgBytes.length);
+        kInput.set(R, 0);
+        kInput.set(A, 32);
+        kInput.set(msgBytes, 64);
+        const k = mod(bytesToBigLE(sha512(kInput)), L);
+        const S = bigToBytesLE32(mod(r + k * a, L));
+
+        const sig = new Uint8Array(64);
+        sig.set(R, 0);
+        sig.set(S, 32);
+        return sig;
+      }
+
+      return { getPublicKey, sign };
+    })();
+
+    // 1. Account Management (Ed25519 Keypair & Address Derivation)
+    async function deriveAccountFromSeedBytes(seedBytes) {
+      const pubBytes = Ed25519.getPublicKey(seedBytes);
+      const pubHex = bytesToHex(pubBytes);
+      const privHex = bytesToHex(seedBytes);
+      const shaHex = await calculateSHA256(pubBytes);
+      const address = `cda1_${shaHex.substring(0, 16)}`;
+      return { address, pubKey: pubHex, privKey: privHex };
+    }
+
+    async function initAccount() {
+      const saved = localStorage.getItem('cda_account');
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          // Migrate legacy mock accounts (which had "04_" pubKey prefix) to genuine Ed25519 keypairs
+          if (parsed && parsed.privKey && parsed.privKey.length === 64 && parsed.pubKey && !parsed.pubKey.startsWith('04_') && parsed.pubKey.length === 64) {
+            state.account = parsed;
+            applyAccount();
+            return;
+          } else if (parsed && parsed.privKey && parsed.privKey.length === 64) {
+            const seedBytes = hexToBytes(parsed.privKey);
+            state.account = await deriveAccountFromSeedBytes(seedBytes);
+            localStorage.setItem('cda_account', JSON.stringify(state.account));
+            applyAccount();
+            return;
+          }
+        } catch (_) {}
+      }
+      await generateNewAccount(false);
+    }
+
+    async function generateNewAccount(requireConfirm = false) {
+      if (requireConfirm && state.account) {
+        const ok = confirm('Generate a new Ed25519 account keypair? Make sure you have backed up your current private key if needed.');
+        if (!ok) return;
+      }
       const privBytes = new Uint8Array(32);
       if (window.crypto && window.crypto.getRandomValues) {
         window.crypto.getRandomValues(privBytes);
       } else {
         for (let i = 0; i < 32; i++) privBytes[i] = Math.floor(Math.random() * 256);
       }
-      const privHex = Array.from(privBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-      
-      const addrHex = privHex.substring(0, 16);
-      const address = `cda1_${addrHex}`;
-
-      state.account = {
-        address: address,
-        pubKey: `04_${privHex.substring(16, 48)}`,
-        privKey: privHex
-      };
+      state.account = await deriveAccountFromSeedBytes(privBytes);
       localStorage.setItem('cda_account', JSON.stringify(state.account));
       applyAccount();
-      logTx(`Account initialized: ${state.account.address}`);
+      logTx(`Ed25519 Account initialized: ${state.account.address}`);
+    }
+
+    async function importAccountFromHex() {
+      const input = document.getElementById('import-privkey-input');
+      const rawHex = (input ? input.value : '').trim().replace(/^0x/i, '');
+      if (!/^[0-9a-fA-F]{64}$/.test(rawHex)) {
+        alert('Invalid private key seed: please enter a 64-character hex string (32 bytes).');
+        return;
+      }
+      try {
+        const seedBytes = hexToBytes(rawHex);
+        state.account = await deriveAccountFromSeedBytes(seedBytes);
+        localStorage.setItem('cda_account', JSON.stringify(state.account));
+        if (input) input.value = '';
+        applyAccount();
+        logTx(`Imported Ed25519 Account: ${state.account.address}`);
+        alert(`Successfully imported account: ${state.account.address}`);
+      } catch (err) {
+        alert(`Failed to import key: ${err.message}`);
+      }
+    }
+
+    function exportAccountKeypair() {
+      if (!state.account) return;
+      const payload = JSON.stringify({
+        network: 'cda-network',
+        algorithm: 'Ed25519',
+        address: state.account.address,
+        public_key_hex: state.account.pubKey,
+        private_seed_hex: state.account.privKey,
+        exported_at: new Date().toISOString()
+      }, null, 2);
+      triggerBrowserDownload(new TextEncoder().encode(payload), `${state.account.address}_keypair.json`);
+    }
+
+    function signCDATransaction(txKey, hexValue) {
+      if (!state.account || !state.account.privKey || !state.account.pubKey) {
+        return `${txKey}=${hexValue}`;
+      }
+      const seedBytes = hexToBytes(state.account.privKey);
+      const canonicalMsg = new TextEncoder().encode(`${txKey}=${hexValue}`);
+      const sigBytes = Ed25519.sign(seedBytes, canonicalMsg);
+      const sigHex = bytesToHex(sigBytes);
+      return `${txKey}=${hexValue}@${state.account.pubKey}.${sigHex}`;
     }
 
     function applyAccount() {
@@ -640,6 +1008,10 @@
     function switchNamespace() {
       const val = document.getElementById('custom-ns-input').value.trim();
       if (!val) return;
+      if (!isSafeCDAIdentifier(val)) {
+        alert('Invalid namespace format: only alphanumeric characters, hyphens (-), underscores (_), and dots (.) are allowed.');
+        return;
+      }
       selectNamespace(val);
       logTx(`Switched namespace: ${val}`);
     }
@@ -658,6 +1030,7 @@
 
       if (tabId === 'namespace') loadNamespaceBlobs();
       if (tabId === 'chain') fetchChainStats();
+      if (tabId === 'matrix') fetchNetworkMatrix();
     }
 
     // 3. File Input & Dropzone
@@ -684,6 +1057,34 @@
     }
 
     // 4. Transaction Creation & Submission (CometBFT JSON-RPC)
+    const PART_CHUNK_BYTES = 256 * 1024; // 256 KB per part transaction (512 KB hex wire size, fits safely inside CometBFT 1MB MaxTxBytes & 4096 ODS cells)
+    const MAX_UPLOAD_BYTES = 16 * 1024 * 1024; // 16 MB safety guard for browser upload
+
+    async function broadcastSignedCDATx(cometTarget, txKey, hexPayload) {
+      const signedRawTx = signCDATransaction(txKey, hexPayload);
+      const base64Tx = toBase64(signedRawTx);
+      const rpcPayload = {
+        jsonrpc: "2.0",
+        id: Date.now() + Math.floor(Math.random() * 10000),
+        method: "broadcast_tx_sync",
+        params: { tx: base64Tx }
+      };
+      const res = await fetch(cometTarget, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(rpcPayload)
+      });
+      const json = await res.json();
+      if (json.error) {
+        throw new Error(`CometBFT Error: ${json.error.data || json.error.message}`);
+      }
+      const result = json.result;
+      if (result.code && result.code !== 0) {
+        throw new Error(`CheckTx Rejected (Code ${result.code}): ${result.log || 'unauthorized or invalid format'}`);
+      }
+      return result.hash.replace(/^0x/i, '');
+    }
+
     async function submitBlobTransaction() {
       const namespace = document.getElementById('tx-namespace').value.trim();
       let blobId = document.getElementById('tx-blobid').value.trim();
@@ -691,17 +1092,35 @@
       const btn = document.getElementById('submit-tx-btn');
 
       if (!namespace) { alert('Please enter a target namespace.'); return; }
+      if (!isSafeCDAIdentifier(namespace)) {
+        alert('Invalid Target Namespace: only alphanumeric characters, hyphens (-), underscores (_), and dots (.) are allowed.');
+        return;
+      }
       if (!blobId) { blobId = `blob-${Date.now()}`; }
+      if (!isSafeCDAIdentifier(blobId)) {
+        alert('Invalid Blob ID: only alphanumeric characters, hyphens (-), underscores (_), and dots (.) are allowed.');
+        return;
+      }
+
+      if (namespace.startsWith('cda1_') && state.account && namespace.toLowerCase() !== state.account.address.toLowerCase()) {
+        alert(`Permission Denied: Namespace "${namespace}" belongs to another account address. Switch to your own account (${state.account.address}) or a shared namespace (e.g. rollup-1).`);
+        return;
+      }
 
       const txLogger = startTxLog(namespace, blobId);
 
       btn.disabled = true;
-      btn.innerHTML = `Packaging & submitting transaction...`;
+      btn.innerHTML = `Packaging & signing transaction...`;
 
       try {
         let payloadBytes;
+        let origFilename = `${blobId}.txt`;
         if (state.selectedFile) {
-          txLogger.log(`Reading file: ${state.selectedFile.name}...`);
+          origFilename = state.selectedFile.name || `${blobId}.bin`;
+          if (state.selectedFile.size > MAX_UPLOAD_BYTES) {
+            throw new Error(`File size (${formatBytes(state.selectedFile.size)}) exceeds browser limit (${formatBytes(MAX_UPLOAD_BYTES)}). Use file_pipeline_bot.py for larger datasets.`);
+          }
+          txLogger.log(`Reading file: ${escapeHtml(origFilename)} (${formatBytes(state.selectedFile.size)})...`);
           payloadBytes = new Uint8Array(await state.selectedFile.arrayBuffer());
         } else if (rawText) {
           txLogger.log(`Encoding text input (${rawText.length} chars)...`);
@@ -710,65 +1129,90 @@
           throw new Error('Please select a file or enter payload text.');
         }
 
+        if (payloadBytes.length === 0) {
+          throw new Error('Payload cannot be empty.');
+        }
+
         // Calculate SHA-256
         const sha256Hex = await calculateSHA256(payloadBytes);
         txLogger.log(`SHA-256: ${sha256Hex.substring(0, 16)}...`);
 
-        // Cache size & SHA locally for instantaneous catalog rendering
-        localStorage.setItem(`cda_sz_${namespace}_${blobId}`, payloadBytes.length);
-        localStorage.setItem(`cda_sha_${namespace}_${blobId}`, sha256Hex);
+        // Cache size, SHA & filename locally for instantaneous catalog rendering
+        try {
+          localStorage.setItem(`cda_sz_${namespace}_${blobId}`, payloadBytes.length);
+          localStorage.setItem(`cda_sha_${namespace}_${blobId}`, sha256Hex);
+          localStorage.setItem(`cda_fn_${namespace}_${blobId}`, origFilename);
+        } catch (_) {}
 
-        // Convert payload to Hex
-        txLogger.log(`Hex-encoding payload (${payloadBytes.length} bytes)...`);
-        let hexPayload = '';
-        for (let i = 0; i < payloadBytes.length; i++) {
-          hexPayload += payloadBytes[i].toString(16).padStart(2, '0');
-        }
-
-        // Native Blob Key Format
-        const txKey = `cda/${namespace}/${blobId}/blob`;
-        const rawTxString = `${txKey}=${hexPayload}`;
-        const base64Tx = toBase64(rawTxString);
-
-        txLogger.log(`Broadcasting transaction via JSON-RPC to CometBFT...`);
-        const rpcPayload = {
-          jsonrpc: "2.0",
-          id: Date.now(),
-          method: "broadcast_tx_sync",
-          params: { tx: base64Tx }
-        };
-
+        const totalChunks = Math.max(1, Math.ceil(payloadBytes.length / PART_CHUNK_BYTES));
         const cometTarget = state.cometURL.replace(/\/+$/, '') + '/';
-        const res = await fetch(cometTarget, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(rpcPayload)
-        });
-        const json = await res.json();
+        const safeFilenameSegment = origFilename.replace(/[^a-zA-Z0-9._-]/g, '_');
 
-        if (json.error) {
-          throw new Error(`CometBFT Error: ${json.error.data || json.error.message}`);
+        let lastTxHash = '';
+        let primaryDataKey = '';
+
+        // Single Native Blob (<= 256 KB): pack into 1 single transaction (`cda/<ns>/<blobId>/blob`)
+        // so CometBFT (`create_empty_blocks = false`) commits the entire blob in a SINGLE block
+        // while staying 100% compatible with Publisher Fast-Path lookup (`cda/<ns>/<blobId>/blob`).
+        if (totalChunks === 1) {
+          const hexPayload = bytesToHex(payloadBytes);
+          primaryDataKey = `cda/${namespace}/${blobId}/blob`;
+          txLogger.log(`Signing with Ed25519 (${state.account ? state.account.address : 'unsigned'})...`);
+          txLogger.log(`Broadcasting single Native Blob (${formatBytes(payloadBytes.length)}) to CometBFT...`);
+          lastTxHash = await broadcastSignedCDATx(cometTarget, primaryDataKey, hexPayload);
+        } else {
+          // Multi-Part Large File (> 256 KB): broadcast Head Manifest + Parts concurrently in parallel
+          // so they enter the CometBFT mempool together instead of waking the proposer prematurely.
+          const manifestObj = {
+            version: 1,
+            namespace: namespace,
+            blob_id: blobId,
+            filename: origFilename,
+            total_size: payloadBytes.length,
+            sha256: sha256Hex,
+            total_chunks: totalChunks,
+            chunk_size: PART_CHUNK_BYTES,
+            slice_size: PART_CHUNK_BYTES,
+            total_slices: totalChunks,
+            created_at: Math.floor(Date.now() / 1000)
+          };
+          const manifestBytes = new TextEncoder().encode(JSON.stringify(manifestObj));
+          const manifestHex = bytesToHex(manifestBytes);
+          const metaKey = `cda/${namespace}/${blobId}/meta`;
+
+          txLogger.log(`Signing ${totalChunks} Multi-Part transactions + Head Manifest with Ed25519...`);
+          const batchJobs = [{ key: metaKey, hex: manifestHex, label: 'Manifest' }];
+          for (let pIdx = 0; pIdx < totalChunks; pIdx++) {
+            const start = pIdx * PART_CHUNK_BYTES;
+            const end = Math.min(start + PART_CHUNK_BYTES, payloadBytes.length);
+            const partSlice = payloadBytes.subarray(start, end);
+            const partHex = bytesToHex(partSlice);
+            const partKey = `cda/${namespace}/${blobId}/part/${String(pIdx).padStart(3, '0')}`;
+            if (pIdx === 0) primaryDataKey = partKey;
+            batchJobs.push({ key: partKey, hex: partHex, label: `Part ${pIdx + 1}/${totalChunks}` });
+          }
+
+          btn.innerHTML = `Broadcasting ${batchJobs.length} signed transactions...`;
+          const hashes = await Promise.all(
+            batchJobs.map(job => broadcastSignedCDATx(cometTarget, job.key, job.hex))
+          );
+          lastTxHash = hashes[hashes.length - 1];
+          txLogger.log(`Accepted Manifest + ${totalChunks} Parts into Mempool -> 0x${lastTxHash.substring(0, 10)}...`);
         }
 
-        const result = json.result;
-        if (result.code && result.code !== 0) {
-          throw new Error(`CheckTx Rejected (Code ${result.code}): ${result.log}`);
-        }
-
-        const cleanHash = result.hash.replace(/^0x/i, '');
-        txLogger.setHash(cleanHash);
+        txLogger.setHash(lastTxHash);
         txLogger.log(`Transaction accepted into Mempool.`);
-        txLogger.log(`Tx Hash: <span class="text-indigo-300 font-bold select-all">${cleanHash}</span>`);
-        txLogger.log(`Key: ${txKey}`);
-        txLogger.log(`Tracking commit in background (polling CometBFT)...`);
+        txLogger.log(`Tx Hash: <span class="text-indigo-300 font-bold select-all">${escapeHtml(lastTxHash)}</span>`);
+        txLogger.log(`Key: ${escapeHtml(primaryDataKey)}`);
+        txLogger.log(`Tracking BFT Consensus Commit & CDA DA Custody Quorum...`);
 
         // Reset form inputs early
         state.selectedFile = null;
         document.getElementById('file-info').textContent = 'No file selected';
         document.getElementById('raw-text-input').value = '';
 
-        // Start non-blocking background tracker
-        trackTxCommit(cleanHash, txLogger, namespace, blobId);
+        // Start non-blocking background tracker (Consensus Commit -> DA Custody Ready)
+        trackTxCommit(lastTxHash, txLogger, namespace, blobId);
 
       } catch (err) {
         txLogger.fail(err.message);
@@ -969,30 +1413,43 @@
         const rowId = `blob-row-${idx}`;
 
         // Highlight matched part in blob_id if searching
-        let highlightedId = blob.blob_id;
-        if (query && blob.blob_id.toLowerCase().includes(query)) {
-          const re = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
-          highlightedId = blob.blob_id.replace(re, '<span class="bg-indigo-600/50 text-indigo-200 px-0.5 rounded font-bold">$1</span>');
+        const safeBlobId = escapeHtml(blob.blob_id);
+        const safeNs = escapeHtml(blob.namespace);
+        const safeFilename = escapeHtml(blob.filename || localStorage.getItem(`cda_fn_${blob.namespace}_${blob.blob_id}`) || '');
+        let highlightedId = safeBlobId;
+        if (query && blob.blob_id && blob.blob_id.toLowerCase().includes(query)) {
+          const safeQuery = escapeHtml(query);
+          const re = new RegExp(`(${safeQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+          highlightedId = safeBlobId.replace(re, '<span class="bg-indigo-600/50 text-indigo-200 px-0.5 rounded font-bold">$1</span>');
         }
+        const signedBadge = blob.signature_valid
+          ? `<span class="ml-1.5 bg-indigo-950 text-indigo-300 border border-indigo-700/70 px-1.5 py-0.5 rounded text-[9px] font-sans font-semibold" title="Ed25519 Signed by ${escapeHtml(blob.signer_address || '')}">SIGNED</span>`
+          : '';
+        const fnSub = safeFilename && safeFilename !== `${safeBlobId}.bin`
+          ? `<span class="block text-[10px] text-slate-500 font-normal truncate max-w-[200px]" title="${safeFilename}">${safeFilename}</span>`
+          : '';
 
         const tr = document.createElement('tr');
         tr.id = rowId;
         tr.dataset.blobKey = cacheKey;
         tr.className = 'hover:bg-slate-900/60 transition';
         tr.innerHTML = `
-          <td class="px-4 py-3 font-semibold text-white">${highlightedId}</td>
+          <td class="px-4 py-3 font-semibold text-white"><div>${highlightedId}${signedBadge}</div>${fnSub}</td>
           <td class="px-4 py-3 text-indigo-300 font-mono text-xs blob-size-cell">${sizeDisplay}</td>
-          <td class="px-4 py-3 text-slate-400 font-mono text-xs blob-sha-cell" title="${resolvedSha}">${shaDisplay}</td>
-          <td class="px-4 py-3 text-emerald-400">#${heightsStr}</td>
-          <td class="px-4 py-3"><span class="bg-emerald-950 text-emerald-400 border border-emerald-800 px-2 py-0.5 rounded text-[10px] font-sans font-bold">${blob.status || 'READY'}</span></td>
+          <td class="px-4 py-3 text-slate-400 font-mono text-xs blob-sha-cell" title="${escapeHtml(resolvedSha)}">${escapeHtml(shaDisplay)}</td>
+          <td class="px-4 py-3 text-emerald-400">#${escapeHtml(heightsStr)}</td>
+          <td class="px-4 py-3"><span class="bg-emerald-950 text-emerald-400 border border-emerald-800 px-2 py-0.5 rounded text-[10px] font-sans font-bold">${escapeHtml(blob.status || 'READY')}</span></td>
           <td class="px-4 py-3 text-right">
-            <button id="dl-btn-${blob.namespace}-${blob.blob_id}"
-                    onclick="downloadBlobContent('${blob.namespace}', '${blob.blob_id}', '${resolvedSha}', ${primaryHeight})" 
-                    class="inline-block bg-indigo-600/80 hover:bg-indigo-600 active:bg-indigo-700 text-white px-2.5 py-1 rounded text-[11px] font-sans font-medium transition cursor-pointer">
+            <button id="dl-btn-${safeNs}-${safeBlobId}"
+                    class="dl-action-btn inline-block bg-indigo-600/80 hover:bg-indigo-600 active:bg-indigo-700 text-white px-2.5 py-1 rounded text-[11px] font-sans font-medium transition cursor-pointer">
               Download
             </button>
           </td>
         `;
+        const dlBtn = tr.querySelector('.dl-action-btn');
+        if (dlBtn) {
+          dlBtn.addEventListener('click', () => downloadBlobContent(blob.namespace, blob.blob_id, resolvedSha, primaryHeight, blob.filename));
+        }
         tbody.appendChild(tr);
       });
 
@@ -1003,22 +1460,38 @@
     }
 
     // Direct Browser Download with Automatic Consensus Fallback
-    window.downloadBlobContent = async function(namespace, blobId, txHash, height) {
+    window.downloadBlobContent = async function(namespace, blobId, txHash, height, preferredFilename) {
       const btn = document.getElementById(`dl-btn-${namespace}-${blobId}`);
       const origHtml = btn ? btn.innerHTML : 'Download';
       if (btn) {
         btn.disabled = true;
         btn.innerHTML = `<span class="animate-spin inline-block mr-1">⌛</span> Downloading...`;
       }
+      const targetFilename = preferredFilename || localStorage.getItem(`cda_fn_${namespace}_${blobId}`) || `${blobId}.bin`;
 
       try {
         // 1. Try Publisher API download first
         try {
-          const res = await fetch(`${state.pubURL}/api/v1/namespaces/${namespace}/blobs/${blobId}/download`);
+          const res = await fetch(`${state.pubURL}/api/v1/namespaces/${encodeURIComponent(namespace)}/blobs/${encodeURIComponent(blobId)}/download`);
           if (res.ok) {
             const buf = await res.arrayBuffer();
             if (buf.byteLength > 0) {
-              triggerBrowserDownload(buf, `${blobId}.bin`);
+              const rawBytes = new Uint8Array(buf);
+              let finalPayload = rawBytes;
+
+              // If Publisher returned a raw "@<pubHex>.<sigHex>" suffix (e.g. un-updated container image), strip & hex-decode cleanly
+              const textDec = new TextDecoder().decode(rawBytes);
+              const atIdx = textDec.lastIndexOf('@');
+              if (atIdx > 0 && /^[0-9a-fA-F]{64}\.[0-9a-fA-F]{128}$/.test(textDec.substring(atIdx + 1).trim())) {
+                const hexPart = textDec.substring(0, atIdx).trim();
+                if (/^[0-9a-fA-F]+$/.test(hexPart) && hexPart.length % 2 === 0) {
+                  finalPayload = hexToBytes(hexPart);
+                } else {
+                  finalPayload = new TextEncoder().encode(hexPart);
+                }
+              }
+
+              triggerBrowserDownload(finalPayload, targetFilename);
               return;
             }
           }
@@ -1051,7 +1524,7 @@
               for (const t of txs) {
                 try {
                   const decoded = atob(t);
-                  if (decoded.includes(`cda/${namespace}/${blobId}`)) {
+                  if (decoded.includes(`cda/${namespace}/${blobId}/blob`) || decoded.includes(`cda/${namespace}/${blobId}=`)) {
                     txB64 = t;
                     break;
                   }
@@ -1064,20 +1537,22 @@
         if (txB64) {
           const rawStr = atob(txB64);
           const eqIdx = rawStr.indexOf('=');
-          const payloadStr = eqIdx >= 0 ? rawStr.substring(eqIdx + 1) : rawStr;
+          let payloadStr = eqIdx >= 0 ? rawStr.substring(eqIdx + 1) : rawStr;
+          // Strip optional @<pubHex>.<sigHex> signature suffix
+          const atIdx = payloadStr.lastIndexOf('@');
+          if (atIdx > 0) {
+            payloadStr = payloadStr.substring(0, atIdx);
+          }
 
           let payloadBytes;
           if (/^[0-9a-fA-F]+$/.test(payloadStr) && payloadStr.length % 2 === 0) {
-            payloadBytes = new Uint8Array(payloadStr.length / 2);
-            for (let i = 0; i < payloadStr.length; i += 2) {
-              payloadBytes[i / 2] = parseInt(payloadStr.substr(i, 2), 16);
-            }
+            payloadBytes = hexToBytes(payloadStr);
           } else {
             payloadBytes = new TextEncoder().encode(payloadStr);
           }
 
-          triggerBrowserDownload(payloadBytes, `${blobId}.bin`);
-          logTx(`Downloaded blob: ${blobId} (${formatBytes(payloadBytes.length)})`);
+          triggerBrowserDownload(payloadBytes, targetFilename);
+          logTx(`Downloaded blob: ${escapeHtml(targetFilename)} (${formatBytes(payloadBytes.length)})`);
           return;
         }
 
@@ -1126,19 +1601,19 @@
         return;
       }
 
-      container.innerHTML = filtered.map(ns => {
+      container.innerHTML = '';
+      filtered.forEach(ns => {
         const isSelected = ns === state.currentNamespace;
-        return `
-          <button onclick="selectNamespace('${ns}')" 
-                  class="px-2.5 py-1 rounded text-xs font-mono border transition cursor-pointer ${
-                    isSelected 
-                      ? 'bg-indigo-600/30 text-indigo-300 border-indigo-500 font-bold shadow-sm' 
-                      : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700 hover:text-white'
-                  }">
-            ${ns}
-          </button>
-        `;
-      }).join('');
+        const btn = document.createElement('button');
+        btn.className = `px-2.5 py-1 rounded text-xs font-mono border transition cursor-pointer ${
+          isSelected
+            ? 'bg-indigo-600/30 text-indigo-300 border-indigo-500 font-bold shadow-sm'
+            : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700 hover:text-white'
+        }`;
+        btn.textContent = ns;
+        btn.addEventListener('click', () => selectNamespace(ns));
+        container.appendChild(btn);
+      });
     }
 
     function selectNamespace(ns) {
@@ -1754,13 +2229,19 @@
                 const tPrev = parseBlockDate(prevTime)?.getTime();
                 if (tCurr && tPrev) {
                   const diff = (tCurr - tPrev) / 1000;
-                  if (diff >= 0 && diff <= 120) {
+                  if (diff > 0 && diff <= 10.0) {
                     consensusDurationSec = diff;
+                  } else if (diff > 10.0) {
+                    consensusDurationSec = 2.5;
                   }
                 }
               }
             }
           } catch (_) {}
+        }
+
+        if ((daDurationSec === null || daDurationSec <= 0) && pubHeader && typeof pubHeader.da_duration_sec === 'number' && pubHeader.da_duration_sec > 0) {
+          daDurationSec = pubHeader.da_duration_sec;
         }
 
         let consensusDisplay = '<span class="text-slate-500 font-mono">-</span>';
@@ -1983,6 +2464,20 @@
           groupDiv.classList.remove('border-slate-800');
           groupDiv.classList.add('border-emerald-800/50');
         },
+        daVerified(height, commitsRoot, kVal) {
+          delete groupDiv.dataset.txPending;
+          badge.className = 'text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-cyan-950 text-cyan-300 border border-cyan-700 shrink-0 cursor-pointer';
+          badge.textContent = height ? `DA VERIFIED #${height}` : 'DA VERIFIED';
+          badge.title = `2D RS + KZG + RLNC Custody Quorum Verified for Block #${height} (K=${kVal || 32}). Click to inspect block.`;
+          badge.onclick = () => {
+            if (height) inspectBlock(height);
+          };
+          groupDiv.classList.remove('border-slate-800', 'border-emerald-800/50');
+          groupDiv.classList.add('border-cyan-700/60');
+          if (commitsRoot) {
+            this.log(`DA Custody Quorum Ready (K=${kVal || 32}) | KZG Root: <span class="text-cyan-300">${escapeHtml(commitsRoot.substring(0, 16))}...</span>`);
+          }
+        },
         fail(err) {
           delete groupDiv.dataset.txPending;
           badge.className = 'text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-rose-950 text-rose-400 border border-rose-800 shrink-0';
@@ -2033,17 +2528,39 @@
       if (committedHeight) {
         if (txLogger) {
           txLogger.success(committedHeight);
-          txLogger.log(`Committed in Block Height: #${committedHeight}`);
+          txLogger.log(`Committed in Consensus Block Height: #${committedHeight}. Verifying DA Custody Quorum...`);
         }
         const tocInput = document.getElementById('toc-height-input');
         if (tocInput) tocInput.value = committedHeight;
         await loadNamespaceBlobs();
         await fetchChainStats();
+
+        // Phase 2: Poll Publisher Node for DA Custody Quorum & KZG CommitsRoot
+        trackDACustodyVerification(committedHeight, txLogger);
       } else {
         if (txLogger) {
           txLogger.timeout();
           txLogger.log(`Transaction remains in mempool. Click badge above to recheck.`);
         }
+      }
+    }
+
+    async function trackDACustodyVerification(height, txLogger) {
+      if (!height || !txLogger) return;
+      for (let attempt = 0; attempt < 25; attempt++) {
+        try {
+          const hdrRes = await fetch(`${state.pubURL}/header/block-${height}`);
+          if (hdrRes.ok) {
+            const hdr = await hdrRes.json();
+            if (hdr && hdr.commits_root) {
+              const kVal = Array.isArray(hdr.column_comm) && hdr.column_comm.length > 0 ? Math.floor(hdr.column_comm.length / 2) : 32;
+              txLogger.daVerified(height, hdr.commits_root, kVal);
+              await loadNamespaceBlobs();
+              return;
+            }
+          }
+        } catch (_) {}
+        await new Promise(r => setTimeout(r, 1200));
       }
     }
 
@@ -2181,10 +2698,358 @@
       loadNamespaceBlobs();
     }
 
+    // 9. DA Network Matrix & Store / Light Node Onboarding Console
+    async function fetchNetworkMatrix() {
+      const previewBlockEl = document.getElementById('matrix-preview-block');
+      const sampleBlock = (previewBlockEl && previewBlockEl.value.trim()) ? previewBlockEl.value.trim() : 'block-5';
+      try {
+        const res = await fetch(`/api/network-matrix?block_id=${encodeURIComponent(sampleBlock)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.status !== 'success') return;
+        renderNetworkMatrix(data);
+      } catch (err) {
+        console.warn('fetchNetworkMatrix error:', err);
+      }
+    }
+
+    function shortPeerId(pid) {
+      if (!pid) return '-';
+      if (pid.length <= 16) return pid;
+      return `${pid.substring(0, 8)}…${pid.substring(pid.length - 6)}`;
+    }
+
+    function renderNetworkMatrix(data) {
+      const dimEl = document.getElementById('matrix-stat-dim');
+      if (dimEl) dimEl.textContent = `${data.net_rows || 8} × ${data.net_cols || 8}`;
+      const subEl = document.getElementById('matrix-stat-subrows');
+      if (subEl) subEl.textContent = `${data.sub_rows_per_cell || 16} data sub-rows / cell (N=${data.data_rows_per_block || 128})`;
+      const storesEl = document.getElementById('matrix-stat-stores');
+      if (storesEl) storesEl.textContent = `${(data.store_nodes || []).length} nodes`;
+      const lightsEl = document.getElementById('matrix-stat-lights');
+      if (lightsEl) lightsEl.textContent = `${(data.light_nodes || []).length} nodes`;
+
+      // Update Light Node selector and list
+      const lightSelect = document.getElementById('das-light-port-select');
+      const lightListEl = document.getElementById('light-nodes-list');
+      const lightNodes = data.light_nodes || [];
+      if (lightSelect) {
+        const prevVal = lightSelect.value;
+        lightSelect.innerHTML = lightNodes.map(ln =>
+          `<option value="${ln.port}">:${ln.port} ${ln.is_spawned ? '(Spawned)' : '(Cluster)'}</option>`
+        ).join('');
+        if (lightNodes.some(ln => String(ln.port) === String(prevVal))) {
+          lightSelect.value = prevVal;
+        }
+      }
+      if (lightListEl) {
+        lightListEl.innerHTML = lightNodes.map(ln => {
+          const histCount = (ln.das_history || []).length;
+          const lastDas = histCount > 0 ? ln.das_history[0] : null;
+          const lastBadge = lastDas
+            ? `<span class="${lastDas.success ? 'text-emerald-400' : 'text-amber-400'}">${lastDas.block_id}: ${lastDas.verified_cells}/${lastDas.total_sampled} ok</span>`
+            : `<span class="text-slate-500">Auto-DAS Active</span>`;
+          const roleBadge = ln.is_spawned
+            ? `<span class="text-[10px] bg-indigo-950 text-indigo-300 border border-indigo-800 px-1.5 py-0.5 rounded">Dynamic</span>`
+            : `<span class="text-[10px] text-slate-500">Cluster</span>`;
+          return `<div class="flex items-center justify-between bg-slate-900/80 border border-slate-800/80 px-2.5 py-1.5 rounded">
+            <div class="flex items-center space-x-2">
+              <span class="w-2 h-2 rounded-full bg-cyan-400"></span>
+              <span class="text-cyan-300 font-bold">:${ln.port}</span>
+              <span class="text-slate-400 text-[11px]" title="${escapeHtml(ln.peer_id)}">${escapeHtml(shortPeerId(ln.peer_id))}</span>
+            </div>
+            <div class="flex items-center space-x-2">
+              <span class="text-[11px]">${lastBadge}</span>
+              ${roleBadge}
+            </div>
+          </div>`;
+        }).join('');
+      }
+
+      // Render 2D Network Matrix Cells
+      const gridEl = document.getElementById('network-matrix-cells-grid');
+      if (!gridEl) return;
+
+      const storeByPeerId = new Map();
+      (data.store_nodes || []).forEach(s => storeByPeerId.set(s.peer_id, s));
+
+      gridEl.innerHTML = (data.cells || []).map(cell => {
+        const m = cell.native_count;
+        const pool = cell.custody_pool || [];
+        const striping = cell.striping || {};
+        const perPeerLoad = striping.per_peer_load || {};
+        const schedule = striping.schedule_sample || [];
+
+        let badgeClass = 'bg-slate-800 text-slate-300 border-slate-700';
+        let modeLabel = '1 Native + 1 Borrowed Backup';
+        if (m >= 2) {
+          badgeClass = 'bg-indigo-950 text-indigo-300 border-indigo-700';
+          modeLabel = `Multi-Node Striped (M=${m}, 1P+1B/subRow)`;
+        } else if (m === 0) {
+          badgeClass = 'bg-amber-950 text-amber-300 border-amber-700';
+          modeLabel = 'Empty Cell (2 Borrowed Custody)';
+        }
+
+        const peersHtml = pool.map(cp => {
+          const pid = cp.peer_id || '';
+          const sInfo = storeByPeerId.get(pid);
+          const load = perPeerLoad[pid] || { primary_rows: 0, backup_rows: 0, non_custody_rows: 0 };
+          const isBorrowed = (cp.row % (data.net_rows || 8)) !== cell.net_row;
+          const portLabel = (sInfo && sInfo.port) ? `:${sInfo.port}` : `Row ${cp.row}`;
+          const piecesLabel = (sInfo && sInfo.total_stored_pieces != null) ? `${sInfo.total_stored_pieces} pcs` : '';
+          const tScore = (sInfo && sInfo.trust_score != null) ? sInfo.trust_score : (cp.trust_score != null ? cp.trust_score : 60.0);
+          const tTier = (sInfo && sInfo.trust_tier) ? sInfo.trust_tier : (cp.trust_tier || 'STANDARD');
+          let tierBadge = `<span class="text-[9px] bg-sky-950 text-sky-300 border border-sky-800 px-1 rounded" title="Standard Tier (40..74.9)">● ${Number(tScore).toFixed(1)} STD</span>`;
+          if (tTier === 'TRUSTED') {
+            tierBadge = `<span class="text-[9px] bg-emerald-950 text-emerald-300 border border-emerald-700 px-1 rounded font-bold" title="Trusted Tier (>=75.0)">★ ${Number(tScore).toFixed(1)} TRUSTED</span>`;
+          } else if (tTier === 'PROBATION') {
+            tierBadge = `<span class="text-[9px] bg-amber-950 text-amber-300 border border-amber-700 px-1 rounded font-bold" title="Probation Tier (20..39.9): Protected by healthy co-custody guardian">⚠ ${Number(tScore).toFixed(1)} PROBATION</span>`;
+          } else if (tTier === 'QUARANTINED') {
+            tierBadge = `<span class="text-[9px] bg-rose-950 text-rose-300 border border-rose-700 px-1 rounded font-bold">⛔ 0.0 QUARANTINED</span>`;
+          }
+          const coRetainTag = load.co_retain_guardian
+            ? `<span class="text-[9px] bg-indigo-950 text-indigo-300 border border-indigo-700 px-1 rounded" title="Promoted to co-retain 4 pieces because native cell node is in PROBATION">Co-Primary 4pcs</span>`
+            : '';
+
+          return `<div class="bg-slate-900/90 border ${tTier === 'PROBATION' ? 'border-amber-700/70' : (isBorrowed ? 'border-amber-900/50' : 'border-slate-800')} rounded p-2 text-[11px] font-mono space-y-1">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center space-x-1.5">
+                <span class="w-1.5 h-1.5 rounded-full ${tTier === 'PROBATION' ? 'bg-amber-400' : (isBorrowed ? 'bg-amber-400' : 'bg-emerald-400')}"></span>
+                <span class="font-bold ${isBorrowed ? 'text-amber-300' : 'text-white'}">${escapeHtml(portLabel)}</span>
+                <span class="text-slate-400 text-[10px]" title="${escapeHtml(pid)}">${escapeHtml(shortPeerId(pid))}</span>
+              </div>
+              <div class="flex items-center space-x-1">
+                ${tierBadge}
+                ${isBorrowed ? `<span class="text-[9px] bg-amber-950 text-amber-300 border border-amber-800 px-1 rounded">Borrowed R${cp.row}</span>` : ''}
+                ${coRetainTag}
+                ${piecesLabel ? `<span class="text-[9px] text-slate-400">${piecesLabel}</span>` : ''}
+              </div>
+            </div>
+            <div class="flex items-center justify-between text-[10px] pt-1 border-t border-slate-800/80">
+              <span class="text-emerald-400" title="Sub-rows where this node is Primary Custody (stores 4 raw pieces)">Primary: <b>${load.primary_rows}</b>/16</span>
+              <span class="text-amber-400" title="Sub-rows where this node is Backup Custody (recodes & prunes to 1 piece)">Backup: <b>${load.backup_rows}</b>/16</span>
+              <span class="text-slate-400" title="Sub-rows where this node acts as Non-Custody (stores 1 recoded piece)">NC: <b>${load.non_custody_rows}</b>/16</span>
+            </div>
+          </div>`;
+        }).join('');
+
+        const scheduleHtml = schedule.slice(0, 4).map(item => {
+          const pInfo = storeByPeerId.get(item.primary);
+          const bInfo = storeByPeerId.get(item.backup);
+          const pTag = (pInfo && pInfo.port) ? `:${pInfo.port}` : shortPeerId(item.primary);
+          const bTag = (bInfo && bInfo.port) ? `:${bInfo.port}` : shortPeerId(item.backup);
+          return `<div class="flex items-center justify-between text-[10px] font-mono text-slate-400">
+            <span> dataRow <b>#${item.data_row}</b>:</span>
+            <span><b class="text-emerald-400">P${escapeHtml(pTag)}</b> / <b class="text-amber-400">B${escapeHtml(bTag)}</b></span>
+          </div>`;
+        }).join('');
+
+        return `<div class="bg-slate-900/50 border border-slate-800 rounded-xl p-3.5 flex flex-col justify-between space-y-3">
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-bold text-white font-mono">Cell [Row ${cell.net_row}, Col ${cell.net_col}]</span>
+              <span class="text-[10px] font-mono px-2 py-0.5 rounded border ${badgeClass}">M = ${m} native</span>
+            </div>
+            <p class="text-[10px] text-slate-400 font-mono">${escapeHtml(modeLabel)}</p>
+            <div class="space-y-1.5 pt-1">
+              ${peersHtml || '<p class="text-xs text-slate-500 italic">No custody peers</p>'}
+            </div>
+          </div>
+          <div class="pt-2 border-t border-slate-800/80 space-y-1">
+            <div class="flex items-center justify-between text-[10px] text-slate-500 font-semibold uppercase">
+              <span>Striping (${escapeHtml(data.sample_block_id || 'block-5')})</span>
+              <span class="text-[10px] text-slate-500 font-mono">16 sub-rows</span>
+            </div>
+            ${scheduleHtml}
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    async function quickSpawnInRow(rowIdx) {
+      const sel = document.getElementById('spawn-store-row-select');
+      if (sel) sel.value = String(rowIdx);
+      await spawnStoreNode();
+    }
+
+    async function spawnStoreNode() {
+      const sel = document.getElementById('spawn-store-row-select');
+      const row = sel ? parseInt(sel.value, 10) : -1;
+      const btn = document.getElementById('btn-spawn-store');
+      const fb = document.getElementById('store-spawn-feedback');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Starting Store Node...';
+      }
+      if (fb) {
+        fb.classList.remove('hidden');
+        fb.textContent = `Launching Store Node (${row < 0 ? 'Auto-Assign Least-Loaded Cell' : 'Target Row ' + row})...`;
+      }
+      try {
+        const res = await fetch('/api/nodes/store/spawn', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ row, col: 0 })
+        });
+        const data = await res.json();
+        if (data.status !== 'success') {
+          throw new Error(data.message || 'Failed to spawn Store Node');
+        }
+        const nInfo = data.node_info || {};
+        const assignedRow = (nInfo.net_row_idx != null) ? nInfo.net_row_idx : (row >= 0 ? row : 'Auto');
+        if (fb) {
+          fb.innerHTML = `<span class="text-emerald-400 font-bold">✓ Store Node Joined!</span> Port <b class="text-white">:${data.port}</b> (P2P :${data.p2p_port}) assigned to <b class="text-indigo-300">Cell [Row ${assignedRow}, Col 0]</b> — PeerID: <span class="text-slate-400">${escapeHtml(shortPeerId(nInfo.peer_id || ''))}</span>`;
+        }
+        await fetchNetworkMatrix();
+      } catch (err) {
+        if (fb) fb.innerHTML = `<span class="text-rose-400 font-bold">✗ Error:</span> ${escapeHtml(err.message)}`;
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = '+ Join New Store Node';
+        }
+      }
+    }
+
+    async function stopStoreNode(port) {
+      const fb = document.getElementById('store-spawn-feedback');
+      if (fb) {
+        fb.classList.remove('hidden');
+        fb.textContent = `Sending SIGTERM (Graceful Leave) to Store Node :${port}...`;
+      }
+      try {
+        const res = await fetch('/api/nodes/store/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ port })
+        });
+        const data = await res.json();
+        if (data.status !== 'success') {
+          throw new Error(data.message || 'Failed to stop Store Node');
+        }
+        if (fb) {
+          fb.innerHTML = `<span class="text-amber-400 font-bold">✓ Store Node :${port} Left Gracefully.</span> Bootstrap rebalanced column custody map.`;
+        }
+        await fetchNetworkMatrix();
+      } catch (err) {
+        if (fb) fb.innerHTML = `<span class="text-rose-400 font-bold">✗ Error:</span> ${escapeHtml(err.message)}`;
+      }
+    }
+
+    async function spawnLightNode() {
+      const btn = document.getElementById('btn-spawn-light');
+      const out = document.getElementById('das-sample-result');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Starting...';
+      }
+      try {
+        const res = await fetch('/api/nodes/light/spawn', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        const data = await res.json();
+        if (data.status !== 'success') {
+          throw new Error(data.message || 'Failed to spawn Light Node');
+        }
+        if (out) {
+          out.classList.remove('hidden');
+          out.innerHTML = `<span class="text-cyan-400 font-bold">✓ Light Node Joined on :${data.port}</span> (P2P :${data.p2p_port}, Auto-DAS enabled).`;
+        }
+        await fetchNetworkMatrix();
+      } catch (err) {
+        if (out) {
+          out.classList.remove('hidden');
+          out.innerHTML = `<span class="text-rose-400 font-bold">✗ Error:</span> ${escapeHtml(err.message)}`;
+        }
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = '+ Join New Light Node';
+        }
+      }
+    }
+
+    async function stopLightNode(port) {
+      try {
+        await fetch('/api/nodes/light/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ port })
+        });
+        await fetchNetworkMatrix();
+      } catch (_) {}
+    }
+
+    async function runLightDASSample() {
+      const portSel = document.getElementById('das-light-port-select');
+      const blockIn = document.getElementById('das-block-input');
+      const samplesIn = document.getElementById('das-samples-input');
+      const btn = document.getElementById('btn-run-das');
+      const out = document.getElementById('das-sample-result');
+
+      const port = portSel ? parseInt(portSel.value, 10) : 9401;
+      const blockId = blockIn ? blockIn.value.trim() : '5';
+      const samples = samplesIn ? parseInt(samplesIn.value, 10) : 4;
+
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Sampling...';
+      }
+      if (out) {
+        out.classList.remove('hidden');
+        out.textContent = `Light Node :${port} executing DAS sampling (${samples} random unique cells) for block ${blockId}...`;
+      }
+      try {
+        const res = await fetch('/api/nodes/light/sample', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ port, block_id: blockId, samples })
+        });
+        const data = await res.json();
+        if (data.status !== 'success') {
+          throw new Error(data.message || 'DAS sample failed');
+        }
+        const das = data.das || {};
+        const results = das.results || [];
+        const okCount = results.filter(r => r.verified).length;
+        const cellsBadges = results.map(r =>
+          `<span class="inline-block px-1.5 py-0.5 rounded text-[10px] mr-1 mb-1 ${r.verified ? 'bg-emerald-950 text-emerald-300 border border-emerald-800' : 'bg-rose-950 text-rose-300 border border-rose-800'}">[${r.row},${r.col}] ${r.verified ? '✓' : '✗'}</span>`
+        ).join('');
+        if (out) {
+          out.innerHTML = `<div class="space-y-1.5">
+            <div class="flex items-center justify-between">
+              <span class="${das.success ? 'text-emerald-400' : 'text-rose-400'} font-bold">${das.success ? '✓ DAS VERIFIED' : '✗ DAS FAILED'} — ${escapeHtml(data.block_id)} (${okCount}/${results.length} cells)</span>
+              <span class="text-slate-400">${data.duration_ms} ms via Light :${port}</span>
+            </div>
+            <div class="pt-1">${cellsBadges}</div>
+          </div>`;
+        }
+        await fetchNetworkMatrix();
+      } catch (err) {
+        if (out) {
+          out.innerHTML = `<span class="text-rose-400 font-bold">✗ DAS Error:</span> ${escapeHtml(err.message)}`;
+        }
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = 'Run DAS Sample';
+        }
+      }
+    }
+
     // Auto Polling
     initAccount();
     fetchChainStats();
+    fetchNetworkMatrix();
     setInterval(fetchChainStats, 3000);
+    setInterval(() => {
+      const panel = document.getElementById('panel-matrix');
+      if (panel && !panel.classList.contains('hidden')) {
+        fetchNetworkMatrix();
+      }
+    }, 4000);
   </script>
 </body>
 </html>

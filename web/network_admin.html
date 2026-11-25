@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CDA Network Admin &amp; Node Operations Console</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen font-sans antialiased">
+  <!-- Header -->
+  <header class="border-b border-slate-800 bg-slate-950/90 sticky top-0 z-50 backdrop-blur">
+    <div class="max-w-7xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-4">
+      <div class="flex items-center space-x-3">
+        <div class="w-8 h-8 rounded-lg bg-emerald-600 flex items-center justify-center font-bold text-white shadow-lg shadow-emerald-500/30">
+          OPS
+        </div>
+        <div>
+          <h1 class="text-lg font-bold text-white leading-tight">CDA Network Management Console</h1>
+          <p class="text-xs text-slate-400">Store Node Onboarding, Light Node Lifecycle &amp; Interactive DAS Operations</p>
+        </div>
+      </div>
+      <div class="flex items-center space-x-3 text-xs">
+        <a href="/" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 transition font-medium">
+          ← Back to Monitoring Dashboard
+        </a>
+        <button onclick="loadAdminMatrix()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg transition font-semibold cursor-pointer">
+          Refresh State
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto px-4 py-6 space-y-6">
+    <!-- CLI Reference Banner -->
+    <div class="bg-slate-950 border border-slate-800 rounded-xl p-4 text-xs flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <span class="text-emerald-400 font-bold uppercase text-[10px] tracking-wider block">Terminal / CLI Alternative</span>
+        <span class="text-slate-300">All operations on this page can also be executed via CLI script:</span>
+      </div>
+      <div class="flex flex-wrap gap-2 font-mono text-[11px]">
+        <code class="bg-slate-900 border border-slate-800 text-indigo-300 px-2 py-1 rounded">./scripts/cda_node_ctl.sh status</code>
+        <code class="bg-slate-900 border border-slate-800 text-emerald-300 px-2 py-1 rounded">./scripts/cda_node_ctl.sh rep-status</code>
+        <code class="bg-slate-900 border border-slate-800 text-amber-300 px-2 py-1 rounded">./scripts/cda_node_ctl.sh rep-sim &lt;port&gt; &lt;event&gt; [count]</code>
+        <code class="bg-slate-900 border border-slate-800 text-cyan-300 px-2 py-1 rounded">./scripts/cda_node_ctl.sh das &lt;block&gt; [samples]</code>
+      </div>
+    </div>
+
+    <!-- Operations Grid: Store Node & Light Node Controls -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <!-- 1. Store Node Lifecycle Management -->
+      <div class="bg-slate-950 border border-slate-800 rounded-xl p-5 space-y-4">
+        <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+          <div>
+            <h2 class="text-base font-bold text-white">1. Store Node Onboarding &amp; Graceful Leave</h2>
+            <p class="text-xs text-slate-400">Join a new Store Node into the Least-Loaded Cell or target a specific cell to scale $M \ge 2$ custody striping.</p>
+          </div>
+          <span id="admin-store-count" class="text-xs font-mono bg-emerald-950 text-emerald-300 border border-emerald-800 px-2.5 py-0.5 rounded">- active</span>
+        </div>
+
+        <div class="flex flex-wrap items-end gap-3">
+          <div class="flex-1 min-w-[220px]">
+            <label class="block text-xs font-semibold text-slate-400 mb-1">Target Cell Assignment (Column 0)</label>
+            <select id="admin-store-row" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white font-mono focus:border-emerald-500 focus:outline-none">
+              <option value="-1">Auto-Assign (Least-Loaded Cell Discovery)</option>
+              <option value="0">Cell [Row 0, Col 0]</option>
+              <option value="1">Cell [Row 1, Col 0]</option>
+              <option value="2">Cell [Row 2, Col 0]</option>
+              <option value="3">Cell [Row 3, Col 0]</option>
+              <option value="4">Cell [Row 4, Col 0]</option>
+              <option value="5">Cell [Row 5, Col 0]</option>
+              <option value="6">Cell [Row 6, Col 0]</option>
+              <option value="7">Cell [Row 7, Col 0]</option>
+            </select>
+          </div>
+          <button id="btn-admin-spawn-store" onclick="adminSpawnStore()" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-4 py-2 rounded-lg transition cursor-pointer">
+            + Join Store Node
+          </button>
+        </div>
+
+        <div id="admin-store-feedback" class="hidden text-xs font-mono p-3 rounded-lg border bg-slate-900 border-slate-800"></div>
+
+        <div>
+          <h3 class="text-xs font-bold uppercase text-slate-400 mb-2">Active Store Nodes in Column</h3>
+          <div id="admin-store-table" class="space-y-1.5 max-h-72 overflow-y-auto font-mono text-xs"></div>
+        </div>
+      </div>
+
+      <!-- 2. Light Node Lifecycle & Interactive DAS Runner -->
+      <div class="bg-slate-950 border border-slate-800 rounded-xl p-5 space-y-4">
+        <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+          <div>
+            <h2 class="text-base font-bold text-white">2. Light Node Onboarding &amp; DAS Execution</h2>
+            <p class="text-xs text-slate-400">Spawn Light Nodes and trigger on-demand Data Availability Sampling (random unique cells or targeted cell).</p>
+          </div>
+          <button id="btn-admin-spawn-light" onclick="adminSpawnLight()" class="bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition cursor-pointer">
+            + Join Light Node
+          </button>
+        </div>
+
+        <div class="grid grid-cols-2 sm:grid-cols-5 gap-2.5 items-end">
+          <div>
+            <label class="block text-[10px] uppercase font-bold text-slate-400 mb-1">Light Node</label>
+            <select id="admin-light-port" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-mono">
+              <option value="9401">:9401</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-[10px] uppercase font-bold text-slate-400 mb-1">Block ID/Height</label>
+            <input id="admin-das-block" type="text" value="5" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-mono">
+          </div>
+          <div>
+            <label class="block text-[10px] uppercase font-bold text-slate-400 mb-1">Random Samples</label>
+            <input id="admin-das-samples" type="number" min="1" max="32" value="4" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-mono">
+          </div>
+          <div>
+            <label class="block text-[10px] uppercase font-bold text-slate-400 mb-1">Or Cell [R,C]</label>
+            <input id="admin-das-cell" type="text" placeholder="e.g. 0,0" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-mono">
+          </div>
+          <div>
+            <button id="btn-admin-das" onclick="adminRunDAS()" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition cursor-pointer">
+              Run DAS
+            </button>
+          </div>
+        </div>
+
+        <div id="admin-das-output" class="hidden text-xs font-mono p-3 rounded-lg border bg-slate-900 border-slate-800 max-h-48 overflow-y-auto"></div>
+
+        <div>
+          <h3 class="text-xs font-bold uppercase text-slate-400 mb-2">Active Light Nodes</h3>
+          <div id="admin-light-table" class="space-y-1.5 max-h-56 overflow-y-auto font-mono text-xs"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    function shortPid(pid) {
+      if (!pid) return '-';
+      return pid.length <= 16 ? pid : `${pid.substring(0, 8)}…${pid.substring(pid.length - 6)}`;
+    }
+
+    async function loadAdminMatrix() {
+      try {
+        const res = await fetch('/api/network-matrix?block_id=block-5');
+        const data = await res.json();
+        if (data.status !== 'success') return;
+
+        document.getElementById('admin-store-count').textContent = `${(data.store_nodes || []).length} active`;
+
+        const storeEl = document.getElementById('admin-store-table');
+        storeEl.innerHTML = (data.store_nodes || []).map(s => {
+          const actionBtn = s.is_spawned
+            ? `<button onclick="adminStopStore(${s.port})" class="bg-rose-950 hover:bg-rose-900 text-rose-300 border border-rose-800 px-2 py-0.5 rounded text-[10px] cursor-pointer">Graceful Leave (SIGTERM)</button>`
+            : `<span class="text-slate-500 text-[10px]">Base Cluster</span>`;
+          const tScore = s.trust_score != null ? Number(s.trust_score).toFixed(1) : '60.0';
+          const tTier = s.trust_tier || 'STANDARD';
+          let tBadge = `<span class="bg-sky-950 text-sky-300 border border-sky-800 px-1.5 py-0.5 rounded text-[10px]">● ${tScore} STD</span>`;
+          if (tTier === 'TRUSTED') tBadge = `<span class="bg-emerald-950 text-emerald-300 border border-emerald-700 px-1.5 py-0.5 rounded text-[10px] font-bold">★ ${tScore} TRUSTED</span>`;
+          else if (tTier === 'PROBATION') tBadge = `<span class="bg-amber-950 text-amber-300 border border-amber-700 px-1.5 py-0.5 rounded text-[10px] font-bold">⚠ ${tScore} PROBATION</span>`;
+          else if (tTier === 'QUARANTINED') tBadge = `<span class="bg-rose-950 text-rose-300 border border-rose-700 px-1.5 py-0.5 rounded text-[10px] font-bold">⛔ 0.0 QUARANTINED</span>`;
+
+          return `<div class="flex items-center justify-between bg-slate-900 border border-slate-800 px-3 py-2 rounded-lg">
+            <div class="flex items-center space-x-2">
+              <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+              <span class="text-white font-bold">:${s.port || '-'}</span>
+              <span class="bg-indigo-950 text-indigo-300 border border-indigo-800 px-1.5 py-0.5 rounded text-[10px]">Cell [Row ${s.net_row}, Col ${s.col}]</span>
+              ${tBadge}
+              <span class="text-slate-400 text-[11px]" title="${s.peer_id}">${shortPid(s.peer_id)}</span>
+            </div>
+            <div class="flex items-center space-x-2">
+              <span class="text-slate-400 text-[11px]">Custody: [${(s.custody_net_rows || []).join(', ')}]</span>
+              ${actionBtn}
+            </div>
+          </div>`;
+        }).join('');
+
+        const lightNodes = data.light_nodes || [];
+        const lightSel = document.getElementById('admin-light-port');
+        const prevPort = lightSel.value;
+        lightSel.innerHTML = lightNodes.map(l => `<option value="${l.port}">:${l.port} ${l.is_spawned ? '(Spawned)' : '(Cluster)'}</option>`).join('');
+        if (lightNodes.some(l => String(l.port) === String(prevPort))) lightSel.value = prevPort;
+
+        const lightEl = document.getElementById('admin-light-table');
+        lightEl.innerHTML = lightNodes.map(l => {
+          const stopBtn = l.is_spawned
+            ? `<button onclick="adminStopLight(${l.port})" class="bg-rose-950 hover:bg-rose-900 text-rose-300 border border-rose-800 px-2 py-0.5 rounded text-[10px] cursor-pointer">Stop</button>`
+            : `<span class="text-slate-500 text-[10px]">Base Cluster</span>`;
+          return `<div class="flex items-center justify-between bg-slate-900 border border-slate-800 px-3 py-2 rounded-lg">
+            <div class="flex items-center space-x-2.5">
+              <span class="w-2 h-2 rounded-full bg-cyan-400"></span>
+              <span class="text-cyan-300 font-bold">:${l.port}</span>
+              <span class="text-slate-400 text-[11px]">${shortPid(l.peer_id)}</span>
+            </div>
+            <div>${stopBtn}</div>
+          </div>`;
+        }).join('');
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function adminSpawnStore() {
+      const row = parseInt(document.getElementById('admin-store-row').value, 10);
+      const btn = document.getElementById('btn-admin-spawn-store');
+      const fb = document.getElementById('admin-store-feedback');
+      btn.disabled = true;
+      fb.classList.remove('hidden');
+      fb.textContent = `Starting Store Node (${row < 0 ? 'Auto Least-Loaded Cell' : 'Row ' + row})...`;
+      try {
+        const res = await fetch('/api/nodes/store/spawn', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ row, col: 0 })
+        });
+        const data = await res.json();
+        if (data.status !== 'success') throw new Error(data.message);
+        const rAssigned = (data.node_info && data.node_info.net_row_idx != null) ? data.node_info.net_row_idx : row;
+        fb.innerHTML = `<span class="text-emerald-400 font-bold">✓ Joined Store Node :${data.port}</span> in Cell [Row ${rAssigned}, Col 0]`;
+        await loadAdminMatrix();
+      } catch (e) {
+        fb.innerHTML = `<span class="text-rose-400 font-bold">✗ ${e.message}</span>`;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function adminStopStore(port) {
+      const fb = document.getElementById('admin-store-feedback');
+      fb.classList.remove('hidden');
+      fb.textContent = `Sending SIGTERM to Store Node :${port}...`;
+      try {
+        const res = await fetch('/api/nodes/store/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ port })
+        });
+        const data = await res.json();
+        if (data.status !== 'success') throw new Error(data.message);
+        fb.innerHTML = `<span class="text-amber-400 font-bold">✓ ${data.message}</span>`;
+        await loadAdminMatrix();
+      } catch (e) {
+        fb.innerHTML = `<span class="text-rose-400 font-bold">✗ ${e.message}</span>`;
+      }
+    }
+
+    async function adminSpawnLight() {
+      const btn = document.getElementById('btn-admin-spawn-light');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/nodes/light/spawn', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        const data = await res.json();
+        if (data.status !== 'success') throw new Error(data.message);
+        await loadAdminMatrix();
+      } catch (e) {
+        alert(e.message);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function adminStopLight(port) {
+      await fetch('/api/nodes/light/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port }) });
+      await loadAdminMatrix();
+    }
+
+    async function adminRunDAS() {
+      const port = parseInt(document.getElementById('admin-light-port').value, 10) || 9401;
+      const blockId = document.getElementById('admin-das-block').value.trim() || '5';
+      const samples = parseInt(document.getElementById('admin-das-samples').value, 10) || 4;
+      const cellStr = document.getElementById('admin-das-cell').value.trim();
+      const out = document.getElementById('admin-das-output');
+      const btn = document.getElementById('btn-admin-das');
+
+      let payload = { port, block_id: blockId, samples };
+      if (cellStr && cellStr.includes(',')) {
+        const parts = cellStr.split(',');
+        payload.row = parseInt(parts[0].trim(), 10);
+        payload.col = parseInt(parts[1].trim(), 10);
+      }
+
+      btn.disabled = true;
+      out.classList.remove('hidden');
+      out.textContent = `Running DAS on Light Node :${port} for block ${blockId}...`;
+      try {
+        const res = await fetch('/api/nodes/light/sample', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data.status !== 'success') throw new Error(data.message);
+        const das = data.das || {};
+        const results = das.results || [];
+        const okCount = results.filter(r => r.verified).length;
+        const badges = results.map(r =>
+          `<span class="inline-block px-1.5 py-0.5 rounded text-[10px] mr-1 mb-1 ${r.verified ? 'bg-emerald-950 text-emerald-300 border border-emerald-800' : 'bg-rose-950 text-rose-300 border border-rose-800'}">[${r.row},${r.col}] ${r.verified ? '✓' : '✗'}</span>`
+        ).join('');
+        out.innerHTML = `<div class="space-y-1.5">
+          <div class="flex items-center justify-between">
+            <span class="${das.success ? 'text-emerald-400' : 'text-rose-400'} font-bold">${das.success ? '✓ DAS VERIFIED' : '✗ DAS FAILED'} — ${data.block_id} (${okCount}/${results.length} cells)</span>
+            <span class="text-slate-400">${data.duration_ms} ms</span>
+          </div>
+          <div>${badges}</div>
+        </div>`;
+      } catch (e) {
+        out.innerHTML = `<span class="text-rose-400 font-bold">✗ ${e.message}</span>`;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    loadAdminMatrix();
+    setInterval(loadAdminMatrix, 4000);
+  </script>
+</body>
+</html>

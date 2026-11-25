@@ -19,9 +19,10 @@ type BlockHeader struct {
 	ProposerAddress string    `json:"proposer_address,omitempty"`
 
 	// Data Availability Root-of-Trust Commitments
-	CommitsRoot string   `json:"commits_root"`
-	ColumnComm  [][]byte `json:"column_comm"` // 2K Kate column commitments (each is a G1Affine point)
-	Coeffs      []byte   `json:"coeffs"`      // Global Fiat-Shamir challenge vector (k * 32 bytes)
+	CommitsRoot   string   `json:"commits_root"`
+	ColumnComm    [][]byte `json:"column_comm"` // 2K Kate column commitments (each is a G1Affine point)
+	Coeffs        []byte   `json:"coeffs"`      // Global Fiat-Shamir challenge vector (k * 32 bytes)
+	DADurationSec float64  `json:"da_duration_sec,omitempty"`
 }
 
 // Serialize encodes the BlockHeader into JSON bytes.
