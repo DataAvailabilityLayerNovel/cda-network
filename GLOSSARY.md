@@ -75,15 +75,17 @@ Mỗi hàng mạng $r_{\text{net}}$ trong cột $c_{\text{net}}$ sử dụng **2
      $$Q = \max\left(1, \left\lceil \frac{k_{\text{piece}}}{M} \right\rceil\right) + 1$$
      mảnh recode lên kênh `TopicCellRowRecode`.
 
-### Custody Storage, Borrowed Backup Pruning & Non-Custody Re-Mixing
-- **Native Custody Nodes (Full Rank Quorum)**:
-  Thu thập mảnh từ `TopicCellRowSeed` và trao đổi mảnh recode với các node cùng ô trên `TopicCellRowRecode` cho đến khi tích lũy đủ **Full Rank**:
-  $$\text{Rank}(\text{Stored Pieces for } [r, c]) \ge k_{\text{piece}}$$
-  và giữ nguyên $k_{\text{piece}}$ mảnh độc lập tuyến tính để lưu trữ dài hạn.
-- **Borrowed Backup Custody Nodes (Immediate Pruning)**:
-  Tham gia nhận seed và phát đủ hạn ngạch $Q$ mảnh recode lên `TopicCellRowRecode`, sau đó **cắt tỉa (prune) ngay lập tức** các mảnh thô về đúng **1 mảnh recode** (trừ trường hợp cột mạng quá thưa với `activePeersInCol <= kPiece` thì giữ nguyên $k_{\text{piece}}$ mảnh để đảm bảo khả năng khôi phục cột).
+### Custody Storage, Per-SubRow Striping & Contention-Safe Reputation
+- **Per-SubRow & Per-Block Custody Striping (`1 Primary + 1 Backup`)**:
+  Khi một ô mạng $(r_{\text{net}}, c_{\text{net}})$ có $M \ge 2$ Store Nodes, thay vì bắt cả $M$ node lưu trùng lặp toàn bộ $\frac{2K}{R_{\text{net}}}$ hàng dữ liệu thuộc ô đó, hệ thống chọn tất định đúng **1 Primary Custody + 1 Backup Custody** xoay vòng cho từng `(blockID, subRow = dataRow / NetRows)` trong tập các node khỏe mạnh ($T \ge 40.0$). Các node còn lại trong ô đóng vai trò Non-Custody cho `dataRow` đó (chỉ giữ 1 mảnh recode), giúp chia đều tải CPU KZG, băng thông Gossip và dung lượng đĩa theo tỷ lệ $1/M$.
+- **Primary Custody Nodes (Full Rank Quorum)**:
+  Thu thập mảnh từ `TopicCellRowSeed` và `TopicCellRowRecode` cho đến khi tích lũy đủ **Full Rank** ($\text{Rank} \ge k_{\text{piece}}$) và giữ nguyên $k_{\text{piece}}$ mảnh độc lập tuyến tính để lưu trữ dài hạn.
+- **Backup Custody Nodes (Immediate Pruning)**:
+  Tham gia lấy mẫu hạt giống trên `TopicCellRowSeed` và phát đủ hạn ngạch $Q$ mảnh recode lên `TopicCellRowRecode`, sau đó **cắt tỉa (prune) ngay lập tức** các mảnh thô về đúng **1 mảnh recode**. Khi một ô lân cận tăng lên $M \ge 2$ node bản địa, node hàng bên cạnh được giải phóng khỏi nghĩa vụ Borrowed Backup và tự động `Unsubscribe` khỏi kênh `TopicCellRowSeed` của ô đó.
 - **Non-Custody Store Nodes (Hierarchical RLNC Re-Mixing)**:
-  Chỉ lắng nghe trên `TopicCellRowRecode`. Khi thu thập được $\ge 2$ mảnh độc lập tuyến tính từ $\ge 2$ nguồn (`minSources >= 2`), node thực hiện **Recode lần 2** (`RecodePiecesWithVerify`) để sinh ra **1 mảnh RLNC mới** có độ độc lập tuyến tính cao hơn rồi khóa ô (`nonCustodyLocked`) và xóa mảnh tạm. Nếu hết thời gian chờ ngắn mà chỉ nhận được 1 mảnh, node lưu trực tiếp 1 mảnh đó và khóa ô để không làm chậm tiến độ hoàn thành khối.
+  Chỉ lắng nghe trên `TopicCellRowRecode`. Khi thu thập được $\ge 2$ mảnh độc lập tuyến tính từ $\ge 2$ nguồn (`minSources >= 2`), node thực hiện **Recode lần 2** (`RecodePiecesWithVerify`) để sinh ra **1 mảnh RLNC mới** rồi khóa ô (`nonCustodyLocked`) và xóa mảnh tạm.
+- **Contention-Safe Node Trust & Reputation (`TrustScore` & `TrustTier`)**:
+  Hệ thống điểm tín nhiệm $T \in [0, 100]$ (khởi tạo ở $60.0$ `STANDARD`) với 4 phân hạng: `TRUSTED` ($\ge 75.0$), `STANDARD` ($40.0 - 74.9$), `PROBATION` ($20.0 - 39.9$, sàn bảo vệ lỗi mềm $25.0$ không bao giờ abort node do tranh chấp CPU), và `QUARANTINED` ($0.0$, chỉ áp dụng cho vi phạm mật mã KZG / Griefing). Có cơ chế **Straggler Forgiveness** (tự động hoàn điểm khi node hoàn thành `StoreReady` trễ) và **Co-Primary Guardian** (nâng node Backup khỏe mạnh lên giữ hộ $k_{\text{piece}}=4$ mảnh khi node bản địa đang ở hạng `PROBATION`).
 
 ### CDA BlockReady
 - Tín hiệu sự kiện phát ra từ CDA Publisher / Bootstrap Relay khi toàn bộ các hàng mạng `0 .. NetRows-1` trong các cột mạng hoạt động đã có ít nhất một Custody Store Node hoàn thành lưu ký (`StoreReady`) cho khối.

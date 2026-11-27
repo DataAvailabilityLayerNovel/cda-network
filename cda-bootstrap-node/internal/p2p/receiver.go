@@ -802,7 +802,9 @@ func (rcv *Receiver) waitForDispatchTurn(height int, blockID string) {
 		isHeadOfQueue := len(rcv.pendingDispatchQueue) > 0 && rcv.pendingDispatchQueue[0] == height
 
 		// Condition 2: Store nodes must have completed the last dispatched block
-		prevCompleted := rcv.lastDispatchedHeight == 0 || rcv.latestCompletedHeight >= rcv.lastDispatchedHeight
+		// (or if 0 Store Nodes have joined the column so far, pre-cache immediately without blocking so future joiners can catch up).
+		_, _, activeStoresCount := rcv.getCustodySnapshot()
+		prevCompleted := activeStoresCount == 0 || rcv.lastDispatchedHeight == 0 || rcv.latestCompletedHeight >= rcv.lastDispatchedHeight
 
 		if isHeadOfQueue && prevCompleted {
 			// Gate cleared! Pop from queue and advance lastDispatchedHeight

@@ -8,11 +8,8 @@ import (
 	"log"
 	"math/big"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -84,12 +81,13 @@ func main() {
 	// Auto-Join Least-Loaded Cell Discovery:
 	// If RowIdx < 0 or ColIdx < 0, query Bootstrap /bootstrap/peers to discover the active column
 	// and assign this Store Node to the network row with the fewest active Store Nodes (Least-Loaded Cell).
+	bootstrapHTTPBase := p2pcommon.DeriveHTTPAddrFromP2POrHTTP(cfg.BootstrapAddr)
 	if cfg.RowIdx < 0 || cfg.ColIdx < 0 {
 		discoveredRow := -1
 		discoveredCol := cfg.ColIdx
-		if cfg.BootstrapAddr != "" && strings.HasPrefix(cfg.BootstrapAddr, "http") {
+		if bootstrapHTTPBase != "" {
 			client := &http.Client{Timeout: 1500 * time.Millisecond}
-			resp, err := client.Get(strings.TrimSuffix(cfg.BootstrapAddr, "/") + "/bootstrap/peers")
+			resp, err := client.Get(bootstrapHTTPBase + "/bootstrap/peers")
 			if err == nil {
 				var peerData struct {
 					RowCustodyMap map[string][]p2pcommon.PeerInfo `json:"row_custody_map"`
@@ -254,38 +252,13 @@ func main() {
 		log.Fatalf("Failed to calculate bootstrap PeerID: %v", err)
 	}
 
-	// Dynamic resolution of own multiaddr
-	hostName := "localhost"
-	u, err := url.Parse(cfg.MyAddr)
-	if err == nil {
-		hostName = u.Hostname()
-	}
-	myP2PAddr := fmt.Sprintf("/dns4/%s/tcp/%d", hostName, p2pPort)
-	myP2PAddrQUIC := fmt.Sprintf("/dns4/%s/udp/%d/quic-v1", hostName, p2pPort)
-	myAddrs := []string{myP2PAddrQUIC, myP2PAddr}
+	// Dynamic resolution of own externally advertised multiaddrs (supports Docker port mapping & raw IPv4/DNS)
+	myAddrs := p2pcommon.BuildAdvertisedP2PAddrs(cfg.MyAddr, cfg.Port)
+	log.Printf("[P2P Identity] Advertising external P2P multiaddrs: %v", myAddrs)
 
 	// Helper to resolve address to multiaddr
 	resolveToMultiaddr := func(addrStr string, bootPID peer.ID) (multiaddr.Multiaddr, error) {
-		resolved := addrStr
-		if strings.HasPrefix(resolved, "http://") || strings.HasPrefix(resolved, "https://") {
-			u, err := url.Parse(resolved)
-			if err == nil {
-				hostStr := u.Hostname()
-				portStr := u.Port()
-				if portVal, err := strconv.Atoi(portStr); err == nil {
-					pPort := portVal + 10000
-					if hostStr == "localhost" || hostStr == "127.0.0.1" {
-						resolved = fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", pPort)
-					} else {
-						resolved = fmt.Sprintf("/dns4/%s/udp/%d/quic-v1", hostStr, pPort)
-					}
-				}
-			}
-		}
-		if !strings.Contains(resolved, "/p2p/") {
-			resolved = fmt.Sprintf("%s/p2p/%s", resolved, bootPID.String())
-		}
-		return multiaddr.NewMultiaddr(resolved)
+		return p2pcommon.ResolvePeerMultiaddr(addrStr, bootPID, true)
 	}
 
 	targetBootAddr := cfg.BootstrapAddr
@@ -342,7 +315,11 @@ func main() {
 		log.Fatalf("Failed to parse bootstrap PeerInfo: %v", err)
 	}
 
-	receiver.SetBootstrapHTTPAddr(cfg.BootstrapAddr)
+	if bootstrapHTTPBase != "" {
+		receiver.SetBootstrapHTTPAddr(bootstrapHTTPBase)
+	} else {
+		receiver.SetBootstrapHTTPAddr(cfg.BootstrapAddr)
+	}
 
 	registerAndSyncPeers := func() {
 		connCtx, connCancel := context.WithTimeout(ctx, 10*time.Second)

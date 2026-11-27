@@ -37,16 +37,18 @@ Toàn bộ các thành phần trong hệ thống đã được đồng bộ chu�
 | **Cell Size** | **512 bytes** | Kích thước chuẩn của một ô trong ma trận ODS/EDS (đồng bộ trong CometBFT CDA Engine, Publisher, Store Node và Submitter Bot). |
 | **$k_{\text{piece}}$** | **4 fragments / cell** | Mỗi ô dữ liệu (cell 512B) được chia thành 4 fragments ($512\text{B} / 4 = 128\text{B}$). Một mảnh RLNC piece là một tổ hợp tuyến tính của 4 fragments này (payload = 128B). Cần tối thiểu 4 mảnh độc lập tuyến tính để giải mã phục hồi 1 cell hoàn chỉnh. |
 | **Network Matrix ($R_{\text{net}} \times C_{\text{net}}$)** | **$4-8$ rows $\times 8$ cols** | Ma trận mạng P2P 2 chiều (`--net-rows`, `--net-cols`). Mỗi ô mạng $(r_{\text{net}}, c_{\text{net}})$ có thể chứa $M \ge 1$ Custody Store Nodes (`--nodes-per-cell`). |
-| **Kênh GossipSub Kép** | **`/seed` & `/recode`** | Bootstrap phát bể $2 \cdot k_{\text{piece}}$ hạt giống lên `/cda/1.0.0/col/<c>/row/<r>/seed`; Custody Nodes lấy mẫu ngẫu nhiên $S_{\text{node}} = \max(2, \lceil 2k_{\text{piece}}/M \rceil)$ mảnh và phát $Q = \max(1, \lceil k_{\text{piece}}/M \rceil) + 1$ mảnh recode lên `/cda/1.0.0/col/<c>/row/<r>/recode`. |
+| **Chia tải Custody (`Per-SubRow Striping`)** | **`1 Primary + 1 Backup` / subRow** | Khi 1 ô mạng có $M \ge 2$ node, mỗi `(blockID, subRow)` chỉ chọn tất định **1 Primary Custody (lưu 4 mảnh)** + **1 Backup Custody (recode rồi cắt về 1 mảnh)** xoay vòng theo `FNV1a(blockID, netRow) + subRow`, còn $M-2$ node còn lại làm Non-Custody (giữ 1 mảnh). |
+| **Điểm Tín Nhiệm (`TrustScore`)** | **$0.0 - 100.0$ (Khởi tạo $60.0$)** | Phân hạng `TRUSTED` ($\ge 75$), `STANDARD` ($40-74.9$), `PROBATION` ($20-39.9$, sàn bảo vệ lỗi mềm $25.0$), `QUARANTINED` ($0.0$, chỉ khi gian lận mật mã KZG). Có cơ chế `Straggler Forgiveness` và `Co-Primary Guardian`. |
+| **Kênh GossipSub Kép** | **`/seed` & `/recode`** | Bootstrap phát bể $2 \cdot k_{\text{piece}}$ hạt giống lên `/cda/1.0.0/col/<c>/row/<r>/seed`; Custody Nodes lấy mẫu ngẫu nhiên $S_{\text{node}} = \max(2, \lceil 2k_{\text{piece}}/M_{\text{active}} \rceil)$ mảnh và phát $Q = \max(1, \lceil k_{\text{piece}}/M_{\text{active}} \rceil) + 1$ mảnh recode lên `/cda/1.0.0/col/<c>/row/<r>/recode`. |
 | **RPC Max Body Size** | **10 MB** (`10000000`) | Giới hạn payload HTTP tiếp nhận của CometBFT RPC để hỗ trợ các giao dịch dung lượng lớn. |
 | **In-Flight Queue** | **Tối đa 32 blocks** | Hàng đợi pipeline xử lý song song của CDA Publisher trước khi áp dụng backpressure. |
 
 > [!NOTE]
-> **Quy tắc phân rã Cell, Lưu ký Custody & Tái mã hóa phân cấp**:
+> **Quy tắc phân rã Cell, Chia tải Sub-Row & Bảo vệ Tín nhiệm**:
 > - **Kích thước Fragment**: $\text{Fragment Size} = \frac{\text{Cell Size}}{k_{\text{piece}}} = \frac{512\text{ bytes}}{4} = 128\text{ bytes}$.
-> - **Native Custody (Full Rank)**: Mỗi Custody Node trong ô mạng $(r_{\text{net}}, c_{\text{net}})$ thu thập mảnh từ kênh `/seed` và `/recode` cho đến khi tích lũy đủ $\text{Rank} \ge k_{\text{piece}}$ mảnh RLNC độc lập tuyến tính và lưu trữ dài hạn.
-> - **Borrowed Backup Custody**: Khi một ô mạng thiếu node, hệ thống tự động mượn 1 Backup Node từ hàng kế cận `(r + 1) % NetRows`. Backup Node phát đủ hạn ngạch $Q$ mảnh recode lên `/recode` rồi cắt tỉa (prune) ngay lập tức về 1 mảnh recode.
-> - **Non-Custody Store Nodes**: Thu thập $\ge 2$ mảnh độc lập tuyến tính từ $\ge 2$ nguồn (`minSources >= 2`) trên kênh `/recode` và thực hiện **Recode lần 2** thành 1 mảnh mới trước khi khóa ô (hoặc lưu trực tiếp 1 mảnh nếu hết thời gian chờ ngắn mà chỉ nhận được 1 mảnh).
+> - **Primary Custody (Full Rank)**: Giữ đủ $\text{Rank} = k_{\text{piece}} = 4$ mảnh RLNC độc lập tuyến tính dài hạn.
+> - **Backup Custody (Immediate Pruning)**: Lấy mẫu 4 hạt giống từ `/seed`, phát đủ hạn ngạch $Q = 3$ mảnh recode lên `/recode`, sau đó **cắt tỉa (prune) ngay lập tức** về 1 mảnh recode và tự động hủy đăng ký (`Unsubscribe`) kênh `/seed` của hàng lân cận khi hàng đó đã có $\ge 2$ node bản địa.
+> - **Co-Primary Guardian (Bảo vệ Kép khi `PROBATION`)**: Nếu một ô đơn node ($M=1$) có node duy nhất bị tụt điểm xuống hạng `PROBATION` ($T < 40.0$), hệ thống không abort node đó mà tự động nâng node Backup mượn từ hàng khác ($T \ge 40.0$) lên giữ song song $k_{\text{piece}} = 4$ mảnh gốc cho đến khi node bản địa tự hồi phục điểm (`+2.0/block`).
 
 ---
 
@@ -69,7 +71,33 @@ $$K = 2^{\lceil \log_2(\sqrt{\lceil \text{TotalBytes} / 512 \rceil}) \rceil}$$
 
 ### 2.1. Khởi Tạo Mới Toàn Bộ Cụm (Clean Initialization)
 
-Khi bắt đầu một phiên làm việc mới hoặc cần reset sạch dữ liệu cũ:
+Hệ thống hỗ trợ **2 chế độ khởi tạo trên Máy Chủ Chính**:
+
+#### A. Cấu hình Chuẩn 2 Máy Chủ (`active_cols = 1`, `net_rows = 4`, Máy Chính 6 Store Nodes + Máy Phụ 2 Store Nodes)
+Khi vận hành trên **1 Máy Chính + 1 Máy Phụ** với `active_cols = 1` và `4 row mạng (Row 0..3)`:
+- **Trên Máy Chính (`MAIN_HOST_IP`, ví dụ `192.168.1.10`)**: Chạy `CometBFT + Publisher + Bootstrap-0 + 6 Store Nodes (:9300..9305)`:
+  - `Row 0`: 2 Store Nodes (`:9300`, `:9304`)
+  - `Row 1`: 2 Store Nodes (`:9301`, `:9305`)
+  - `Row 2`: 1 Store Node (`:9302` — tạm mượn Backup từ `Row 0/1` khi Máy Phụ chưa bật)
+  - `Row 3`: 1 Store Node (`:9303` — tạm mượn Backup từ `Row 0/1` khi Máy Phụ chưa bật)
+- **Trên Máy Phụ (`WORKER_PUBLIC_IP`, ví dụ `192.168.1.50`)**: Chạy **2 Store Nodes (`:9310`, `:9311`) + 1 Light Node (`:9410`)** qua [`docker-compose.worker.yml`](file:///home/ubuntu/cda-network/docker-compose.worker.yml). Khi khởi chạy với `STORE_ROW=-1`, 2 Store Nodes trên Máy Phụ tự động phát hiện `Row 2` và `Row 3` là 2 ô ít node nhất (`Least-Loaded`) và gia nhập vào `Row 2` & `Row 3`, tạo thành ma trận đối xứng **$4 \text{ hàng} \times 2 \text{ nodes/ô} = 8 \text{ Store Nodes}$**!
+
+```bash
+# 1. Trên Máy Chính (192.168.1.10):
+bash scripts/cleanup.sh
+python3 scripts/init_cometbft_cluster.py --validators 4
+python3 scripts/generate_compose.py -c 1 -s 4 --total-stores 6 -l 1 -k 64
+MAIN_HOST_IP=192.168.1.10 docker compose -f docker-compose.json up -d --build
+
+# 2. Trên Máy Phụ (192.168.1.50):
+MAIN_HOST_IP=192.168.1.10 \
+WORKER_PUBLIC_IP=192.168.1.50 \
+CDA_NET_ROWS=4 \
+docker compose -f docker-compose.worker.yml up -d --build
+```
+
+#### B. Chế độ Tinh Gọn `Core-Only` (Chỉ chạy `CometBFT + Publisher + Bootstrap` trên Máy Chủ Chính)
+Giúp giảm ~75% tải CPU/RAM trên máy chủ chính bằng cách không khởi chạy sẵn 8 Store Nodes và Light Nodes tại chỗ. Các Store Nodes và Light Nodes sẽ tham gia động từ các máy chủ phụ (qua [`docker-compose.worker.yml`](file:///home/ubuntu/cda-network/docker-compose.worker.yml)) hoặc bật linh hoạt theo nhu cầu qua [`scripts/cda_node_ctl.sh`](file:///home/ubuntu/cda-network/scripts/cda_node_ctl.sh):
 
 ```bash
 # Bước 1: Dọn dẹp các container và volume dữ liệu cũ
@@ -78,14 +106,30 @@ bash scripts/cleanup.sh
 # Bước 2: Khởi tạo cấu hình genesis, validator keys và nâng RPC max_body_bytes = 10MB
 python3 scripts/init_cometbft_cluster.py --validators 4
 
-# Bước 3: Tự động sinh cấu hình Docker Compose, Prometheus và Dashboard Grafana
-# Ví dụ mặc định (8 net-cols x 8 net-rows x 1 node/cell, chạy cột 0):
-python3 scripts/generate_compose.py
+# Bước 3 (Cách 1): Chạy trực tiếp file docker-compose.core.yml tối giản
+docker compose -f docker-compose.core.yml up -d --build
+
+# Bước 3 (Cách 2): Hoặc sinh docker-compose.json ở chế độ --core-only (0 Store Node, 0 Light Node, có kèm Prometheus/Grafana)
+python3 scripts/generate_compose.py --core-only -c 1 -k 64
+docker compose -f docker-compose.json up -d --build
+```
+
+> [!TIP]
+> Trong chế độ `Core-Only`, bạn chỉ cần cho **1 hoặc 2 Store Nodes** gia nhập mạng (từ máy khác hoặc bằng lệnh `./scripts/cda_node_ctl.sh join-store auto`) là thuật toán `ComputeColumnCustodyMap` sẽ tự động phân công 1–2 node đó gánh hộ các hàng mạng còn trống và hoàn tất `CDA BlockReady` bình thường mà không cần chạy đủ 8 Store Nodes.
+
+#### B. Chế độ Đầy Đủ Trên 1 Máy (`All-in-One Local Cluster`)
+Khi muốn chạy sẵn toàn bộ 8 Store Nodes + Light Nodes trên cùng một máy chủ:
+
+```bash
+bash scripts/cleanup.sh
+python3 scripts/init_cometbft_cluster.py --validators 4
+
+# Sinh cấu hình mặc định (8 net-cols x 8 net-rows x 1 node/cell, chạy cột 0):
+python3 scripts/generate_compose.py -c 1 -k 64
 
 # Hoặc sinh cấu hình đa node trên mỗi ô mạng (ví dụ: 8 net-cols x 4 net-rows x 2 nodes/cell):
 python3 scripts/generate_compose.py --net-cols 8 --net-rows 4 --nodes-per-cell 2 --active-cols 1
 
-# Bước 4: Khởi động toàn bộ containers ở chế độ chạy nền
 docker compose -f docker-compose.json up -d --build
 ```
 
@@ -127,6 +171,72 @@ docker logs -f store-0-1
 # Xem log CometBFT validator
 docker logs -f cometbft-0
 ```
+
+---
+
+### 2.4. Tham Gia Mạng Từ Máy Chủ Khác (Multi-Host Node Onboarding) & Quản Lý Vòng Đời Node
+
+#### A. Tham gia mạng từ Máy Phụ qua Docker (`docker-compose.worker.yml`)
+Khi cụm chính đang chạy ở **Máy Chính (`MAIN_HOST_IP`, ví dụ `192.168.1.10`)**, bạn có thể đóng gói image hoặc đưa [`docker-compose.worker.yml`](file:///home/ubuntu/cda-network/docker-compose.worker.yml) sang **Máy Phụ (`WORKER_PUBLIC_IP`, ví dụ `192.168.1.50`)** để khởi chạy thêm Store Node và Light Node:
+
+```bash
+# 1. Tự động gia nhập Ô Ít Tải Nhất (Least-Loaded Cell Discovery: STORE_ROW=-1)
+MAIN_HOST_IP=192.168.1.10 \
+WORKER_PUBLIC_IP=192.168.1.50 \
+STORE_ROW=-1 \
+docker compose -f docker-compose.worker.yml up -d --build
+
+# 2. Hoặc chỉ định gia nhập vào một ô cụ thể (ví dụ Row 0 để kích hoạt Multi-Node Cell M >= 2)
+MAIN_HOST_IP=192.168.1.10 \
+WORKER_PUBLIC_IP=192.168.1.50 \
+STORE_ROW=0 \
+docker compose -f docker-compose.worker.yml up -d
+```
+
+#### B. Quản lý Store Node, Light Node, DAS & Điểm Tín Nhiệm bằng CLI [`scripts/cda_node_ctl.sh`](file:///home/ubuntu/cda-network/scripts/cda_node_ctl.sh)
+```bash
+# 1. Xem trạng thái Ma trận mạng 2D, danh sách Store Nodes & Light Nodes
+./scripts/cda_node_ctl.sh status
+
+# 2. Khởi chạy thêm Store Node (Auto-Join vào ô ít tải nhất hoặc chỉ định hàng 0..7)
+./scripts/cda_node_ctl.sh join-store auto
+./scripts/cda_node_ctl.sh join-store 0
+
+# 3. Cho Store Node rời mạng chủ động (Graceful Leave - SIGTERM)
+./scripts/cda_node_ctl.sh leave-store 9310
+
+# 4. Khởi chạy / Dừng Light Node và lấy mẫu DAS
+./scripts/cda_node_ctl.sh join-light
+./scripts/cda_node_ctl.sh das 5 4
+./scripts/cda_node_ctl.sh das-cell 5 0 0
+
+# 5. Xem bảng xếp hạng Điểm Tín nhiệm & Giả lập kịch bản Tín nhiệm nhanh
+./scripts/cda_node_ctl.sh rep-status
+./scripts/cda_node_ctl.sh rep-sim 9301 missed_block 5
+./scripts/cda_node_ctl.sh rep-sim 9301 block_completed 26
+./scripts/cda_node_ctl.sh rep-reset all
+
+# 6. Chạy Suite Kiểm thử Tự động Hệ thống Điểm Tín nhiệm & Chống tranh chấp CPU
+python3 scripts/tests/resilience/test_reputation_system.py
+```
+
+---
+
+### 2.5. Hướng Dẫn Người Dùng Cuối Sử Dụng Web Dashboard (`:8889`)
+
+Khởi chạy máy chủ giao diện Web:
+```bash
+python3 -u scripts/serve_dashboard.py 8889
+```
+
+Hệ thống tách biệt 2 giao diện:
+1. **Giao diện Người dùng & Theo dõi Ma trận (`http://localhost:8889/`)**:
+   - **Tạo/Quản lý Tài khoản Ed25519 (`Account & Keys`)**: Sinh khóa Ed25519 chuẩn RFC 8032 ngay trên trình duyệt với địa chỉ `cda1_<16_hex>`, hỗ trợ Export JSON và Import Private Seed Hex.
+   - **Ký số & Đẩy Dữ liệu (`Upload Blob`)**: Mọi giao dịch gửi vào namespace `cda1_...` đều được tự động ký số `@<pubKeyHex>.<sigHex>` và được CometBFT `CheckTx` xác thực quyền sở hữu. Hỗ trợ gom Single Native Blob ($\le 256\text{ KB}$) vào **1 block duy nhất** và tự động cắt chunk song song (`Promise.all`) cho file lớn Multi-Part.
+   - **Tra cứu & Tải File (`Namespace & Blobs`)**: Xem danh mục blob theo namespace và tải xuống file nhị phân gốc.
+   - **Khám phá Khối (`Block Explorer`) & Giám sát Ma trận (`DA Network Matrix - Monitor`)**: Quan sát `Consensus Time`, `DA Time`, bảng mục lục khối (TOC), sơ đồ phân bổ ô ODS và trạng thái điểm tín nhiệm/chia tải của từng ô mạng (chế độ chỉ đọc).
+2. **Giao diện Quản trị Mạng CDA (`http://localhost:8889/network-admin`)**:
+   - Dành riêng cho người vận hành mạng để thêm/bớt Store Node, Light Node và chạy thử nghiệm DAS.
 
 ---
 

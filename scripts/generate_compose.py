@@ -10,11 +10,11 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                      bootstrap_encode_workers=None,
                      publisher_max_in_flight=None, gomaxprocs=None, cpus=None,
                      cometbft_validators=0, cell_size=512,
-                     nodes_per_cell=1, peer_ttl='15s'):
+                     nodes_per_cell=1, peer_ttl='15s', total_stores_per_col=None):
     if active_cols is None:
         active_cols = cols
-    if nodes_per_cell is None or nodes_per_cell < 1:
-        nodes_per_cell = 1
+    if nodes_per_cell is None or nodes_per_cell < 0:
+        nodes_per_cell = 0
     crash_arg = ["-crash-on-fail=true"] if crash_on_fail else []
     compose = {
         'services': {},
@@ -98,13 +98,31 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
 
         bootstrap_addresses.append(f"{c}:/dns4/{bootstrap_name}/udp/{bootstrap_p2p_port}/quic-v1")
 
-        # Store Nodes for this column (NetRows x NodesPerCell)
-        for s in range(1, stores_per_col + 1):
-            for replica in range(1, nodes_per_cell + 1):
-                store_name = f'store-{c}-{s}' if replica == 1 else f'store-{c}-{s}-r{replica}'
-                store_ports.append(current_store_host_port)
+        # Store Nodes for this column:
+        # Either exact total_stores_per_col (placed round-robin across 0..stores_per_col-1, e.g. 6 stores across 4 rows -> Row 0,1 have 2 nodes; Row 2,3 have 1 node)
+        # or NetRows x NodesPerCell
+        store_assignments = []
+        if total_stores_per_col is not None and total_stores_per_col >= 0:
+            row_seq_counts = {}
+            for idx in range(total_stores_per_col):
+                r_idx = idx % stores_per_col
+                rep = row_seq_counts.get(r_idx, 0) + 1
+                row_seq_counts[r_idx] = rep
+                s_name = f'store-{c}-{idx + 1}'
+                store_assignments.append((s_name, r_idx))
+        else:
+            for s in range(1, stores_per_col + 1):
+                for replica in range(1, nodes_per_cell + 1):
+                    s_name = f'store-{c}-{s}' if replica == 1 else f'store-{c}-{s}-r{replica}'
+                    store_assignments.append((s_name, s - 1))
 
-                store_env = []
+        for store_name, row_idx in store_assignments:
+                store_ports.append(current_store_host_port)
+                store_p2p_port = current_store_host_port + 10000
+
+                store_env = [
+                    'CDA_PUBLIC_IP=${MAIN_HOST_IP:-}'
+                ]
                 if store_gossip_batch_size is not None:
                     store_env.append(f'STORE_GOSSIP_BATCH_SIZE={store_gossip_batch_size}')
                 if store_gossip_batch_workers is not None:
@@ -127,8 +145,8 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                     },
                     'command': [
                         "/usr/local/bin/store",
-                        "-port", "8080",
-                        "-row", str(s - 1),
+                        "-port", str(current_store_host_port),
+                        "-row", str(row_idx),
                         "-col", str(col_id),
                         "-publisher", "http://publisher:8080",
                         "-bootstrap", f"/dns4/{bootstrap_name}/udp/{bootstrap_p2p_port}/quic-v1",
@@ -138,10 +156,10 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
                         "-net-cols", str(cols),
                         "-stores-per-col", str(stores_per_col),
                         "-net-rows", str(stores_per_col),
-                        "-myaddr", f"http://{store_name}:8080"
+                        "-myaddr", f"http://{store_name}:{current_store_host_port}"
                     ] + crash_arg + (["-prune-enable=true"] if prune_enable else []) + (["-prune-ttl", prune_ttl] if prune_ttl else []),
-                    'ports': [f"{current_store_host_port}:8080", f"{current_store_host_port + 10000}:18080", f"{current_store_host_port + 10000}:18080/udp"],
-                    'volumes': [f"./data/store_{current_store_host_port}:/app/data/store_8080"],
+                    'ports': [f"{current_store_host_port}:{current_store_host_port}", f"{store_p2p_port}:{store_p2p_port}", f"{store_p2p_port}:{store_p2p_port}/udp"],
+                    'volumes': [f"./data/store_{current_store_host_port}:/app/data/store_{current_store_host_port}"],
                     'networks': ['cda-net'],
                     'depends_on': [bootstrap_name]
                 }
@@ -262,9 +280,9 @@ def generate_compose(k, k_piece, cols, stores_per_col, lights, crash_on_fail=Fal
 
     return compose, store_ports
 
-def generate_prometheus_config(active_cols, stores_per_col, lights, cometbft_validators=0, nodes_per_cell=1):
-    if nodes_per_cell is None or nodes_per_cell < 1:
-        nodes_per_cell = 1
+def generate_prometheus_config(active_cols, stores_per_col, lights, cometbft_validators=0, nodes_per_cell=1, total_stores_per_col=None):
+    if nodes_per_cell is None or nodes_per_cell < 0:
+        nodes_per_cell = 0
     os.makedirs('data', exist_ok=True)
     prometheus_yml = """global:
   scrape_interval: 1s
@@ -282,24 +300,35 @@ scrape_configs:
     for c in range(active_cols):
         prometheus_yml += f"          - 'bootstrap-{c}:{9200+c}'\n"
 
-    prometheus_yml += """
+    has_stores = (total_stores_per_col is not None and total_stores_per_col > 0) or (total_stores_per_col is None and nodes_per_cell > 0 and stores_per_col > 0)
+    if has_stores:
+        prometheus_yml += """
   - job_name: 'stores'
     static_configs:
       - targets:
 """
-    for c in range(active_cols):
-        for s in range(1, stores_per_col + 1):
-            for replica in range(1, nodes_per_cell + 1):
-                store_name = f'store-{c}-{s}' if replica == 1 else f'store-{c}-{s}-r{replica}'
-                prometheus_yml += f"          - '{store_name}:8080'\n"
+        cur_port = 9300
+        for c in range(active_cols):
+            if total_stores_per_col is not None:
+                for idx in range(total_stores_per_col):
+                    store_name = f'store-{c}-{idx + 1}'
+                    prometheus_yml += f"          - '{store_name}:{cur_port}'\n"
+                    cur_port += 1
+            else:
+                for s in range(1, stores_per_col + 1):
+                    for replica in range(1, nodes_per_cell + 1):
+                        store_name = f'store-{c}-{s}' if replica == 1 else f'store-{c}-{s}-r{replica}'
+                        prometheus_yml += f"          - '{store_name}:{cur_port}'\n"
+                        cur_port += 1
 
-    prometheus_yml += """
+    if lights > 0:
+        prometheus_yml += """
   - job_name: 'lights'
     static_configs:
       - targets:
 """
-    for l in range(1, lights + 1):
-        prometheus_yml += f"          - 'light-{l}:{9400+l}'\n"
+        for l in range(1, lights + 1):
+            prometheus_yml += f"          - 'light-{l}:{9400+l}'\n"
 
     if cometbft_validators > 0:
         prometheus_yml += """
@@ -862,7 +891,9 @@ if __name__ == '__main__':
     parser.add_argument('-n', '--num-cols', '--cols', '--columns', '--net-cols', dest='cols', type=int, default=8, help='Total number of network columns (NetCols)')
     parser.add_argument('-c', '--active-cols', type=int, default=None, help='Number of active columns to run in Compose (C)')
     parser.add_argument('-s', '--stores-per-col', '--net-rows', dest='stores_per_col', type=int, default=8, help='Number of network rows per column (NetRows)')
-    parser.add_argument('-m', '--nodes-per-cell', type=int, default=1, help='Number of store node replicas per (row, col) cell (default: 1)')
+    parser.add_argument('-m', '--nodes-per-cell', type=int, default=1, help='Number of store node replicas per (row, col) cell (set 0 for Core-Only mode without pre-spawned Store Nodes)')
+    parser.add_argument('--total-stores', type=int, default=None, help='Exact number of Store Nodes to run per active column on Main Host (e.g. 6 across 4 net-rows, leaving 2 slots for Worker Host)')
+    parser.add_argument('--core-only', action='store_true', help='Generate Core-Only cluster (CometBFT + Publisher + Bootstrap only, 0 pre-spawned Store/Light nodes)')
     parser.add_argument('--peer-ttl', type=str, default='15s', help='Bootstrap peer routing table TTL for leave detection (default: 15s)')
     parser.add_argument('-l', '--lights', '--light-nodes', type=int, default=2, help='Number of light nodes (L)')
     parser.add_argument('--crash-on-fail', action='store_true', help='Enable crash on fail for nodes')
@@ -887,6 +918,9 @@ if __name__ == '__main__':
     parser.add_argument('--out', type=str, default='docker-compose.json', help='Output file')
     
     args = parser.parse_args()
+    if args.core_only:
+        args.nodes_per_cell = 0
+        args.lights = 0
 
     if args.cometbft_validators is None:
         detected_validators = 0
@@ -931,18 +965,19 @@ if __name__ == '__main__':
         cometbft_validators=args.cometbft_validators,
         cell_size=args.cell_size,
         nodes_per_cell=args.nodes_per_cell,
-        peer_ttl=args.peer_ttl
+        peer_ttl=args.peer_ttl,
+        total_stores_per_col=args.total_stores
     )
     
     n = 2 * args.k
     cols_per_net_col = n // args.cols if args.cols > 0 else 1
     
-    generate_prometheus_config(active_cols, args.stores_per_col, args.lights, cometbft_validators=args.cometbft_validators, nodes_per_cell=args.nodes_per_cell)
+    generate_prometheus_config(active_cols, args.stores_per_col, args.lights, cometbft_validators=args.cometbft_validators, nodes_per_cell=args.nodes_per_cell, total_stores_per_col=args.total_stores)
     generate_grafana_provisioning()
     generate_publisher_config(args.k, args.k_piece, args.cols, cols_per_net_col, active_cols, net_rows=args.stores_per_col)
     
     with open(args.out, 'w') as f:
         json.dump(compose_dict, f, indent=2)
         
-    print(f"Generated {args.out} with {args.cols} net-cols, {args.stores_per_col} net-rows, {args.nodes_per_cell} nodes/cell, {args.lights} light nodes.")
+    print(f"Generated {args.out} with {args.cols} net-cols (active={active_cols}), {args.stores_per_col} net-rows, {len(store_ports)} host store nodes, {args.lights} light nodes.")
     print(f"STORE_PORTS={' '.join(map(str, store_ports))}")

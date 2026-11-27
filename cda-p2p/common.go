@@ -6,6 +6,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"net"
+	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,6 +17,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 	"github.com/zeebo/blake3"
 )
 
@@ -37,6 +41,151 @@ func ParseHeightFromBlockID(blockID string) int {
 		}
 	}
 	return 0
+}
+
+// FormatHostMultiaddrPrefix returns "/ip4/<ip>", "/ip6/<ip>", or "/dns4/<hostname>"
+// so raw IPv4 addresses are never mistakenly wrapped in /dns4/... across multi-host Docker deployments.
+func FormatHostMultiaddrPrefix(hostStr string) string {
+	h := strings.TrimSpace(hostStr)
+	if h == "" || strings.EqualFold(h, "localhost") {
+		return "/ip4/127.0.0.1"
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			return fmt.Sprintf("/ip4/%s", ip4.String())
+		}
+		return fmt.Sprintf("/ip6/%s", ip.String())
+	}
+	return fmt.Sprintf("/dns4/%s", h)
+}
+
+// BuildAdvertisedP2PAddrs constructs the externally reachable QUIC and TCP libp2p multiaddrs
+// for a node given its advertised myAddr (e.g. "http://203.0.113.50:9301" or "http://store-0-1:8080")
+// and its local container HTTP port. If myAddr includes an external mapped port (e.g. 9301 while
+// localHTTPPort inside the container is 8080), the advertised P2P port automatically uses 9301+10000 = 19301.
+func BuildAdvertisedP2PAddrs(myAddr string, localHTTPPort int) []string {
+	trimmed := strings.TrimSpace(myAddr)
+	hostName := "127.0.0.1"
+	advertisedHTTPPort := localHTTPPort
+
+	if strings.HasPrefix(trimmed, "/ip4/") || strings.HasPrefix(trimmed, "/dns4/") {
+		parts := strings.Split(trimmed, "/")
+		if len(parts) >= 5 {
+			hostName = parts[2]
+			if pVal, err := strconv.Atoi(parts[4]); err == nil && pVal > 0 {
+				p2pPort := pVal
+				if p2pPort < 10000 {
+					p2pPort += 10000
+				}
+				prefix := FormatHostMultiaddrPrefix(hostName)
+				return []string{
+					fmt.Sprintf("%s/udp/%d/quic-v1", prefix, p2pPort),
+					fmt.Sprintf("%s/tcp/%d", prefix, p2pPort),
+				}
+			}
+		}
+	}
+
+	parsedStr := trimmed
+	if parsedStr != "" && !strings.Contains(parsedStr, "://") {
+		parsedStr = "http://" + parsedStr
+	}
+	if u, err := url.Parse(parsedStr); err == nil && u.Hostname() != "" {
+		hostName = u.Hostname()
+		if pStr := u.Port(); pStr != "" {
+			if pVal, err := strconv.Atoi(pStr); err == nil && pVal > 0 {
+				advertisedHTTPPort = pVal
+			}
+		}
+	}
+
+	p2pPort := advertisedHTTPPort + 10000
+	if advertisedHTTPPort >= 10000 {
+		p2pPort = advertisedHTTPPort
+	}
+	prefix := FormatHostMultiaddrPrefix(hostName)
+	var addrs []string
+
+	// If CDA_PUBLIC_IP (or MAIN_HOST_IP / WORKER_PUBLIC_IP) is set in a multi-host Docker setup,
+	// advertise the host's external LAN/Public IPv4 first so remote machines can dial this container directly,
+	// followed by the internal Docker DNS multiaddr for same-host container communication.
+	pubIP := strings.TrimSpace(os.Getenv("CDA_PUBLIC_IP"))
+	if pubIP != "" && pubIP != "127.0.0.1" && !strings.EqualFold(pubIP, "localhost") && !strings.EqualFold(pubIP, hostName) {
+		pubPrefix := FormatHostMultiaddrPrefix(pubIP)
+		addrs = append(addrs,
+			fmt.Sprintf("%s/udp/%d/quic-v1", pubPrefix, p2pPort),
+			fmt.Sprintf("%s/tcp/%d", pubPrefix, p2pPort),
+		)
+	}
+	addrs = append(addrs,
+		fmt.Sprintf("%s/udp/%d/quic-v1", prefix, p2pPort),
+		fmt.Sprintf("%s/tcp/%d", prefix, p2pPort),
+	)
+	return addrs
+}
+
+// ResolvePeerMultiaddr converts either an HTTP endpoint ("http://192.168.1.10:9200") or a libp2p
+// multiaddr ("/ip4/192.168.1.10/tcp/19200" or "/dns4/bootstrap-0/udp/19200/quic-v1/p2p/...")
+// into a valid multiaddr.Multiaddr with "/p2p/<peerID>" appended once.
+func ResolvePeerMultiaddr(addrStr string, targetPID peer.ID, preferQUIC bool) (multiaddr.Multiaddr, error) {
+	resolved := strings.TrimSpace(addrStr)
+	if strings.HasPrefix(resolved, "http://") || strings.HasPrefix(resolved, "https://") {
+		u, err := url.Parse(resolved)
+		if err == nil && u.Hostname() != "" {
+			prefix := FormatHostMultiaddrPrefix(u.Hostname())
+			if portVal, err := strconv.Atoi(u.Port()); err == nil && portVal > 0 {
+				pPort := portVal
+				if pPort < 10000 {
+					pPort += 10000
+				}
+				if preferQUIC {
+					resolved = fmt.Sprintf("%s/udp/%d/quic-v1", prefix, pPort)
+				} else {
+					resolved = fmt.Sprintf("%s/tcp/%d", prefix, pPort)
+				}
+			}
+		}
+	} else if strings.HasPrefix(resolved, "/dns4/") {
+		// Auto-correct "/dns4/<ipv4>/..." to "/ip4/<ipv4>/..." if an IP literal was placed after /dns4/
+		parts := strings.Split(resolved, "/")
+		if len(parts) >= 3 {
+			if ip := net.ParseIP(parts[2]); ip != nil && ip.To4() != nil {
+				parts[1] = "ip4"
+				parts[2] = ip.To4().String()
+				resolved = strings.Join(parts, "/")
+			}
+		}
+	}
+	if !strings.Contains(resolved, "/p2p/") && targetPID != "" {
+		resolved = fmt.Sprintf("%s/p2p/%s", strings.TrimSuffix(resolved, "/"), targetPID.String())
+	}
+	return multiaddr.NewMultiaddr(resolved)
+}
+
+// DeriveHTTPAddrFromP2POrHTTP returns an HTTP base URL (e.g. "http://bootstrap-0:9200" or "http://192.168.1.10:9200")
+// from either an HTTP URL or a libp2p multiaddr ("/dns4/bootstrap-0/tcp/19200" or "/ip4/192.168.1.10/udp/19200/quic-v1").
+func DeriveHTTPAddrFromP2POrHTTP(addrStr string) string {
+	s := strings.TrimSpace(addrStr)
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		return strings.TrimSuffix(s, "/")
+	}
+	if strings.HasPrefix(s, "/ip4/") || strings.HasPrefix(s, "/dns4/") {
+		parts := strings.Split(s, "/")
+		if len(parts) >= 5 {
+			host := parts[2]
+			if portVal, err := strconv.Atoi(parts[4]); err == nil && portVal > 0 {
+				httpPort := portVal
+				if httpPort > 10000 {
+					httpPort -= 10000
+				}
+				return fmt.Sprintf("http://%s:%d", host, httpPort)
+			}
+		}
+	}
+	return ""
 }
 
 func CalculateCell(pid peer.ID, k1, k2 int, salt string) (row, col int) {

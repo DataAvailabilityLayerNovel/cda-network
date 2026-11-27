@@ -20,8 +20,12 @@ Single-page web dashboard for inspecting and interacting with the CDA Network.
    - Query all blobs registered under a namespace.
    - One-click binary download via Publisher Node Fast Path (`GET /api/v1/namespaces/{ns}/blobs/{id}/download`), served directly from BadgerDB memory-mapped cache.
 4. **Block Explorer & ODS TOC**:
-   - Monitors real-time block height and active namespace counts.
+   - Monitors real-time block height, active namespace counts, and separate `Consensus Time` vs. `DA Time` latencies.
    - Inspects block structure and Table of Contents (TOC) with ODS cell coordinates (`cell_offset`, `cell_count`).
+5. **DA Network Matrix Monitor (Read-Only)**:
+   - Real-time 2D Network Matrix ($R_{\text{net}} \times C_{\text{net}}$) visualization showing Store Nodes per cell ($M$), Reputation Score & Trust Tier badges (`TRUSTED`, `STANDARD`, `PROBATION`, `Co-Primary 4pcs`), and per-subRow `(1 Primary + 1 Backup)` custody striping schedules.
+6. **Separated Network Admin Console (`/network-admin`) & CLI (`scripts/cda_node_ctl.sh`)**:
+   - Dedicated operational console at `http://<server-ip>:8889/network-admin` (and CLI script `./scripts/cda_node_ctl.sh`) for Store Node Auto-Join / Graceful Leave, Light Node lifecycle, on-demand DAS sampling, and Reputation simulations.
 5. **Node Settings**:
    - Configurable endpoints for CometBFT JSON-RPC (`http://<ip>:26657`) and CDA Publisher Node (`http://<ip>:8889`).
 

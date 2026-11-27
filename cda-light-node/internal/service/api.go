@@ -747,27 +747,9 @@ func (s *APIService) getRoutingInfo(netColIdx int, colsPerNetCol int, row int, c
 	}
 
 	for _, bootAddr := range bootAddrs {
-		resolvedAddr := bootAddr
-		if strings.HasPrefix(resolvedAddr, "http://") || strings.HasPrefix(resolvedAddr, "https://") {
-			u, err := url.Parse(resolvedAddr)
-			if err == nil {
-				hostStr := u.Hostname()
-				portStr := u.Port()
-				if portVal, err := strconv.Atoi(portStr); err == nil {
-					p2pPort := portVal + 10000
-					if hostStr == "localhost" || hostStr == "127.0.0.1" {
-						resolvedAddr = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", p2pPort)
-					} else {
-						resolvedAddr = fmt.Sprintf("/dns4/%s/tcp/%d", hostStr, p2pPort)
-					}
-				}
-			}
-		}
-
-		bootstrapAddrFull := fmt.Sprintf("%s/p2p/%s", resolvedAddr, bootPID.String())
-		maddr, err := multiaddr.NewMultiaddr(bootstrapAddrFull)
+		maddr, err := p2pcommon.ResolvePeerMultiaddr(bootAddr, bootPID, false)
 		if err != nil {
-			lastErr = fmt.Errorf("invalid bootstrap multiaddr %s: %v", bootstrapAddrFull, err)
+			lastErr = fmt.Errorf("invalid bootstrap multiaddr %s: %v", bootAddr, err)
 			continue
 		}
 

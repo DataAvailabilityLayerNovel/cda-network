@@ -1,0 +1,174 @@
+# ==============================================================================
+# CDA Network - Core Control Plane Docker Compose (docker-compose.core.yml)
+# ==============================================================================
+# Cấu hình khởi tạo TỐI GIẢN & NHẸ TÀI NGUYÊN trên Máy Chủ Chính (Main Host):
+# Chỉ khởi chạy các thành phần điều phối cốt lõi:
+#   1. CometBFT Consensus Validators (cometbft-0..3)
+#   2. CDA Publisher Node (:8080, P2P :18080)
+#   3. CDA Bootstrap Node 0 (:9200, P2P :19200/tcp & :19200/udp)
+#
+# Không chạy sẵn 8 Store Nodes hay Light Nodes trên Máy Chủ Chính để tiết kiệm
+# ~75% CPU/RAM. Các Store Nodes và Light Nodes sẽ tham gia động từ máy khác
+# (qua docker-compose.worker.yml) hoặc khởi chạy theo nhu cầu qua ./scripts/cda_node_ctl.sh.
+#
+# Cách chạy:
+#   python3 scripts/init_cometbft_cluster.py --validators 4
+#   python3 scripts/generate_compose.py --core-only -c 1 -k 64
+#   docker compose -f docker-compose.core.yml up -d --build
+# ==============================================================================
+
+services:
+  publisher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - /usr/local/bin/publisher
+      - -config
+      - /app/publisher_config.json
+    ports:
+      - "8080:8080"
+      - "18080:18080"
+    volumes:
+      - ./publisher_config_docker.json:/app/publisher_config.json
+    networks:
+      - cda-net
+    environment:
+      - PUBLISHER_QUEUE_TIMEOUT=300s
+      - PUBLISHER_MAX_IN_FLIGHT=2
+    restart: unless-stopped
+
+  bootstrap-0:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - /usr/local/bin/bootstrap
+      - -port
+      - "9200"
+      - -col
+      - "0"
+      - -publisher
+      - "http://publisher:8080"
+      - -k
+      - "${CDA_K:-64}"
+      - -k-piece
+      - "${CDA_K_PIECE:-4}"
+      - -net-rows
+      - "${CDA_NET_ROWS:-8}"
+      - -net-cols
+      - "${CDA_NET_COLS:-8}"
+      - -peer-ttl
+      - "15s"
+      - -prune-enable=true
+      - -prune-ttl
+      - "15s"
+    ports:
+      - "9200:9200"
+      - "19200:19200/tcp"
+      - "19200:19200/udp"
+    networks:
+      - cda-net
+    depends_on:
+      - publisher
+    restart: unless-stopped
+
+  cometbft-0:
+    build:
+      context: .
+      dockerfile: Dockerfile.cometbft
+    command: ["node", "--proxy_app", "kvstore"]
+    ports:
+      - "26657:26657"
+      - "26656:26656"
+    volumes:
+      - ./data/cometbft/node0:/cometbft
+    networks:
+      - cda-net
+    depends_on:
+      - publisher
+    environment:
+      - NODE_ID=0
+      - PUBLISHER_URL=http://publisher:8080/publish
+      - CDA_K=64
+      - CDA_MAX_K=64
+      - CDA_K_PIECE=4
+      - CDA_CELL_SIZE=512
+      - DISABLE_AUTO_PUBLISHER_PUSH=false
+    restart: unless-stopped
+
+  cometbft-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.cometbft
+    command: ["node", "--proxy_app", "kvstore"]
+    ports:
+      - "27658:26657"
+      - "28657:26656"
+    volumes:
+      - ./data/cometbft/node1:/cometbft
+    networks:
+      - cda-net
+    depends_on:
+      - publisher
+    environment:
+      - NODE_ID=1
+      - PUBLISHER_URL=http://publisher:8080/publish
+      - CDA_K=64
+      - CDA_MAX_K=64
+      - CDA_K_PIECE=4
+      - CDA_CELL_SIZE=512
+      - DISABLE_AUTO_PUBLISHER_PUSH=true
+    restart: unless-stopped
+
+  cometbft-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.cometbft
+    command: ["node", "--proxy_app", "kvstore"]
+    ports:
+      - "27659:26657"
+      - "28658:26656"
+    volumes:
+      - ./data/cometbft/node2:/cometbft
+    networks:
+      - cda-net
+    depends_on:
+      - publisher
+    environment:
+      - NODE_ID=2
+      - PUBLISHER_URL=http://publisher:8080/publish
+      - CDA_K=64
+      - CDA_MAX_K=64
+      - CDA_K_PIECE=4
+      - CDA_CELL_SIZE=512
+      - DISABLE_AUTO_PUBLISHER_PUSH=true
+    restart: unless-stopped
+
+  cometbft-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.cometbft
+    command: ["node", "--proxy_app", "kvstore"]
+    ports:
+      - "27660:26657"
+      - "28659:26656"
+    volumes:
+      - ./data/cometbft/node3:/cometbft
+    networks:
+      - cda-net
+    depends_on:
+      - publisher
+    environment:
+      - NODE_ID=3
+      - PUBLISHER_URL=http://publisher:8080/publish
+      - CDA_K=64
+      - CDA_MAX_K=64
+      - CDA_K_PIECE=4
+      - CDA_CELL_SIZE=512
+      - DISABLE_AUTO_PUBLISHER_PUSH=true
+    restart: unless-stopped
+
+networks:
+  cda-net:
+    driver: bridge

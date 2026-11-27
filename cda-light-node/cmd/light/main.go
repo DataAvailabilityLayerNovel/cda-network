@@ -7,11 +7,8 @@ import (
 	"log"
 	"math/big"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -24,7 +21,6 @@ import (
 	bls12381kzg "github.com/consensys/gnark-crypto/ecc/bls12-381/kzg"
 	"github.com/libp2p/go-libp2p/core/peer"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/multiformats/go-multiaddr"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -92,28 +88,10 @@ func main() {
 				continue
 			}
 
-			// Convert HTTP address to P2P multiaddr: http://host:port -> /dns4/host/tcp/(port+10000)
-			bootAddr := httpAddr
-			if strings.HasPrefix(bootAddr, "http://") || strings.HasPrefix(bootAddr, "https://") {
-				u, err := url.Parse(bootAddr)
-				if err == nil {
-					hostStr := u.Hostname()
-					portStr := u.Port()
-					if portVal, err := strconv.Atoi(portStr); err == nil {
-						p2pPort := portVal + 10000
-						if hostStr == "localhost" || hostStr == "127.0.0.1" {
-							bootAddr = fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", p2pPort)
-						} else {
-							bootAddr = fmt.Sprintf("/dns4/%s/udp/%d/quic-v1", hostStr, p2pPort)
-						}
-					}
-				}
-			}
-
-			fullAddr := fmt.Sprintf("%s/p2p/%s", bootAddr, bootPID.String())
-			maddr, err := multiaddr.NewMultiaddr(fullAddr)
+			// Convert HTTP address or raw multiaddr to P2P multiaddr safely (supports IPv4, DNS, and existing /p2p/ suffix)
+			maddr, err := p2pcommon.ResolvePeerMultiaddr(httpAddr, bootPID, true)
 			if err != nil {
-				log.Printf("[P2P] Failed to parse bootstrap multiaddr %s: %v", fullAddr, err)
+				log.Printf("[P2P] Failed to parse bootstrap multiaddr %s: %v", httpAddr, err)
 				continue
 			}
 

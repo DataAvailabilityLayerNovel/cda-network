@@ -99,3 +99,40 @@ func TestMultiNodeCellCustodyStripingAndRotation(t *testing.T) {
 		}
 	}
 }
+
+func TestMultiHostDockerMultiaddrAndHTTPDerivation(t *testing.T) {
+	// 1. Raw IPv4 with external mapped Docker port (e.g. -port 8080 inside container, -myaddr http://203.0.113.50:9301)
+	addrs := BuildAdvertisedP2PAddrs("http://203.0.113.50:9301", 8080)
+	if len(addrs) != 2 || addrs[0] != "/ip4/203.0.113.50/udp/19301/quic-v1" || addrs[1] != "/ip4/203.0.113.50/tcp/19301" {
+		t.Fatalf("unexpected advertised addrs for mapped IPv4: %v", addrs)
+	}
+
+	// 2. Docker DNS service name (e.g. http://store-0-1:8080)
+	dnsAddrs := BuildAdvertisedP2PAddrs("http://store-0-1:8080", 8080)
+	if len(dnsAddrs) != 2 || dnsAddrs[0] != "/dns4/store-0-1/udp/18080/quic-v1" || dnsAddrs[1] != "/dns4/store-0-1/tcp/18080" {
+		t.Fatalf("unexpected advertised addrs for Docker DNS: %v", dnsAddrs)
+	}
+
+	// 3. Derive HTTP Bootstrap URL from P2P multiaddr (/dns4/bootstrap-0/tcp/19200 or /ip4/192.168.1.10/udp/19200/quic-v1)
+	if got := DeriveHTTPAddrFromP2POrHTTP("/dns4/bootstrap-0/tcp/19200"); got != "http://bootstrap-0:9200" {
+		t.Fatalf("expected http://bootstrap-0:9200, got %s", got)
+	}
+	if got := DeriveHTTPAddrFromP2POrHTTP("/ip4/192.168.1.10/udp/19200/quic-v1"); got != "http://192.168.1.10:9200" {
+		t.Fatalf("expected http://192.168.1.10:9200, got %s", got)
+	}
+
+	// 4. ResolvePeerMultiaddr must not duplicate /p2p/ and must use /ip4/ for raw IPv4
+	_, bootPID, err := GenerateDeterministicKeypair("cda-bootstrap-0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m1, err := ResolvePeerMultiaddr("http://192.168.1.10:9200", bootPID, true)
+	if err != nil || m1.String() != fmt.Sprintf("/ip4/192.168.1.10/udp/19200/quic-v1/p2p/%s", bootPID.String()) {
+		t.Fatalf("unexpected m1: %v (err=%v)", m1, err)
+	}
+	// Passing an already-complete multiaddr with /p2p/ must not append /p2p/ a second time
+	m2, err := ResolvePeerMultiaddr(m1.String(), bootPID, true)
+	if err != nil || m2.String() != m1.String() {
+		t.Fatalf("expected idempotent /p2p/ resolution, got %v (err=%v)", m2, err)
+	}
+}

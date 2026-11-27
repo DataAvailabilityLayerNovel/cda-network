@@ -1,0 +1,138 @@
+# ==============================================================================
+# CDA Network - Multi-Host Worker Docker Compose (2 Store Nodes + 1 Light Node)
+# ==============================================================================
+# Thiết kế chuẩn cho kịch bản 2 MÁY CHỦ với active_cols = 1, net_rows = 4 (4 hàng mạng):
+#   - Máy Chính (MAIN_HOST_IP): Chạy CometBFT + Publisher + Bootstrap-0 + 6 Store Nodes
+#     (Row 0: 2 nodes, Row 1: 2 nodes, Row 2: 1 node, Row 3: 1 node)
+#   - Máy Phụ (WORKER_PUBLIC_IP): Chạy file này gồm 2 Store Nodes (:9310, :9311)
+#     + 1 Light Node (:9410).
+#     Khi khởi chạy ở chế độ Auto-Join (STORE_ROW=-1), 2 Store Nodes trên Máy Phụ sẽ
+#     tự động phát hiện Row 2 và Row 3 trên Máy Chính đang chỉ có 1 node (Least-Loaded)
+#     và gia nhập vào Row 2 & Row 3 -> Hoàn thiện ma trận 4 hàng x 2 nodes/ô = 8 Store Nodes!
+#
+# Cách chạy trên Máy Phụ (ví dụ Máy Chính IP 192.168.1.10, Máy Phụ IP 192.168.1.50):
+#
+#   MAIN_HOST_IP=192.168.1.10 \
+#   WORKER_PUBLIC_IP=192.168.1.50 \
+#   docker compose -f docker-compose.worker.yml up -d --build
+# ==============================================================================
+
+services:
+  worker-store-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - /usr/local/bin/store
+      - -port
+      - "${STORE1_HTTP_PORT:-9310}"
+      - -row
+      - "${STORE1_ROW:--1}"
+      - -col
+      - "${STORE_COL:-0}"
+      - -publisher
+      - "http://${MAIN_HOST_IP:-127.0.0.1}:${PUBLISHER_PORT:-8080}"
+      - -bootstrap
+      - "http://${MAIN_HOST_IP:-127.0.0.1}:${BOOTSTRAP_PORT:-9200}"
+      - -k
+      - "${CDA_K:-64}"
+      - -k-piece
+      - "${CDA_K_PIECE:-4}"
+      - -num-cols
+      - "${CDA_NET_COLS:-8}"
+      - -net-cols
+      - "${CDA_NET_COLS:-8}"
+      - -stores-per-col
+      - "${CDA_NET_ROWS:-4}"
+      - -net-rows
+      - "${CDA_NET_ROWS:-4}"
+      - -myaddr
+      - "http://${WORKER_PUBLIC_IP:-127.0.0.1}:${STORE1_HTTP_PORT:-9310}"
+      - -prune-enable=true
+      - -prune-ttl
+      - "15s"
+    environment:
+      - CDA_PUBLIC_IP=${WORKER_PUBLIC_IP:-}
+    ports:
+      - "${STORE1_HTTP_PORT:-9310}:${STORE1_HTTP_PORT:-9310}"
+      - "${STORE1_P2P_PORT:-19310}:${STORE1_P2P_PORT:-19310}/tcp"
+      - "${STORE1_P2P_PORT:-19310}:${STORE1_P2P_PORT:-19310}/udp"
+    volumes:
+      - ./data/worker_store_9310:/app/data
+    restart: unless-stopped
+
+  worker-store-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - /usr/local/bin/store
+      - -port
+      - "${STORE2_HTTP_PORT:-9311}"
+      - -row
+      - "${STORE2_ROW:--1}"
+      - -col
+      - "${STORE_COL:-0}"
+      - -publisher
+      - "http://${MAIN_HOST_IP:-127.0.0.1}:${PUBLISHER_PORT:-8080}"
+      - -bootstrap
+      - "http://${MAIN_HOST_IP:-127.0.0.1}:${BOOTSTRAP_PORT:-9200}"
+      - -k
+      - "${CDA_K:-64}"
+      - -k-piece
+      - "${CDA_K_PIECE:-4}"
+      - -num-cols
+      - "${CDA_NET_COLS:-8}"
+      - -net-cols
+      - "${CDA_NET_COLS:-8}"
+      - -stores-per-col
+      - "${CDA_NET_ROWS:-4}"
+      - -net-rows
+      - "${CDA_NET_ROWS:-4}"
+      - -myaddr
+      - "http://${WORKER_PUBLIC_IP:-127.0.0.1}:${STORE2_HTTP_PORT:-9311}"
+      - -prune-enable=true
+      - -prune-ttl
+      - "15s"
+    environment:
+      - CDA_PUBLIC_IP=${WORKER_PUBLIC_IP:-}
+    ports:
+      - "${STORE2_HTTP_PORT:-9311}:${STORE2_HTTP_PORT:-9311}"
+      - "${STORE2_P2P_PORT:-19311}:${STORE2_P2P_PORT:-19311}/tcp"
+      - "${STORE2_P2P_PORT:-19311}:${STORE2_P2P_PORT:-19311}/udp"
+    volumes:
+      - ./data/worker_store_9311:/app/data
+    depends_on:
+      - worker-store-1
+    restart: unless-stopped
+
+  worker-light:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - /usr/local/bin/light
+      - -port
+      - "${LIGHT_HTTP_PORT:-9410}"
+      - -publisher
+      - "http://${MAIN_HOST_IP:-127.0.0.1}:${PUBLISHER_PORT:-8080}"
+      - -bootstraps
+      - "0:http://${MAIN_HOST_IP:-127.0.0.1}:${BOOTSTRAP_PORT:-9200}"
+      - -k
+      - "${CDA_K:-64}"
+      - -k-piece
+      - "${CDA_K_PIECE:-4}"
+      - -num-cols
+      - "${CDA_NET_COLS:-8}"
+      - -net-cols
+      - "${CDA_NET_COLS:-8}"
+      - -net-rows
+      - "${CDA_NET_ROWS:-4}"
+      - -auto-das=true
+    ports:
+      - "${LIGHT_HTTP_PORT:-9410}:${LIGHT_HTTP_PORT:-9410}"
+      - "${LIGHT_P2P_PORT:-19410}:${LIGHT_P2P_PORT:-19410}/tcp"
+      - "${LIGHT_P2P_PORT:-19410}:${LIGHT_P2P_PORT:-19410}/udp"
+    volumes:
+      - ./data/worker_light:/app/data
+    restart: unless-stopped
